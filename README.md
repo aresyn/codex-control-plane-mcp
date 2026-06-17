@@ -59,6 +59,9 @@ That gives you a simple contract:
 | Restart recovery | ad hoc | persisted operation state |
 | Diagnostics | logs only | health, diagnostics, repair tools |
 
+For a more detailed decision guide, see
+[docs/THIN_WRAPPERS.md](docs/THIN_WRAPPERS.md).
+
 ## Current support
 
 - Full live target: Windows with Codex Desktop and `codex-app-server`.
