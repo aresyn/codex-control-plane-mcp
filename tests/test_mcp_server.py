@@ -190,6 +190,7 @@ class FakeAppServer:
         self.first_message = first_message
         self.process_generation = 1
         self.turn_start_calls: list[dict] = []
+        self.turn_steer_calls: list[dict] = []
         self.thread_start_calls: list[dict] = []
         self._turn_counter = 0
 
@@ -238,6 +239,26 @@ class FakeAppServer:
     async def turn_interrupt(self, *, thread_id: str, turn_id: str, timeout_seconds: float | None = 30) -> dict:
         self.tracker.mark_turn_interrupted(turn_id, reason="test interrupt")
         return {"interrupted": True, "threadId": thread_id, "turnId": turn_id}
+
+    async def turn_steer(
+        self,
+        *,
+        thread_id: str,
+        expected_turn_id: str,
+        input_items: list[dict],
+        client_user_message_id: str | None = None,
+        timeout_seconds: float | None = 60,
+    ) -> dict:
+        self.turn_steer_calls.append(
+            {
+                "thread_id": thread_id,
+                "expected_turn_id": expected_turn_id,
+                "input_items": input_items,
+                "client_user_message_id": client_user_message_id,
+                "timeout_seconds": timeout_seconds,
+            }
+        )
+        return {"turnId": expected_turn_id}
 
     def status_snapshot(self, *, include_recent_events: bool = False) -> dict:
         return {
@@ -861,6 +882,9 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertIn("start_chat", submit_schema["properties"]["operation_type"]["enum"])
         self.assertIn("send_message", submit_schema["properties"]["operation_type"]["enum"])
         self.assertIn("execute_plan", submit_schema["properties"]["operation_type"]["enum"])
+        self.assertIn("steer_turn", submit_schema["properties"]["operation_type"]["enum"])
+        self.assertIn("thread_id", submit_schema["properties"])
+        self.assertIn("expected_turn_id", submit_schema["properties"])
         self.assertEqual("danger-full-access", submit_schema["properties"]["sandbox"]["default"])
         self.assertEqual("never", submit_schema["properties"]["approval_policy"]["default"])
 
@@ -2598,6 +2622,134 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertEqual("turn-existing", status["turnId"])
         self.assertEqual(0, turn_starts)
 
+    def test_submit_task_steer_turn_is_durable_idempotent_and_follows_target_turn(self) -> None:
+        async def scenario() -> tuple[dict, dict, dict, dict, list[dict], int, object]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                service = ToolService(_search_service_config(root, root / ".codex" / "state_5.sqlite"))
+                fake = FakeAppServer(service.storage, first_message=None)
+                service._app_server = fake  # type: ignore[assignment]
+                try:
+                    fake.tracker.register_turn(
+                        turn_id="turn-steer",
+                        thread_id="thread-steer",
+                        chat_id="thread-steer",
+                        project_id=project_id_for_path(str(project)),
+                        project_path=str(project),
+                    )
+                    submitted = await service.call(
+                        "codex_submit_task",
+                        {
+                            "operation_type": "steer_turn",
+                            "thread_id": "thread-steer",
+                            "expected_turn_id": "turn-steer",
+                            "message": "add this clarification",
+                            "client_request_id": "steer-client-1",
+                        },
+                    )
+                    accepted = submitted
+                    for _ in range(50):
+                        accepted = service.codex_get_operation_status({"operation_id": submitted["operationId"]})
+                        if accepted.get("steerState", {}).get("accepted"):
+                            break
+                        await asyncio.sleep(0.01)
+                    repeated = await service.call(
+                        "codex_submit_task",
+                        {
+                            "operation_type": "steer_turn",
+                            "thread_id": "thread-steer",
+                            "expected_turn_id": "turn-steer",
+                            "message": "add this clarification",
+                            "client_request_id": "steer-client-1",
+                        },
+                    )
+                    fake.tracker.record_event(
+                        {
+                            "method": "turn/completed",
+                            "params": {
+                                "threadId": "thread-steer",
+                                "turnId": "turn-steer",
+                                "status": "completed",
+                            },
+                        },
+                        received_at="2026-05-25T00:00:02+00:00",
+                    )
+                    completed = service.codex_get_operation_status({"operation_id": submitted["operationId"]})
+                    prompt_submission = service.storage.get_prompt_submission_by_operation(str(submitted["operationId"]))
+                    return submitted, accepted, repeated, completed, fake.turn_steer_calls, len(fake.turn_start_calls), prompt_submission
+                finally:
+                    await service.close()
+
+        submitted, accepted, repeated, completed, steer_calls, turn_start_count, prompt_submission = asyncio.run(scenario())
+
+        self.assertEqual("steer_turn", submitted["operationType"])
+        self.assertEqual("thread-steer", accepted["threadId"])
+        self.assertEqual("turn-steer", accepted["turnId"])
+        self.assertEqual("running", accepted["status"])
+        self.assertTrue(accepted["steerState"]["accepted"])
+        self.assertEqual("mcp-steer:" + submitted["operationId"], accepted["steerState"]["clientUserMessageId"])
+        self.assertEqual("not_recorded", accepted["dedupState"]["state"])
+        self.assertTrue(repeated["idempotent"])
+        self.assertEqual(submitted["operationId"], repeated["operationId"])
+        self.assertEqual(1, len(steer_calls))
+        self.assertEqual(0, turn_start_count)
+        self.assertIsNone(prompt_submission)
+        self.assertEqual("completed", completed["status"])
+        self.assertFalse(completed["pollRecommended"])
+
+    def test_submit_task_steer_turn_rejects_terminal_or_unknown_target(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "Project"
+            project.mkdir()
+            service = ToolService(_search_service_config(root, root / ".codex" / "state_5.sqlite"))
+            fake = FakeAppServer(service.storage, first_message=None)
+            service._app_server = fake  # type: ignore[assignment]
+            try:
+                fake.tracker.register_turn(
+                    turn_id="turn-terminal",
+                    thread_id="thread-terminal",
+                    chat_id="thread-terminal",
+                    project_id=project_id_for_path(str(project)),
+                    project_path=str(project),
+                )
+                fake.tracker.record_event(
+                    {
+                        "method": "turn/completed",
+                        "params": {"threadId": "thread-terminal", "turnId": "turn-terminal", "status": "completed"},
+                    },
+                    received_at="2026-05-25T00:00:02+00:00",
+                )
+                terminal = asyncio.run(
+                    service.call(
+                        "codex_submit_task",
+                        {
+                            "operation_type": "steer_turn",
+                            "thread_id": "thread-terminal",
+                            "expected_turn_id": "turn-terminal",
+                            "message": "too late",
+                        },
+                    )
+                )
+                unknown = asyncio.run(
+                    service.call(
+                        "codex_submit_task",
+                        {
+                            "operation_type": "steer_turn",
+                            "thread_id": "thread-missing",
+                            "expected_turn_id": "turn-missing",
+                            "message": "missing",
+                        },
+                    )
+                )
+            finally:
+                asyncio.run(service.close())
+
+        self.assertEqual("INVALID_ARGUMENT", terminal["error"]["code"])
+        self.assertEqual("CODEX_TURN_NOT_FOUND", unknown["error"]["code"])
+
     def test_two_workers_compete_for_one_operation_and_only_one_starts_turn(self) -> None:
         async def scenario() -> tuple[int, dict]:
             with TemporaryDirectory() as tmp:
@@ -2644,6 +2796,65 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertEqual(1, turn_starts)
         self.assertEqual("running", stored["status"])
         self.assertEqual("turn-fake", stored["turn_id"])
+
+    def test_two_workers_compete_for_one_steer_operation_and_only_one_steers(self) -> None:
+        async def scenario() -> tuple[int, int, dict]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                state_db = root / ".codex" / "state_5.sqlite"
+                service_a = ToolService(_search_service_config(root, state_db))
+                service_b = ToolService(_search_service_config(root, state_db))
+                fake_a = FakeAppServer(service_a.storage, first_message=None)
+                fake_b = FakeAppServer(service_b.storage, first_message=None)
+                service_a._app_server = fake_a  # type: ignore[assignment]
+                service_b._app_server = fake_b  # type: ignore[assignment]
+                operation_id = "op-steer-compete"
+                project_id = project_id_for_path(str(project))
+                for fake in (fake_a, fake_b):
+                    fake.tracker.register_turn(
+                        turn_id="turn-steer-compete",
+                        thread_id="thread-steer-compete",
+                        chat_id="thread-steer-compete",
+                        project_id=project_id,
+                        project_path=str(project),
+                    )
+                request = {
+                    "operation_type": "steer_turn",
+                    "thread_id": "thread-steer-compete",
+                    "expected_turn_id": "turn-steer-compete",
+                    "message": "single steering input",
+                    "_operation_id": operation_id,
+                    "_client_user_message_id": f"mcp-steer:{operation_id}",
+                }
+                try:
+                    service_a.storage.create_operation(
+                        _storage_operation_row(
+                            operation_id,
+                            status="queued",
+                            operation_type="steer_turn",
+                            thread_id="thread-steer-compete",
+                            turn_id="turn-steer-compete",
+                            cwd=str(project),
+                            request=request,
+                        )
+                    )
+                    await asyncio.gather(service_a._run_operation(operation_id), service_b._run_operation(operation_id))
+                    stored = service_a.storage.get_operation(operation_id) or {}
+                    steer_count = len(fake_a.turn_steer_calls) + len(fake_b.turn_steer_calls)
+                    start_count = len(fake_a.turn_start_calls) + len(fake_b.turn_start_calls)
+                    return steer_count, start_count, stored
+                finally:
+                    await service_a.close()
+                    await service_b.close()
+
+        steer_count, start_count, stored = asyncio.run(scenario())
+
+        self.assertEqual(1, steer_count)
+        self.assertEqual(0, start_count)
+        self.assertEqual("running", stored["status"])
+        self.assertEqual("turn-steer-compete", stored["turn_id"])
 
     def test_interrupt_turn_marks_tracked_turn_interrupted(self) -> None:
         with TemporaryDirectory() as tmp:

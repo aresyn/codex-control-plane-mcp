@@ -305,6 +305,25 @@ class CodexAppServerClient:
         self.tracker.mark_turn_interrupted(turn_id, reason="Interrupted by MCP client.")
         return result if isinstance(result, dict) else {"result": result}
 
+    async def turn_steer(
+        self,
+        *,
+        thread_id: str,
+        expected_turn_id: str,
+        input_items: list[dict[str, Any]],
+        client_user_message_id: str | None = None,
+        timeout_seconds: float | None = 60,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "threadId": thread_id,
+            "expectedTurnId": expected_turn_id,
+            "input": input_items,
+        }
+        if client_user_message_id:
+            params["clientUserMessageId"] = client_user_message_id
+        result = await self.request("turn/steer", params, timeout_seconds=timeout_seconds)
+        return result if isinstance(result, dict) else {"result": result}
+
     async def _ensure_running(self) -> None:
         if self.process is None or self.process.returncode is not None:
             await self.start()

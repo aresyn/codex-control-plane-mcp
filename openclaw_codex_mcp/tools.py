@@ -51,6 +51,7 @@ from .statuses import (
     OPERATION_ACTIVE_STATUSES,
     OPERATION_STARTABLE_STATUSES,
     OPERATION_TERMINAL_STATUSES,
+    TURN_ACTIVE_STATUSES,
 )
 from .storage import McpStorage
 from .transcripts import parse_transcript
@@ -408,7 +409,7 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "required": ["operation_type", "message"],
             "properties": {
-                "operation_type": {"type": "string", "enum": ["start_chat", "send_message", "execute_plan"]},
+                "operation_type": {"type": "string", "enum": ["start_chat", "send_message", "execute_plan", "steer_turn"]},
                 "client_request_id": {
                     "type": ["string", "null"],
                     "default": None,
@@ -416,6 +417,16 @@ TOOLS: list[dict[str, Any]] = [
                 },
                 "project_id": {"type": ["string", "null"], "default": None},
                 "chat_id": {"type": ["string", "null"], "default": None},
+                "thread_id": {
+                    "type": ["string", "null"],
+                    "default": None,
+                    "description": "Required for operation_type='steer_turn'. Target thread that owns the active turn.",
+                },
+                "expected_turn_id": {
+                    "type": ["string", "null"],
+                    "default": None,
+                    "description": "Required for operation_type='steer_turn'. Active turn id precondition passed to Codex app-server.",
+                },
                 "workflow_id": {"type": ["string", "null"], "default": None},
                 "message": {"type": "string", "minLength": 1, "maxLength": 200000},
                 "title": {"type": ["string", "null"], "default": None},
@@ -886,6 +897,28 @@ class ToolService:
                 return turn
         return None
 
+    def _validate_steer_target(self, *, thread_id: str, expected_turn_id: str) -> dict[str, Any]:
+        turn = self.storage.get_tracked_turn(expected_turn_id)
+        if turn is None:
+            raise turn_not_found(expected_turn_id)
+        actual_thread_id = _optional_string(turn.get("thread_id"))
+        if actual_thread_id != thread_id:
+            raise invalid_argument(
+                "Steer target turn does not belong to the requested thread.",
+                thread_id=thread_id,
+                expected_turn_id=expected_turn_id,
+                actual_thread_id=actual_thread_id,
+            )
+        status = str(turn.get("status") or "")
+        if status not in TURN_ACTIVE_STATUSES:
+            raise invalid_argument(
+                "Steer target turn is not active.",
+                thread_id=thread_id,
+                expected_turn_id=expected_turn_id,
+                status=status,
+            )
+        return turn
+
     def _dedup_metadata_for_result(self, dedup: dict[str, Any] | None) -> dict[str, Any]:
         if not dedup or dedup.get("action") == "new":
             return {}
@@ -900,6 +933,78 @@ class ToolService:
             "existingThreadId": dedup.get("existingThreadId"),
             "existingTurnId": dedup.get("existingTurnId"),
             "existingStatus": dedup.get("existingStatus"),
+        }
+
+    async def _steer_turn_resolved(
+        self,
+        *,
+        thread_id: str,
+        expected_turn_id: str,
+        message: str,
+        args: dict[str, Any],
+    ) -> dict[str, Any]:
+        operation_id = _optional_string(args.get("_operation_id"))
+        timeout_seconds = _bounded_int(args.get("timeout_seconds", DEFAULT_TOOL_START_TIMEOUT_SECONDS), 1, 7200)
+        client_user_message_id = _optional_string(args.get("_client_user_message_id")) or (
+            f"mcp-steer:{operation_id}" if operation_id else None
+        )
+        self._validate_steer_target(thread_id=thread_id, expected_turn_id=expected_turn_id)
+        client = await self._app()
+        if operation_id:
+            self.storage.update_operation(
+                operation_id,
+                status="starting_turn",
+                phase="starting_turn",
+                chat_id=thread_id,
+                thread_id=thread_id,
+                turn_id=expected_turn_id,
+                updated_at=_now_iso(),
+                app_server_generation=client.process_generation,
+            )
+        result = await client.turn_steer(
+            thread_id=thread_id,
+            expected_turn_id=expected_turn_id,
+            input_items=[{"type": "text", "text": message}],
+            client_user_message_id=client_user_message_id,
+            timeout_seconds=timeout_seconds,
+        )
+        result_turn_id = _extract_turn_id(result) or expected_turn_id
+        steer_state = {
+            "accepted": True,
+            "targetThreadId": thread_id,
+            "targetTurnId": result_turn_id,
+            "clientUserMessageId": client_user_message_id,
+        }
+        if operation_id:
+            self.storage.update_operation(
+                operation_id,
+                status="running",
+                phase="running",
+                chat_id=thread_id,
+                thread_id=thread_id,
+                turn_id=result_turn_id,
+                result_json=json.dumps({"turnId": result_turn_id, "steerState": steer_state, "appServerResult": result}, ensure_ascii=False),
+                last_error=None,
+                updated_at=_now_iso(),
+                next_attempt_at=None,
+                app_server_generation=result.get("_processGeneration") or client.process_generation,
+            )
+        return {
+            "ok": True,
+            "accepted": True,
+            "status": "running",
+            "phase": "running",
+            "thread_id": thread_id,
+            "threadId": thread_id,
+            "turn_id": result_turn_id,
+            "turnId": result_turn_id,
+            "targetThreadId": thread_id,
+            "targetTurnId": result_turn_id,
+            "steerState": steer_state,
+            "appServerGeneration": result.get("_processGeneration") or client.process_generation,
+            "pollRecommended": True,
+            "nextRecommendedAction": "poll_turn_status",
+            "recommendedPollAfterSeconds": 15,
         }
 
     async def _send_message_resolved(
@@ -2078,7 +2183,7 @@ class ToolService:
 
     def codex_submit_task(self, args: dict[str, Any]) -> dict[str, Any]:
         operation_type = _required_string(args, "operation_type")
-        if operation_type not in {"start_chat", "send_message", "execute_plan"}:
+        if operation_type not in {"start_chat", "send_message", "execute_plan", "steer_turn"}:
             raise invalid_argument("Unsupported operation_type", operation_type=operation_type)
         message = _required_string(args, "message")
         explicit_client_request_id = _optional_string(args.get("client_request_id"))
@@ -2101,6 +2206,8 @@ class ToolService:
             raise invalid_argument("codex_submit_task send_message requires chat_id")
         if operation_type == "execute_plan" and not (_optional_string(args.get("workflow_id")) or _optional_string(args.get("chat_id"))):
             raise invalid_argument("codex_submit_task execute_plan requires workflow_id or chat_id")
+        if operation_type == "steer_turn" and not (_optional_string(args.get("thread_id")) and _optional_string(args.get("expected_turn_id"))):
+            raise invalid_argument("codex_submit_task steer_turn requires thread_id and expected_turn_id")
 
         now = _now_iso()
         operation_id = str(uuid.uuid4())
@@ -2118,7 +2225,20 @@ class ToolService:
         project_id: str | None = _optional_string(args.get("project_id"))
         project_path: str | None = None
 
-        if operation_type == "start_chat":
+        if operation_type == "steer_turn":
+            initial_thread_id = _required_string(args, "thread_id")
+            expected_turn_id = _required_string(args, "expected_turn_id")
+            target_turn = self._validate_steer_target(thread_id=initial_thread_id, expected_turn_id=expected_turn_id)
+            initial_chat_id = _optional_string(target_turn.get("chat_id")) or initial_thread_id
+            project_id = _optional_string(target_turn.get("project_id")) or project_id
+            project_path = _optional_string(target_turn.get("project_path"))
+            actual_args["chat_id"] = initial_chat_id
+            actual_args["thread_id"] = initial_thread_id
+            actual_args["expected_turn_id"] = expected_turn_id
+            actual_args["_resolved_thread_id"] = initial_thread_id
+            actual_args["_target_turn_id"] = expected_turn_id
+            actual_args["_client_user_message_id"] = f"mcp-steer:{operation_id}"
+        elif operation_type == "start_chat":
             project = self.catalog.get_project(str(project_id))
             if project is None:
                 raise project_not_found(str(project_id))
@@ -2164,21 +2284,24 @@ class ToolService:
                 actual_args["_resolved_thread_id"] = initial_thread_id
                 actual_args["_resolved_project_path"] = project_path
 
-        dedup_basis = str(args.get("_prompt_dedup_basis") or self._prompt_dedup_basis(operation_type, message, workflow=workflow))
-        dedup = self._prepare_prompt_submission(
-            project_id=project_id,
-            project_path_key=path_key(project_path),
-            operation_type=operation_type,
-            message=message,
-            dedup_basis=dedup_basis,
-            operation_id=operation_id,
-            chat_id=initial_chat_id,
-            thread_id=initial_thread_id,
-            workflow_id=_optional_string(args.get("workflow_id")),
-        )
-        prompt_submission_id = _optional_string(dedup.get("promptSubmissionId"))
+        dedup: dict[str, Any] = {"action": "not_applicable"}
+        prompt_submission_id: str | None = None
         dedup_metadata: dict[str, Any] | None = None
-        if dedup.get("action") == "continue_existing_chat":
+        if operation_type != "steer_turn":
+            dedup_basis = str(args.get("_prompt_dedup_basis") or self._prompt_dedup_basis(operation_type, message, workflow=workflow))
+            dedup = self._prepare_prompt_submission(
+                project_id=project_id,
+                project_path_key=path_key(project_path),
+                operation_type=operation_type,
+                message=message,
+                dedup_basis=dedup_basis,
+                operation_id=operation_id,
+                chat_id=initial_chat_id,
+                thread_id=initial_thread_id,
+                workflow_id=_optional_string(args.get("workflow_id")),
+            )
+            prompt_submission_id = _optional_string(dedup.get("promptSubmissionId"))
+        if operation_type != "steer_turn" and dedup.get("action") == "continue_existing_chat":
             actual_operation_type = "send_message"
             existing_chat_id = _optional_string(dedup.get("existingChatId")) or _optional_string(dedup.get("existingThreadId"))
             existing_thread_id = _optional_string(dedup.get("existingThreadId")) or existing_chat_id
@@ -2232,7 +2355,7 @@ class ToolService:
             "project_id": project_id,
             "chat_id": initial_chat_id,
             "thread_id": initial_thread_id,
-            "turn_id": None,
+            "turn_id": _optional_string(actual_args.get("expected_turn_id")) if operation_type == "steer_turn" else None,
             "workflow_id": _optional_string(args.get("workflow_id")),
             "cwd": project_path,
             "title": _optional_string(args.get("title")),
@@ -2334,7 +2457,8 @@ class ToolService:
         if status not in OPERATION_STARTABLE_STATUSES:
             self.storage.release_operation_lease(operation_id, lease_owner=self._worker_owner, updated_at=_now_iso())
             return
-        if _optional_string(operation.get("turn_id")):
+        operation_type_for_guard = str(operation.get("operation_type") or "")
+        if _optional_string(operation.get("turn_id")) and operation_type_for_guard != "steer_turn":
             self.storage.update_operation(
                 operation_id,
                 status="running",
@@ -2367,17 +2491,26 @@ class ToolService:
             if prompt_submission_id:
                 self.storage.update_prompt_submission(prompt_submission_id, status="starting_app_server", updated_at=_now_iso())
             await self._app()
-            self.storage.update_operation(operation_id, status="starting_thread", phase="starting_thread", updated_at=_now_iso())
-            if prompt_submission_id:
-                self.storage.update_prompt_submission(prompt_submission_id, status="starting_thread", updated_at=_now_iso())
-            if operation_type == "start_chat":
-                result = await self.codex_start_chat(_operation_tool_args(payload))
-            elif operation_type == "send_message":
-                result = await self.codex_send_message(_operation_tool_args(payload))
-            elif operation_type == "execute_plan":
-                result = await self.codex_execute_plan(_operation_tool_args(payload))
+            if operation_type == "steer_turn":
+                self.storage.update_operation(operation_id, status="starting_turn", phase="starting_turn", updated_at=_now_iso())
+                result = await self._steer_turn_resolved(
+                    thread_id=_required_string(payload, "thread_id"),
+                    expected_turn_id=_required_string(payload, "expected_turn_id"),
+                    message=str(payload.get("message") or ""),
+                    args=_operation_tool_args(payload),
+                )
             else:
-                raise invalid_argument("Unsupported operation_type", operation_type=operation_type)
+                self.storage.update_operation(operation_id, status="starting_thread", phase="starting_thread", updated_at=_now_iso())
+                if prompt_submission_id:
+                    self.storage.update_prompt_submission(prompt_submission_id, status="starting_thread", updated_at=_now_iso())
+                if operation_type == "start_chat":
+                    result = await self.codex_start_chat(_operation_tool_args(payload))
+                elif operation_type == "send_message":
+                    result = await self.codex_send_message(_operation_tool_args(payload))
+                elif operation_type == "execute_plan":
+                    result = await self.codex_execute_plan(_operation_tool_args(payload))
+                else:
+                    raise invalid_argument("Unsupported operation_type", operation_type=operation_type)
             thread_id = _optional_string(result.get("threadId")) or _optional_string(result.get("thread_id"))
             turn_id = _optional_string(result.get("turnId")) or _optional_string(result.get("turn_id"))
             chat_id = _optional_string(result.get("chatId")) or _optional_string(result.get("chat_id")) or thread_id
@@ -2546,7 +2679,11 @@ class ToolService:
                         "message_max_chars": message_max_chars,
                     }
                 )
-                latest = self._reconcile_operation_with_turn(latest, turn_status)
+                if not (
+                    str(latest.get("operation_type") or "") == "steer_turn"
+                    and str(latest.get("status") or "") in OPERATION_STARTABLE_STATUSES
+                ):
+                    latest = self._reconcile_operation_with_turn(latest, turn_status)
             except CodexMcpError:
                 turn_status = None
         response = _operation_row_to_tool(latest)
@@ -2581,7 +2718,11 @@ class ToolService:
         if not pending_interactions:
             pending_interactions = (turn_status or {}).get("pendingInteractions") or []
         response["pendingInteractions"] = pending_interactions
-        if pending_interactions and str(response.get("status") or "") not in OPERATION_TERMINAL_STATUSES:
+        pending_can_drive_operation = not (
+            str(response.get("operationType") or "") == "steer_turn"
+            and str(response.get("status") or "") in OPERATION_STARTABLE_STATUSES
+        )
+        if pending_interactions and pending_can_drive_operation and str(response.get("status") or "") not in OPERATION_TERMINAL_STATUSES:
             waiting_status = "waiting_for_user_input" if any(item.get("kind") == "user_input" for item in pending_interactions) else "waiting_for_approval"
             response["status"] = waiting_status
             response["phase"] = waiting_status
@@ -4801,6 +4942,8 @@ def _operation_request_payload(args: dict[str, Any], *, operation_type: str, mes
     keys = {
         "project_id",
         "chat_id",
+        "thread_id",
+        "expected_turn_id",
         "workflow_id",
         "title",
         "cwd",
@@ -4850,6 +4993,12 @@ def _operation_row_to_tool(row: dict[str, Any]) -> dict[str, Any]:
     request_payload = _operation_request_from_row(row)
     public_request = {key: value for key, value in request_payload.items() if not key.startswith("_")}
     dedup_metadata = request_payload.get("_dedup_metadata") if isinstance(request_payload.get("_dedup_metadata"), dict) else None
+    try:
+        result_payload = json.loads(str(row.get("result_json") or "{}"))
+    except json.JSONDecodeError:
+        result_payload = {}
+    if not isinstance(result_payload, dict):
+        result_payload = {}
     result = {
         "ok": True,
         "operation_id": row.get("operation_id"),
@@ -4909,6 +5058,19 @@ def _operation_row_to_tool(row: dict[str, Any]) -> dict[str, Any]:
             }
         )
         result.setdefault("originalOperationType", dedup_metadata.get("originalOperationType"))
+    if row.get("operation_type") == "steer_turn":
+        result_steer_state = result_payload.get("steerState") if isinstance(result_payload.get("steerState"), dict) else {}
+        client_user_message_id = (
+            result_steer_state.get("clientUserMessageId")
+            or request_payload.get("_client_user_message_id")
+            or request_payload.get("client_user_message_id")
+        )
+        result["steerState"] = {
+            "accepted": bool(result_steer_state.get("accepted")) or bool(row.get("result_json")),
+            "targetThreadId": result_steer_state.get("targetThreadId") or row.get("thread_id") or request_payload.get("thread_id"),
+            "targetTurnId": result_steer_state.get("targetTurnId") or row.get("turn_id") or request_payload.get("expected_turn_id"),
+            "clientUserMessageId": client_user_message_id,
+        }
     return result
 
 

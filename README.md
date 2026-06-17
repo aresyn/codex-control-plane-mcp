@@ -59,9 +59,6 @@ That gives you a simple contract:
 | Restart recovery | ad hoc | persisted operation state |
 | Diagnostics | logs only | health, diagnostics, repair tools |
 
-For a more detailed decision guide, see
-[docs/THIN_WRAPPERS.md](docs/THIN_WRAPPERS.md).
-
 ## Current support
 
 - Full live target: Windows with Codex Desktop and `codex-app-server`.
@@ -87,6 +84,7 @@ Recommended first-run posture:
 - Active duplicate prompt detection.
 - SQLite leases and heartbeats for competing MCP processes.
 - Recovery after MCP restart during `thread/start` or `turn/start`.
+- Durable `turn/steer` for adding context to an active turn without creating a second turn.
 - Plan Mode workflows: start plan, poll, approve, execute, read final report.
 - Pending approvals and questions exposed as pollable MCP state.
 - Turn interrupts by `threadId`/`turnId`, `operationId`, or `workflowId`.
@@ -208,6 +206,18 @@ codex_get_operation_status(operationId)
 
 Use the same `client_request_id` when a caller retries after a transport timeout.
 The retry returns the existing operation instead of creating another turn.
+
+Steer an active turn:
+
+```text
+codex_submit_task(operation_type="steer_turn", thread_id=..., expected_turn_id=..., message=...)
+  -> operationId
+codex_get_operation_status(operationId)
+  -> follows the target turn until completed / failed / interrupted
+```
+
+Use `steer_turn` only while the target turn is active. For a completed thread,
+use `send_message` instead.
 
 Drive Plan Mode:
 

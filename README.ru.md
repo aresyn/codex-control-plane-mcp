@@ -80,6 +80,7 @@ MCP client / orchestrator
 - Поиск активных дублей prompt.
 - SQLite leases и heartbeats для конкурирующих MCP-процессов.
 - Восстановление после рестарта MCP во время `thread/start` или `turn/start`.
+- Durable `turn/steer`, чтобы добавить контекст в активный turn без второго turn.
 - Plan Mode workflows: план, polling, approve, execution, финальный отчет.
 - Pending approvals и вопросы как pollable MCP state.
 - Interrupt turns по `threadId`/`turnId`, `operationId` или `workflowId`.
@@ -202,6 +203,18 @@ codex_get_operation_status(operationId)
 Используйте тот же `client_request_id`, когда клиент повторяет запрос после
 transport timeout. Retry вернет существующую operation, а не создаст еще один
 turn.
+
+Steer активного turn:
+
+```text
+codex_submit_task(operation_type="steer_turn", thread_id=..., expected_turn_id=..., message=...)
+  -> operationId
+codex_get_operation_status(operationId)
+  -> следует за target turn до completed / failed / interrupted
+```
+
+Используйте `steer_turn` только пока target turn активен. Для завершенного
+thread нужен обычный `send_message`.
 
 Plan Mode:
 

@@ -80,6 +80,35 @@ Explicit tool arguments always win over server defaults. A client may submit one
 task with `sandbox="read-only"` or `approval_policy="on-request"` without
 changing the server configuration.
 
+## Durable operation types
+
+`codex_submit_task` supports these operation types:
+
+- `start_chat`: create a Codex thread and start a turn.
+- `send_message`: resume an existing thread and start a new turn.
+- `execute_plan`: execute an approved Plan Mode workflow or existing chat plan.
+- `steer_turn`: send extra text to an active turn through app-server `turn/steer`.
+
+`steer_turn` requires `thread_id`, `expected_turn_id`, and `message`. It does
+not create a new turn and does not participate in prompt duplicate detection.
+After app-server accepts the steering input, the operation remains `running`
+and follows the target turn until the turn reaches a terminal state.
+
+For strict retry safety, pass `client_request_id`. Reusing the same
+`client_request_id` returns the same steering operation and does not send a
+second `turn/steer` request. Calls without `client_request_id` are treated as
+new steering commands.
+
+Status payloads for `steer_turn` include normal operation fields plus:
+
+- `steerState.accepted`
+- `steerState.targetThreadId`
+- `steerState.targetTurnId`
+- `steerState.clientUserMessageId`
+
+If the target turn is missing, MCP returns `CODEX_TURN_NOT_FOUND`. If the target
+turn is terminal or belongs to another thread, MCP returns `INVALID_ARGUMENT`.
+
 ## Compatibility tools
 
 These tools remain available for UI support, direct reads, diagnostics, and old
