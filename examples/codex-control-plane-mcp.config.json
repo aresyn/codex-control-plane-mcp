@@ -1,0 +1,16 @@
+{
+  "codex_home": "%USERPROFILE%\\.codex",
+  "projects_root": "C:\\Users\\you\\Projects",
+  "projects_registry_path": "C:\\Users\\you\\Projects\\projects.json",
+  "allowed_roots": ["C:\\Users\\you\\Projects"],
+  "state_db_path": "state\\codex-mcp-state.sqlite3",
+  "hook_history_enabled": true,
+  "hook_history_max_text_chars": 20000,
+  "kb_history_projects_root": "C:\\Users\\you\\Projects\\_kb_history\\projects",
+  "default_approval_policy": "never",
+  "default_sandbox_policy": { "type": "dangerFullAccess" },
+  "default_model": "gpt-5.5",
+  "default_effort": "xhigh",
+  "deepseek_env_path": ".env",
+  "deepseek_summary_enabled": false
+}

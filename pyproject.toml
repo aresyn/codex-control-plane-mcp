@@ -1,0 +1,61 @@
+[project]
+name = "codex-control-plane-mcp"
+version = "0.1.1"
+description = "Durable MCP control plane for long-running Codex Desktop tasks."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Codex Control Plane MCP contributors" }]
+keywords = [
+    "agent-tools",
+    "codex",
+    "codex-desktop",
+    "mcp",
+    "model-context-protocol",
+    "openai-codex",
+    "openclaw",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development",
+    "Topic :: Software Development :: Quality Assurance",
+    "Typing :: Typed",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "build>=1.2",
+    "pytest>=8",
+]
+
+[project.urls]
+Homepage = "https://github.com/aresyn/codex-control-plane-mcp"
+Documentation = "https://github.com/aresyn/codex-control-plane-mcp#readme"
+Issues = "https://github.com/aresyn/codex-control-plane-mcp/issues"
+Source = "https://github.com/aresyn/codex-control-plane-mcp"
+
+[project.scripts]
+codex-control-plane-mcp = "codex_control_plane_mcp.server:main"
+codex-control-plane-mcp-hooks = "codex_control_plane_mcp.hook_installer:main"
+codex-control-plane-mcp-admin = "codex_control_plane_mcp.admin:main"
+openclaw-codex-mcp = "openclaw_codex_mcp.server:main"
+openclaw-codex-mcp-hooks = "openclaw_codex_mcp.hook_installer:main"
+
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["openclaw_codex_mcp*", "codex_control_plane_mcp*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,5 @@
+MCP LIVE TEST / DO NOT MODIFY FILES
+
+This is a read-only smoke test for codex-control-plane-mcp.
+Do not edit files, do not run destructive commands, and do not access secrets.
+Reply with one short sentence confirming that you received this marker.

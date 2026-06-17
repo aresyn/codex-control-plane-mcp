@@ -1,0 +1,50 @@
+name: Publish to PyPI
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/codex-control-plane-mcp/
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install test and build tools
+        run: python -m pip install -e ".[dev]" twine
+
+      - name: Unit and contract tests
+        run: python -m pytest -q
+
+      - name: Compile
+        run: python -m compileall -q openclaw_codex_mcp codex_control_plane_mcp tests scripts
+
+      - name: MCP protocol smoke
+        run: python scripts/mcp_live_smoke.py --scenario protocol
+
+      - name: Build wheel and sdist
+        run: python -m build
+
+      - name: Check package metadata
+        run: python -m twine check dist/*
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
