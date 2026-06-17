@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/aresyn-codex-control-plane-mcp-badge.png)](https://mseep.ai/app/aresyn-codex-control-plane-mcp)
+
 # Codex Control Plane MCP
 
 English | [Русский](README.ru.md)
