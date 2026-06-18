@@ -959,6 +959,41 @@ class OperationLeaseStorageTests(unittest.TestCase):
         self.assertIsNotNone(second)
         self.assertEqual("worker-2", second["lease_owner"])
 
+    def test_operation_lease_rejects_config_fingerprint_mismatch(self) -> None:
+        with TemporaryDirectory() as tmp:
+            storage = McpStorage(Path(tmp) / "mcp.sqlite")
+            storage.connect()
+            try:
+                row = _storage_operation_row("op-fingerprint")
+                row["submitter_config_fingerprint"] = "submitter-a"
+                storage.create_operation(row)
+                acquired = storage.acquire_operation_lease(
+                    "op-fingerprint",
+                    lease_owner="worker-b",
+                    now="2026-05-25T00:00:00+00:00",
+                    lease_expires_at="2026-05-25T00:02:00+00:00",
+                    worker_config_fingerprint="worker-b",
+                )
+                listed = storage.list_startable_operations(
+                    now="2026-05-25T00:00:00+00:00",
+                    worker_config_fingerprint="worker-b",
+                )
+                emergency = storage.acquire_operation_lease(
+                    "op-fingerprint",
+                    lease_owner="worker-b",
+                    now="2026-05-25T00:00:01+00:00",
+                    lease_expires_at="2026-05-25T00:02:01+00:00",
+                    worker_config_fingerprint="worker-b",
+                    allow_cross_config_recovery=True,
+                )
+            finally:
+                storage.close()
+
+        self.assertIsNone(acquired)
+        self.assertEqual([], [item["operation_id"] for item in listed])
+        self.assertIsNotNone(emergency)
+        self.assertEqual("worker-b", emergency["lease_owner"])
+
     def test_progress_events_are_idempotent_and_summarized(self) -> None:
         with TemporaryDirectory() as tmp:
             storage = McpStorage(Path(tmp) / "mcp.sqlite")
@@ -1020,6 +1055,65 @@ class OperationLeaseStorageTests(unittest.TestCase):
         self.assertEqual(2, summary["eventCount"])
         self.assertEqual("token_usage", summary["tokenUsageEvent"]["category"])
         self.assertEqual(1, len(summary["warnings"]))
+
+    def test_turn_tracker_ignores_non_turn_ready_and_finalizes_only_on_turn_completed(self) -> None:
+        with TemporaryDirectory() as tmp:
+            storage = McpStorage(Path(tmp) / "mcp.sqlite")
+            storage.connect()
+            try:
+                tracker = TurnTracker(storage)
+                tracker.register_turn(
+                    turn_id="turn-incident",
+                    thread_id="thread-incident",
+                    chat_id="thread-incident",
+                    project_id="project",
+                    project_path=str(Path(tmp)),
+                    status="running",
+                    started_at="2026-05-25T00:00:00+00:00",
+                    user_message="fresh user prompt",
+                )
+                tracker.record_event(
+                    {
+                        "method": "mcpServer/startupStatus/updated",
+                        "params": {"threadId": "thread-incident", "status": "ready"},
+                    },
+                    received_at="2026-05-25T00:00:01+00:00",
+                )
+                tracker.record_event(
+                    {
+                        "method": "item/created",
+                        "params": {
+                            "threadId": "thread-incident",
+                            "turnId": "turn-incident",
+                            "item": {"type": "agentMessage", "text": "intermediate assistant text"},
+                        },
+                    },
+                    received_at="2026-05-25T00:00:02+00:00",
+                )
+                before_terminal = tracker.get_turn_status("turn-incident", last_messages=10, message_max_chars=8000)
+                stored_before = storage.get_tracked_turn("turn-incident") or {}
+                tracker.record_event(
+                    {
+                        "method": "turn/completed",
+                        "params": {"threadId": "thread-incident", "turnId": "turn-incident"},
+                    },
+                    received_at="2026-05-25T00:00:03+00:00",
+                )
+                after_terminal = tracker.get_turn_status("turn-incident", last_messages=10, message_max_chars=8000)
+                stored_after = storage.get_tracked_turn("turn-incident") or {}
+            finally:
+                storage.close()
+
+        self.assertIsNotNone(before_terminal)
+        self.assertEqual("first_message_received", before_terminal["status"])
+        self.assertFalse(before_terminal["completionObserved"])
+        self.assertIsNone(before_terminal["finalMessage"])
+        self.assertIsNone(stored_before["final_message"])
+        self.assertEqual("intermediate assistant text", stored_before["last_assistant_message"])
+        self.assertEqual("completed", after_terminal["status"])
+        self.assertTrue(after_terminal["completionObserved"])
+        self.assertTrue(after_terminal["terminalEvidence"]["trusted"])
+        self.assertEqual("intermediate assistant text", stored_after["final_message"])
 
     def test_startup_recovery_resets_starting_without_turn_and_preserves_turn(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -2141,6 +2235,93 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertNotIn("secret normalized prompt should not leak", serialized)
         self.assertIn("hash-health", serialized)
 
+    def test_operation_status_corrects_premature_completed_when_turn_is_active(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = _search_service_config(root, root / ".codex" / "state_5.sqlite")
+            service = ToolService(config)
+            try:
+                operation = _storage_operation_row(
+                    "op-premature",
+                    status="completed",
+                    thread_id="thread-premature",
+                    turn_id="turn-premature",
+                    cwd=str(root),
+                    updated_at="2026-05-25T00:00:05+00:00",
+                )
+                operation["completed_at"] = "2026-05-25T00:00:05+00:00"
+                operation["final_report_json"] = json.dumps({"text": "stale final report"})
+                operation["latest_report_hash"] = "stale-hash"
+                service.storage.create_operation(operation)
+                service.storage.upsert_tracked_turn(
+                    {
+                        "turn_id": "turn-premature",
+                        "thread_id": "thread-premature",
+                        "chat_id": "thread-premature",
+                        "project_id": "project",
+                        "project_path": str(root),
+                        "status": "running",
+                        "started_at": "2026-05-25T00:00:00+00:00",
+                        "updated_at": "2026-05-25T00:00:06+00:00",
+                        "completed_at": None,
+                        "first_message_at": "2026-05-25T00:00:01+00:00",
+                        "final_message": None,
+                        "last_assistant_message": "working",
+                        "last_error": None,
+                        "source": "app_server",
+                    }
+                )
+                status = service.codex_get_operation_status({"operation_id": "op-premature"})
+                repaired = service.storage.get_operation("op-premature") or {}
+                diagnostics = service.codex_collect_diagnostics({"operation_id": "op-premature"})
+            finally:
+                asyncio.run(service.close())
+
+        self.assertEqual("running", status["status"])
+        self.assertTrue(status["reconciliationState"]["statusCorrected"])
+        self.assertNotIn("finalReport", status)
+        self.assertEqual("running", repaired["status"])
+        self.assertIsNone(repaired["completed_at"])
+        self.assertIsNone(repaired["final_report_json"])
+        self.assertTrue(any(item["name"] == "premature_terminal_operation" for item in diagnostics["checks"]))
+
+    def test_get_chat_falls_back_to_tracked_turn_when_catalog_misses_fresh_thread(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = _search_service_config(root, root / ".codex" / "state_5.sqlite")
+            service = ToolService(config)
+            try:
+                tracker = TurnTracker(service.storage)
+                tracker.register_turn(
+                    turn_id="turn-fresh",
+                    thread_id="thread-fresh",
+                    chat_id="thread-fresh",
+                    project_id="project",
+                    project_path=str(root),
+                    status="running",
+                    started_at="2026-05-25T00:00:00+00:00",
+                    user_message="fresh user prompt",
+                )
+                tracker.record_event(
+                    {
+                        "method": "item/created",
+                        "params": {
+                            "threadId": "thread-fresh",
+                            "turnId": "turn-fresh",
+                            "item": {"type": "agentMessage", "text": "fresh tracked response"},
+                        },
+                    },
+                    received_at="2026-05-25T00:00:01+00:00",
+                )
+                chat_status = service.codex_get_chat_status({"chat_id": "thread-fresh"})
+                chat = service.codex_get_chat({"chat_id": "thread-fresh", "format": "compact"})
+            finally:
+                asyncio.run(service.close())
+
+        self.assertIn(chat_status["transcript"]["source"], {"hook_history", "tracked_turn"})
+        self.assertTrue(chat["source"].startswith(("hook_history+", "tracked_turn+")))
+        self.assertIn("fresh tracked response", json.dumps(chat["messages"], ensure_ascii=False))
+
     def test_search_query_parser_handles_modes_and_escaping(self) -> None:
         phrase = build_fts_query('"точная фраза"', "auto")
         all_terms = build_fts_query("alpha beta!", "all_terms")
@@ -2602,7 +2783,10 @@ class McpDefinitionTests(unittest.TestCase):
                 asyncio.run(service.close())
 
         self.assertEqual("turn-live", result["turn_id"])
-        self.assertEqual("completed", result["status"])
+        self.assertEqual("ready", result["status"])
+        self.assertFalse(result["completionObserved"])
+        self.assertFalse(result["terminalEvidence"]["trusted"])
+        self.assertIsNone(result["finalMessage"])
         self.assertEqual(["live assistant"], [item["text"] for item in result["last_messages"]])
 
     def test_pending_interaction_tools_list_and_answer_live_request(self) -> None:

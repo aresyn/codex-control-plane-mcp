@@ -249,7 +249,10 @@ class ProjectChatCatalog:
         return self._state_rows_by_thread.get(thread_id)
 
     def locate_transcript(self, chat: Chat) -> str | None:
-        if chat.transcript_path and str(chat.transcript_path).startswith(HOOK_HISTORY_PREFIX):
+        if chat.transcript_path and (
+            str(chat.transcript_path).startswith(HOOK_HISTORY_PREFIX)
+            or str(chat.transcript_path).startswith("tracked_turn:")
+        ):
             return chat.transcript_path
         if chat.transcript_path and Path(chat.transcript_path).exists():
             return chat.transcript_path
@@ -275,6 +278,8 @@ class ProjectChatCatalog:
         if transcript_path.startswith(HOOK_HISTORY_PREFIX):
             thread_id = self.hook_history.thread_id_from_uri(transcript_path) or chat.thread_id
             return self.hook_history.infer_thread_status(thread_id)
+        if transcript_path.startswith("tracked_turn:"):
+            return chat.status, "medium", ["status inferred from tracked_turn journal"]
         path = Path(transcript_path)
         if path.is_dir():
             fingerprint = self.kb_history.fingerprint(path)

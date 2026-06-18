@@ -113,6 +113,7 @@ CREATE TABLE IF NOT EXISTS tracked_turns(
   completed_at TEXT,
   first_message_at TEXT,
   final_message TEXT,
+  last_assistant_message TEXT,
   last_error TEXT,
   accepted_at TEXT,
   request_id TEXT,
@@ -290,7 +291,10 @@ CREATE TABLE IF NOT EXISTS codex_operations(
   lease_expires_at TEXT,
   next_attempt_at TEXT,
   max_attempts INTEGER NOT NULL DEFAULT 3,
-  last_heartbeat_at TEXT
+  last_heartbeat_at TEXT,
+  submitter_config_fingerprint TEXT,
+  worker_config_fingerprint TEXT,
+  worker_config_summary_json TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_codex_operations_client_request
@@ -925,6 +929,7 @@ class McpStorage:
         self._add_column_if_missing("tracked_turns", "request_id", "TEXT")
         self._add_column_if_missing("tracked_turns", "process_generation", "INTEGER")
         self._add_column_if_missing("tracked_turns", "last_event_seq", "INTEGER NOT NULL DEFAULT 0")
+        self._add_column_if_missing("tracked_turns", "last_assistant_message", "TEXT")
         self._add_column_if_missing("codex_workflows", "execution_client_request_id", "TEXT")
         self._add_column_if_missing("codex_workflows", "app_server_generation", "INTEGER")
         self._add_column_if_missing("codex_workflows", "workflow_kind", "TEXT NOT NULL DEFAULT 'plan_then_execute'")
@@ -968,6 +973,9 @@ class McpStorage:
         self._add_column_if_missing("codex_operations", "next_attempt_at", "TEXT")
         self._add_column_if_missing("codex_operations", "max_attempts", "INTEGER NOT NULL DEFAULT 3")
         self._add_column_if_missing("codex_operations", "last_heartbeat_at", "TEXT")
+        self._add_column_if_missing("codex_operations", "submitter_config_fingerprint", "TEXT")
+        self._add_column_if_missing("codex_operations", "worker_config_fingerprint", "TEXT")
+        self._add_column_if_missing("codex_operations", "worker_config_summary_json", "TEXT")
         self._add_column_if_missing("pending_interactions", "recommended_action", "TEXT")
         self._add_column_if_missing("pending_interactions", "risk_summary_json", "TEXT")
         self._add_column_if_missing("pending_interactions", "answer_schema_json", "TEXT")
@@ -1154,6 +1162,7 @@ class McpStorage:
             "request_id": row.get("request_id"),
             "process_generation": row.get("process_generation"),
             "last_event_seq": int(row.get("last_event_seq") or 0),
+            "last_assistant_message": row.get("last_assistant_message"),
             "clear_last_error": int(bool(row.get("clear_last_error"))),
             **row,
         }
@@ -1162,13 +1171,13 @@ class McpStorage:
             INSERT INTO tracked_turns(
               turn_id, thread_id, chat_id, project_id, project_path, status,
               started_at, updated_at, completed_at, first_message_at,
-              final_message, last_error, accepted_at, request_id,
+              final_message, last_assistant_message, last_error, accepted_at, request_id,
               process_generation, last_event_seq, source
             )
             VALUES(
               :turn_id, :thread_id, :chat_id, :project_id, :project_path, :status,
               :started_at, :updated_at, :completed_at, :first_message_at,
-              :final_message, :last_error, :accepted_at, :request_id,
+              :final_message, :last_assistant_message, :last_error, :accepted_at, :request_id,
               :process_generation, :last_event_seq, :source
             )
             ON CONFLICT(turn_id) DO UPDATE SET
@@ -1182,6 +1191,7 @@ class McpStorage:
               completed_at=COALESCE(excluded.completed_at, tracked_turns.completed_at),
               first_message_at=COALESCE(tracked_turns.first_message_at, excluded.first_message_at),
               final_message=COALESCE(excluded.final_message, tracked_turns.final_message),
+              last_assistant_message=COALESCE(excluded.last_assistant_message, tracked_turns.last_assistant_message),
               accepted_at=COALESCE(tracked_turns.accepted_at, excluded.accepted_at),
               request_id=COALESCE(excluded.request_id, tracked_turns.request_id),
               process_generation=COALESCE(excluded.process_generation, tracked_turns.process_generation),
@@ -1204,6 +1214,7 @@ class McpStorage:
         updated_at: str,
         completed_at: str | None = None,
         final_message: str | None = None,
+        last_assistant_message: str | None = None,
         last_error: str | None = None,
         clear_last_error: bool = False,
     ) -> None:
@@ -1214,13 +1225,23 @@ class McpStorage:
               updated_at = ?,
               completed_at = COALESCE(?, completed_at),
               final_message = COALESCE(?, final_message),
+              last_assistant_message = COALESCE(?, last_assistant_message),
               last_error = CASE
                 WHEN ? THEN NULL
                 ELSE COALESCE(?, last_error)
               END
             WHERE turn_id = ?
             """,
-            (status, updated_at, completed_at, final_message, int(clear_last_error), last_error, turn_id),
+            (
+                status,
+                updated_at,
+                completed_at,
+                final_message,
+                last_assistant_message,
+                int(clear_last_error),
+                last_error,
+                turn_id,
+            ),
         )
         self.connection.commit()
 
@@ -1246,7 +1267,7 @@ class McpStorage:
                 UPDATE tracked_turns SET
                   updated_at = COALESCE(:created_at, updated_at),
                   first_message_at = COALESCE(first_message_at, :created_at),
-                  final_message = :text,
+                  last_assistant_message = :text,
                   last_event_seq = MAX(last_event_seq, :event_id)
                 WHERE turn_id = :turn_id
                 """,
@@ -1274,6 +1295,19 @@ class McpStorage:
             (thread_id,),
         ).fetchone()
         return dict(row) if row is not None else None
+
+    def list_tracked_turns_for_thread(self, thread_id: str, *, limit: int = 1000) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            """
+            SELECT *
+            FROM tracked_turns
+            WHERE thread_id = ?
+            ORDER BY COALESCE(started_at, updated_at), turn_id
+            LIMIT ?
+            """,
+            (thread_id, limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def get_running_tracked_turns(self) -> list[dict[str, Any]]:
         rows = self.connection.execute(
@@ -1806,6 +1840,9 @@ class McpStorage:
             "next_attempt_at": None,
             "max_attempts": 3,
             "last_heartbeat_at": None,
+            "submitter_config_fingerprint": None,
+            "worker_config_fingerprint": None,
+            "worker_config_summary_json": None,
             **row,
         }
         cursor = self.connection.execute(
@@ -1816,7 +1853,8 @@ class McpStorage:
               request_json, result_json, last_error, attempt_count,
               created_at, updated_at, started_at, completed_at, app_server_generation,
               latest_report_hash, final_report_json,
-              lease_owner, lease_expires_at, next_attempt_at, max_attempts, last_heartbeat_at
+              lease_owner, lease_expires_at, next_attempt_at, max_attempts, last_heartbeat_at,
+              submitter_config_fingerprint, worker_config_fingerprint, worker_config_summary_json
             )
             VALUES(
               :operation_id, :client_request_id, :operation_type, :status, :phase,
@@ -1824,7 +1862,8 @@ class McpStorage:
               :request_json, :result_json, :last_error, :attempt_count,
               :created_at, :updated_at, :started_at, :completed_at, :app_server_generation,
               :latest_report_hash, :final_report_json,
-              :lease_owner, :lease_expires_at, :next_attempt_at, :max_attempts, :last_heartbeat_at
+              :lease_owner, :lease_expires_at, :next_attempt_at, :max_attempts, :last_heartbeat_at,
+              :submitter_config_fingerprint, :worker_config_fingerprint, :worker_config_summary_json
             )
             """,
             payload,
@@ -1858,6 +1897,9 @@ class McpStorage:
             "next_attempt_at",
             "max_attempts",
             "last_heartbeat_at",
+            "submitter_config_fingerprint",
+            "worker_config_fingerprint",
+            "worker_config_summary_json",
         }
         selected = {key: value for key, value in fields.items() if key in allowed}
         if not selected:
@@ -1890,6 +1932,9 @@ class McpStorage:
         lease_owner: str,
         now: str,
         lease_expires_at: str,
+        worker_config_fingerprint: str | None = None,
+        allow_cross_config_recovery: bool = False,
+        config_mismatch_message: str | None = None,
     ) -> dict[str, Any] | None:
         startable = tuple(sorted(OPERATION_STARTABLE_STATUSES))
         placeholders = ",".join("?" for _ in startable)
@@ -1916,16 +1961,42 @@ class McpStorage:
             if row is None:
                 self.connection.rollback()
                 return None
+            submitter_fingerprint = row["submitter_config_fingerprint"] if "submitter_config_fingerprint" in row.keys() else None
+            if (
+                not allow_cross_config_recovery
+                and submitter_fingerprint
+                and worker_config_fingerprint
+                and submitter_fingerprint != worker_config_fingerprint
+            ):
+                self.connection.execute(
+                    """
+                    UPDATE codex_operations
+                    SET last_error = ?,
+                        updated_at = ?,
+                        worker_config_fingerprint = ?
+                    WHERE operation_id = ?
+                    """,
+                    (
+                        config_mismatch_message
+                        or "Operation was not acquired because MCP config fingerprint differs from the submitter.",
+                        now,
+                        worker_config_fingerprint,
+                        operation_id,
+                    ),
+                )
+                self.connection.commit()
+                return None
             self.connection.execute(
                 """
                 UPDATE codex_operations
                 SET lease_owner = ?,
                     lease_expires_at = ?,
                     last_heartbeat_at = ?,
-                    updated_at = ?
+                    updated_at = ?,
+                    worker_config_fingerprint = ?
                 WHERE operation_id = ?
                 """,
-                (lease_owner, lease_expires_at, now, now, operation_id),
+                (lease_owner, lease_expires_at, now, now, worker_config_fingerprint, operation_id),
             )
             self.connection.commit()
         except Exception:
@@ -1964,9 +2035,27 @@ class McpStorage:
         self.connection.commit()
         return cursor.rowcount > 0
 
-    def list_startable_operations(self, *, now: str, limit: int = 50) -> list[dict[str, Any]]:
+    def list_startable_operations(
+        self,
+        *,
+        now: str,
+        limit: int = 50,
+        worker_config_fingerprint: str | None = None,
+        allow_cross_config_recovery: bool = False,
+    ) -> list[dict[str, Any]]:
         startable = tuple(sorted(OPERATION_STARTABLE_STATUSES))
         placeholders = ",".join("?" for _ in startable)
+        fingerprint_clause = ""
+        params: list[Any] = [*startable, now, now]
+        if not allow_cross_config_recovery and worker_config_fingerprint:
+            fingerprint_clause = """
+              AND (
+                submitter_config_fingerprint IS NULL
+                OR submitter_config_fingerprint = ?
+              )
+            """
+            params.append(worker_config_fingerprint)
+        params.append(limit)
         rows = self.connection.execute(
             f"""
             SELECT *
@@ -1975,10 +2064,11 @@ class McpStorage:
               AND COALESCE(attempt_count, 0) < COALESCE(max_attempts, 3)
               AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
               AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?)
+              {fingerprint_clause}
             ORDER BY updated_at ASC
             LIMIT ?
             """,
-            (*startable, now, now, limit),
+            tuple(params),
         ).fetchall()
         return [dict(row) for row in rows]
 

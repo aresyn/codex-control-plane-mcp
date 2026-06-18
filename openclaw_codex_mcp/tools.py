@@ -44,7 +44,7 @@ from .errors import (
 from .hook_history import HOOK_HISTORY_PREFIX
 from .hook_installer import hook_status as installed_hook_status
 from .logging_utils import get_logger
-from .models import Chat, TranscriptMessage, TranscriptSummary
+from .models import Chat, TranscriptMessage, TranscriptSummary, TranscriptTurn
 from .pending_interactions import PendingInteractionManager, interaction_row_to_tool
 from .prompt_dedup import DEFAULT_PROMPT_SIMILARITY_THRESHOLD, normalize_prompt, prompt_hash, prompt_similarity
 from .protocol import with_output_schema
@@ -70,6 +70,8 @@ from .statuses import (
     OPERATION_STARTABLE_STATUSES,
     OPERATION_TERMINAL_STATUSES,
     TURN_ACTIVE_STATUSES,
+    TURN_COMPLETION_OBSERVED_STATUSES,
+    TURN_TERMINAL_STATUSES,
 )
 from .storage import McpStorage
 from .transcripts import parse_transcript
@@ -86,6 +88,7 @@ IMAGE_INPUT_URL_MAX_CHARS = 8192
 SUPPORTED_IMAGE_INPUT_SUFFIXES = {".gif", ".jpeg", ".jpg", ".png", ".webp"}
 SUPPORTED_IMAGE_INPUT_DETAILS = {"auto", "low", "high", "original"}
 GOAL_COMPLETION_ACTIONS = {"clear", "set_complete", "leave"}
+TRACKED_TURN_HISTORY_PREFIX = "tracked_turn:"
 LOG = get_logger("tools")
 PROMPT_OPERATION_ACTIVE_STATUSES = OPERATION_ACTIVE_STATUSES
 CONTRACT_VERSION = "1"
@@ -900,6 +903,9 @@ class ToolService:
         self.storage = McpStorage(self.config.state_db_path)
         self.storage.connect()
         self._worker_owner = f"mcp:{os.getpid()}:{uuid.uuid4().hex}"
+        self._config_fingerprint = _config_fingerprint(self.config)
+        self._config_summary_json = json.dumps(_config_fingerprint_summary(self.config), ensure_ascii=False, sort_keys=True)
+        self._allow_cross_config_recovery = os.environ.get("CODEX_MCP_ALLOW_CROSS_CONFIG_RECOVERY") == "1"
         self._startup_recovery = self.storage.recover_startup_operations(now=_now_iso())
         if self._startup_recovery.get("resetOperationIds") or self._startup_recovery.get("runningOperationIds"):
             LOG.info("operation startup recovery owner=%s result=%s", self._worker_owner, self._startup_recovery)
@@ -2223,7 +2229,7 @@ class ToolService:
         chat_id = _required_string(args, "chat_id")
         project_id = args.get("project_id")
         preview_max_chars = _bounded_int(args.get("preview_max_chars", 300), 20, 4000)
-        chat = self.catalog.get_chat(chat_id, str(project_id) if project_id else None)
+        chat = self._resolve_chat_for_read(chat_id, str(project_id) if project_id else None)
         if chat is None:
             raise thread_not_found(chat_id)
         parsed, source_info = self._load_chat_summary(
@@ -2263,7 +2269,7 @@ class ToolService:
     def codex_get_chat(self, args: dict[str, Any]) -> dict[str, Any]:
         chat_id = _required_string(args, "chat_id")
         project_id = args.get("project_id")
-        chat = self.catalog.get_chat(chat_id, str(project_id) if project_id else None)
+        chat = self._resolve_chat_for_read(chat_id, str(project_id) if project_id else None)
         if chat is None:
             raise thread_not_found(chat_id)
         summary, source_info = self._load_chat_summary(
@@ -2875,6 +2881,8 @@ class ToolService:
                 "started_at": None,
                 "completed_at": None,
                 "app_server_generation": None,
+                "submitter_config_fingerprint": self._config_fingerprint,
+                "worker_config_summary_json": self._config_summary_json,
             }
         )
         self.storage.create_workflow(
@@ -3415,24 +3423,24 @@ class ToolService:
             if kb is None:
                 raise turn_not_found(turn_id)
             return self._attach_progress_status(kb, turn_id, progress_events=progress_events, progress_max_chars=progress_max_chars)
+        live_status = str(live.get("status") or "unknown")
+        live_unknown = live_status in {"unknown", "unknown_after_app_server_exit"}
+        live_active = live_status in TURN_ACTIVE_STATUSES or live_status in {"starting", "ready"}
         if hook is not None:
-            live_status = str(live.get("status") or "unknown")
-            hook_status = str(hook.get("status") or "unknown")
-            if live_status in {"starting", "running", "unknown", "unknown_after_app_server_exit"} and hook_status in {"completed", "failed", "aborted", "cancelled", "canceled"}:
+            if live_unknown and _turn_status_has_trusted_terminal_evidence(hook):
                 hook["source"] = "app_server+hook_history"
                 return self._attach_progress_status(hook, turn_id, progress_events=progress_events, progress_max_chars=progress_max_chars)
             if not live.get("last_messages") and hook.get("last_messages"):
-                hook["source"] = "app_server+hook_history"
-                return self._attach_progress_status(hook, turn_id, progress_events=progress_events, progress_max_chars=progress_max_chars)
+                live = _merge_turn_messages(live, hook, source="app_server+hook_history")
         if kb is not None:
-            live_status = str(live.get("status") or "unknown")
-            kb_status = str(kb.get("status") or "unknown")
-            if live_status in {"starting", "running", "unknown"} and kb_status in {"completed", "failed", "aborted", "cancelled", "canceled"}:
+            if live_unknown and _turn_status_has_trusted_terminal_evidence(kb):
                 kb["source"] = "app_server+kb_history"
                 return self._attach_progress_status(kb, turn_id, progress_events=progress_events, progress_max_chars=progress_max_chars)
             if not live.get("last_messages") and kb.get("last_messages"):
-                kb["source"] = "app_server+kb_history"
-                return self._attach_progress_status(kb, turn_id, progress_events=progress_events, progress_max_chars=progress_max_chars)
+                live = _merge_turn_messages(live, kb, source="app_server+kb_history")
+        if live_active:
+            live["completion_observed"] = False
+            live["completionObserved"] = False
         return live
 
     async def codex_execute_plan(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -3778,6 +3786,8 @@ class ToolService:
             "started_at": None,
             "completed_at": None,
             "app_server_generation": None,
+            "submitter_config_fingerprint": self._config_fingerprint,
+            "worker_config_summary_json": self._config_summary_json,
         }
         created = self.storage.create_operation(row)
         operation = self.storage.get_operation(operation_id) if created else self.storage.get_operation_by_client_request_id(client_request_id)
@@ -3813,6 +3823,14 @@ class ToolService:
             return
         if str(operation.get("status") or "") not in OPERATION_STARTABLE_STATUSES:
             return
+        if self._operation_config_mismatch(operation):
+            self.storage.update_operation(
+                operation_id,
+                last_error="Operation belongs to a different MCP config fingerprint. Inspect diagnostics or set CODEX_MCP_ALLOW_CROSS_CONFIG_RECOVERY=1 for manual emergency recovery.",
+                worker_config_fingerprint=self._config_fingerprint,
+                updated_at=_now_iso(),
+            )
+            return
         task = self._operation_tasks.get(operation_id)
         if task is not None and not task.done():
             return
@@ -3836,7 +3854,12 @@ class ToolService:
             asyncio.get_running_loop()
         except RuntimeError:
             return
-        for operation in self.storage.list_startable_operations(now=_now_iso(), limit=limit):
+        for operation in self.storage.list_startable_operations(
+            now=_now_iso(),
+            limit=limit,
+            worker_config_fingerprint=self._config_fingerprint,
+            allow_cross_config_recovery=self._allow_cross_config_recovery,
+        ):
             self._schedule_operation_if_needed(operation)
 
     async def _operation_heartbeat_loop(self, operation_id: str) -> None:
@@ -3857,6 +3880,9 @@ class ToolService:
             lease_owner=self._worker_owner,
             now=_now_iso(),
             lease_expires_at=_future_iso(OPERATION_LEASE_TTL_SECONDS),
+            worker_config_fingerprint=self._config_fingerprint,
+            allow_cross_config_recovery=self._allow_cross_config_recovery,
+            config_mismatch_message="Operation belongs to a different MCP config fingerprint. Set CODEX_MCP_ALLOW_CROSS_CONFIG_RECOVERY=1 only for manual emergency recovery.",
         )
         if operation is None:
             self.storage.mark_operation_failed_if_attempts_exhausted(
@@ -4193,6 +4219,13 @@ class ToolService:
         response["operationSource"] = "durable_queue"
         response["lease_state"] = self._operation_lease_state(latest)
         response["leaseState"] = response["lease_state"]
+        if self._operation_config_mismatch(latest):
+            response["configRecoveryState"] = {
+                "state": "mismatch",
+                "submitterConfigFingerprint": latest.get("submitter_config_fingerprint"),
+                "workerConfigFingerprint": self._config_fingerprint,
+                "crossConfigRecoveryAllowed": self._allow_cross_config_recovery,
+            }
         prompt_submission = self.storage.get_prompt_submission_by_operation(operation_id)
         if prompt_submission is not None:
             response["promptSubmissionId"] = prompt_submission.get("prompt_submission_id")
@@ -4215,6 +4248,7 @@ class ToolService:
         else:
             response["dedupState"] = {"state": "not_recorded", "deduplicated": False}
         response["turnStatus"] = turn_status
+        response["reconciliationState"] = _operation_reconciliation_state(latest, turn_status)
         response["latestMessages"] = (turn_status or {}).get("latestMessages") or (turn_status or {}).get("last_messages") or []
         if turn_status and "progressEvents" in turn_status:
             response["progressEvents"] = turn_status.get("progressEvents") or []
@@ -4255,8 +4289,13 @@ class ToolService:
         response["source"] = "live" if turn_status and turn_status.get("source") == "live" else "storage"
         response["stalenessSeconds"] = _staleness_seconds(str(latest.get("updated_at") or ""))
         response["nextRecommendedAction"] = _operation_next_action(response)
+        if response.get("configRecoveryState", {}).get("state") == "mismatch":
+            response["nextRecommendedAction"] = "inspect_diagnostics"
         response["recommendedPollAfterSeconds"] = _operation_poll_after(response)
         response["pollRecommended"] = response["status"] not in OPERATION_TERMINAL_STATUSES
+        if response.get("configRecoveryState", {}).get("state") == "mismatch":
+            response["recommendedPollAfterSeconds"] = 0
+            response["pollRecommended"] = False
         if include_events and (thread_id or turn_id):
             response["events"] = [
                 event_to_tool(row, include_payload=False)
@@ -4282,6 +4321,8 @@ class ToolService:
         output_schema_state = request_payload.get("_output_schema_state") if isinstance(request_payload.get("_output_schema_state"), dict) else None
         schema_hash = _optional_string((output_schema_state or {}).get("schemaHash")) or _optional_string(request_payload.get("output_schema_hash"))
         final_text = _optional_string((turn_status or {}).get("finalMessage")) or _optional_string((turn_status or {}).get("final_message"))
+        if not _turn_status_has_trusted_terminal_evidence(turn_status):
+            return None
         if turn_status is not None and str(turn_status.get("status") or "") == "completed" and final_text:
             report_hash, report_json = _stored_final_report_json(
                 final_text=final_text,
@@ -4333,23 +4374,37 @@ class ToolService:
     def _reconcile_operation_with_turn(self, operation: dict[str, Any], turn_status: dict[str, Any]) -> dict[str, Any]:
         turn_state = str(turn_status.get("status") or "")
         current_status = str(operation.get("status") or "")
+        trusted_terminal = _turn_status_has_trusted_terminal_evidence(turn_status)
+        turn_active = turn_state in TURN_ACTIVE_STATUSES or turn_state in {"starting", "ready"}
         next_status = current_status
         next_phase = str(operation.get("phase") or current_status or "unknown")
         completed_at = operation.get("completed_at")
         last_error = operation.get("last_error")
-        if turn_state in {"completed"}:
+        latest_report_hash = operation.get("latest_report_hash")
+        final_report_json = operation.get("final_report_json")
+        status_corrected = False
+        if current_status in OPERATION_TERMINAL_STATUSES and not trusted_terminal:
+            next_status = "running"
+            next_phase = "running"
+            completed_at = None
+            last_error = None
+            latest_report_hash = None
+            final_report_json = None
+            status_corrected = True
+        elif turn_state in {"completed"} and trusted_terminal:
             next_status = "completed"
             next_phase = "completed"
-            completed_at = completed_at or _now_iso()
-        elif turn_state in {"failed", "aborted", "cancelled", "canceled", "interrupted"}:
+            completed_at = turn_status.get("completedAt") or turn_status.get("completed_at") or completed_at or _now_iso()
+            last_error = None
+        elif turn_state in {"failed", "aborted", "cancelled", "canceled", "interrupted"} and trusted_terminal:
             next_status = "failed" if turn_state == "failed" else turn_state
             next_phase = next_status
-            completed_at = completed_at or _now_iso()
+            completed_at = turn_status.get("completedAt") or turn_status.get("completed_at") or completed_at or _now_iso()
             last_error = turn_status.get("last_error") or last_error
-        elif turn_state == "unknown_after_app_server_exit":
+        elif turn_state == "unknown_after_app_server_exit" and trusted_terminal:
             next_status = "unknown_after_app_server_exit"
             next_phase = "unknown_after_app_server_exit"
-            completed_at = completed_at or _now_iso()
+            completed_at = turn_status.get("completedAt") or turn_status.get("completed_at") or completed_at or _now_iso()
             last_error = turn_status.get("lastError") or turn_status.get("last_error") or last_error
         elif turn_state in {"waiting_for_approval", "waiting_for_user_input"}:
             next_status = turn_state
@@ -4357,13 +4412,22 @@ class ToolService:
         elif turn_state:
             next_status = "running" if current_status not in OPERATION_STARTABLE_STATUSES else current_status
             next_phase = "running" if next_status == "running" else next_phase
-        if next_status != current_status or next_phase != operation.get("phase") or completed_at != operation.get("completed_at") or last_error != operation.get("last_error"):
+        if (
+            next_status != current_status
+            or next_phase != operation.get("phase")
+            or completed_at != operation.get("completed_at")
+            or last_error != operation.get("last_error")
+            or latest_report_hash != operation.get("latest_report_hash")
+            or final_report_json != operation.get("final_report_json")
+        ):
             self.storage.update_operation(
                 str(operation["operation_id"]),
                 status=next_status,
                 phase=next_phase,
                 completed_at=completed_at,
                 last_error=last_error,
+                latest_report_hash=latest_report_hash,
+                final_report_json=final_report_json,
                 updated_at=_now_iso(),
             )
             self.storage.update_prompt_submission_by_operation(
@@ -4371,8 +4435,18 @@ class ToolService:
                 status=next_status,
                 updated_at=_now_iso(),
             )
-            return self.storage.get_operation(str(operation["operation_id"])) or operation
+            updated_operation = self.storage.get_operation(str(operation["operation_id"])) or operation
+            if status_corrected:
+                updated_operation = dict(updated_operation)
+                updated_operation["_status_corrected"] = True
+            return updated_operation
         return operation
+
+    def _operation_config_mismatch(self, operation: dict[str, Any]) -> bool:
+        if self._allow_cross_config_recovery:
+            return False
+        submitter = _optional_string(operation.get("submitter_config_fingerprint"))
+        return bool(submitter and submitter != self._config_fingerprint)
 
     def _attach_progress_status(
         self,
@@ -4431,7 +4505,15 @@ class ToolService:
         ]
         final_message = _truncate_text(turn.get("final_message"), message_max_chars)[0]
         status_value = _turn_status_with_final_message(turn["status"], final_message)
-        completion_observed = status_value in {"completed", "failed", "aborted", "cancelled", "canceled", "interrupted"}
+        terminal_evidence = _terminal_evidence_from_status(
+            status_value,
+            source="app_server",
+            observed_at=turn.get("completed_at"),
+            method="turn_lifecycle_event",
+        )
+        completion_observed = bool(terminal_evidence.get("trusted"))
+        if not completion_observed:
+            final_message = None
         last_error = _tracked_turn_last_error(turn)
         plans = [_plan_row_to_tool(row, message_max_chars) for row in self.storage.get_tracked_turn_plans(turn_id)]
         latest_plan = _latest_plan(plans)
@@ -4448,6 +4530,7 @@ class ToolService:
             "status": status_value,
             "completion_observed": completion_observed,
             "completionObserved": completion_observed,
+            "terminalEvidence": terminal_evidence,
             "started_at": turn.get("started_at"),
             "startedAt": turn.get("started_at"),
             "updated_at": turn.get("updated_at"),
@@ -4510,7 +4593,15 @@ class ToolService:
         ][-last_messages:]
         chat = self.catalog.get_chat(summary.thread_id or hook_thread_id)
         final_message = _truncate_text(turns_last_assistant(summary.messages, turn_id), message_max_chars)[0]
-        completion_observed = turn.status in {"completed", "failed", "aborted", "cancelled", "canceled", "interrupted"}
+        terminal_evidence = _terminal_evidence_from_status(
+            turn.status,
+            source="hook_history",
+            observed_at=turn.completed_at,
+            method="hook_terminal_marker",
+        )
+        completion_observed = bool(terminal_evidence.get("trusted"))
+        if not completion_observed:
+            final_message = None
         plans = [_plan_row_to_tool(row, message_max_chars) for row in self.storage.get_tracked_turn_plans(turn_id)]
         latest_plan = _latest_plan(plans)
         return {
@@ -4526,6 +4617,7 @@ class ToolService:
             "status": turn.status,
             "completion_observed": completion_observed,
             "completionObserved": completion_observed,
+            "terminalEvidence": terminal_evidence,
             "started_at": turn.started_at,
             "startedAt": turn.started_at,
             "updated_at": turn.completed_at or summary.updated_at,
@@ -4583,7 +4675,15 @@ class ToolService:
         ][-last_messages:]
         chat = self.catalog.get_chat(summary.thread_id or thread_dir.name)
         final_message = messages[-1]["text"] if messages else None
-        completion_observed = turn.status in {"completed", "failed", "aborted", "cancelled", "canceled", "interrupted"}
+        terminal_evidence = _terminal_evidence_from_status(
+            turn.status,
+            source="kb_history",
+            observed_at=turn.completed_at,
+            method="kb_terminal_marker",
+        )
+        completion_observed = bool(terminal_evidence.get("trusted"))
+        if not completion_observed:
+            final_message = None
         plans = [_plan_row_to_tool(row, message_max_chars) for row in self.storage.get_tracked_turn_plans(turn_id)]
         latest_plan = _latest_plan(plans)
         return {
@@ -4599,6 +4699,7 @@ class ToolService:
             "status": turn.status,
             "completion_observed": completion_observed,
             "completionObserved": completion_observed,
+            "terminalEvidence": terminal_evidence,
             "started_at": turn.started_at,
             "startedAt": turn.started_at,
             "updated_at": turn.completed_at or summary.updated_at,
@@ -5315,6 +5416,17 @@ class ToolService:
         transcript_path = self.catalog.locate_transcript(chat)
         if transcript_path is None:
             raise transcript_not_found(chat.chat_id)
+        if transcript_path.startswith(TRACKED_TURN_HISTORY_PREFIX):
+            thread_id = transcript_path[len(TRACKED_TURN_HISTORY_PREFIX) :] or chat.thread_id
+            summary = self._tracked_turn_transcript_summary(thread_id, chat=chat)
+            fingerprint_size = sum(len(str(message.text or "")) for message in summary.messages)
+            return summary, {
+                "path": transcript_path,
+                "size": fingerprint_size,
+                "mtime_ns": _stable_mtime_ns(summary.updated_at),
+                "mtime": summary.updated_at,
+                "source": "tracked_turn",
+            }
         if transcript_path.startswith(HOOK_HISTORY_PREFIX):
             thread_id = self.catalog.hook_history.thread_id_from_uri(transcript_path) or chat.thread_id
             summary = self.catalog.hook_history.parse_thread(thread_id)
@@ -5359,6 +5471,112 @@ class ToolService:
             "mtime": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
             "source": "transcript",
         }
+
+    def _resolve_chat_for_read(self, chat_id: str, project_id: str | None) -> Chat | None:
+        chat = self.catalog.get_chat(chat_id, project_id)
+        if chat is not None:
+            return chat
+        with suppress(Exception):
+            self.catalog.refresh()
+        chat = self.catalog.get_chat(chat_id, project_id)
+        if chat is not None:
+            return chat
+
+        hook_uri = self.catalog.hook_history.locate_thread(chat_id)
+        if hook_uri is not None:
+            hook_thread = self.storage.get_hook_thread(chat_id) or {}
+            project_path = _optional_string(hook_thread.get("project_path"))
+            return Chat(
+                chat_id=chat_id,
+                thread_id=chat_id,
+                project_id=project_id or (project_id_for_path(project_path) if project_path else None),
+                project_path=project_path,
+                title=_optional_string(hook_thread.get("title")),
+                created_at=_optional_string(hook_thread.get("created_at")),
+                updated_at=_optional_string(hook_thread.get("updated_at")),
+                transcript_path=hook_uri,
+                status="unknown",
+                source="hook_history",
+            )
+
+        tracked_turn = self.storage.get_latest_tracked_turn_for_thread(chat_id)
+        if tracked_turn is not None:
+            project_path = _optional_string(tracked_turn.get("project_path"))
+            return Chat(
+                chat_id=chat_id,
+                thread_id=chat_id,
+                project_id=project_id or _optional_string(tracked_turn.get("project_id")) or (project_id_for_path(project_path) if project_path else None),
+                project_path=project_path,
+                title=chat_id[:16],
+                created_at=_optional_string(tracked_turn.get("started_at")),
+                updated_at=_optional_string(tracked_turn.get("updated_at")),
+                transcript_path=f"{TRACKED_TURN_HISTORY_PREFIX}{chat_id}",
+                status=str(tracked_turn.get("status") or "unknown"),
+                source="tracked_turn",
+            )
+
+        thread_dir = self.catalog.kb_history.locate_thread_dir(chat_id)
+        if thread_dir is not None:
+            return Chat(
+                chat_id=chat_id,
+                thread_id=chat_id,
+                project_id=project_id,
+                project_path=None,
+                title=chat_id[:16],
+                transcript_path=str(thread_dir),
+                status="unknown",
+                source="kb_history",
+            )
+        return None
+
+    def _tracked_turn_transcript_summary(self, thread_id: str, *, chat: Chat) -> TranscriptSummary:
+        turn_rows = self.storage.list_tracked_turns_for_thread(thread_id)
+        if not turn_rows:
+            latest = self.storage.get_latest_tracked_turn_for_thread(thread_id)
+            turn_rows = [latest] if latest is not None else []
+        turns: dict[str, TranscriptTurn] = {}
+        messages: list[TranscriptMessage] = []
+        for turn in turn_rows:
+            if turn is None:
+                continue
+            turn_id = str(turn.get("turn_id") or "")
+            if not turn_id:
+                continue
+            turns[turn_id] = TranscriptTurn(
+                turn_id=turn_id,
+                thread_id=thread_id,
+                started_at=_optional_string(turn.get("started_at")),
+                completed_at=_optional_string(turn.get("completed_at")),
+                status=str(turn.get("status") or "unknown"),
+            )
+            for row in self.storage.get_last_tracked_turn_messages(turn_id, 10_000):
+                messages.append(
+                    TranscriptMessage(
+                        message_id=str(row.get("id") or row.get("event_hash") or ""),
+                        thread_id=thread_id,
+                        turn_id=turn_id,
+                        role=str(row.get("role") or "assistant"),
+                        created_at=_optional_string(row.get("created_at")),
+                        text=_optional_string(row.get("text")),
+                        items=[],
+                        metadata={"source": "tracked_turn"},
+                    )
+                )
+        messages.sort(key=lambda item: item.created_at or "")
+        created_at = min((str(turn.get("started_at")) for turn in turn_rows if turn and turn.get("started_at")), default=chat.created_at)
+        updated_at = max((str(turn.get("updated_at")) for turn in turn_rows if turn and turn.get("updated_at")), default=chat.updated_at)
+        return TranscriptSummary(
+            thread_id=thread_id,
+            title=chat.title,
+            project_path=chat.project_path,
+            created_at=created_at,
+            updated_at=updated_at,
+            transcript_path=f"{TRACKED_TURN_HISTORY_PREFIX}{thread_id}",
+            messages=messages,
+            turns=turns,
+            parse_errors=0,
+            archived=False,
+        )
 
     def _summary_input_with_rolling(self, thread_id: str, transcript_path: str, upper: list[TranscriptMessage]) -> tuple[list[TranscriptMessage], bool]:
         if not self.config.rolling_summary_enabled or not upper:
@@ -6227,6 +6445,7 @@ class ToolService:
             context,
             self.storage.list_stale_operations(stale_before=stale_before, limit=50),
         )[:20]
+        premature_terminal_operations = self._premature_terminal_operations(context=context, limit=20)
         since = _since_iso(since_minutes)
         recent_events = [
             event_to_tool(row, include_payload=False)
@@ -6247,6 +6466,7 @@ class ToolService:
             event_pointers=recent_events,
             log_path=_diagnostic_log_path(),
             stale_operations=stale_operations,
+            premature_terminal_operations=premature_terminal_operations,
         )
         hook_history = self._hook_history_snapshot()
         recommendations = _recommended_actions_from_checks(checks)
@@ -6295,6 +6515,7 @@ class ToolService:
             },
             "activeWork": active_work,
             "staleOperations": [_operation_summary_to_tool(row) for row in stale_operations],
+            "prematureTerminalOperations": [_operation_summary_to_tool(row) for row in premature_terminal_operations],
             "recentErrors": recent_errors,
             "paths": {
                 "codexBinaryPath": str(self.config.codex_binary_path),
@@ -6413,6 +6634,7 @@ class ToolService:
             context,
             self.storage.list_stale_operations(stale_before=stale_before, limit=50),
         )[:20]
+        premature_terminal_operations = self._premature_terminal_operations(context=context, limit=20)
         log_path = _diagnostic_log_path()
         checks = self._diagnostic_checks(
             app_status=app_status,
@@ -6421,6 +6643,7 @@ class ToolService:
             event_pointers=events,
             log_path=log_path,
             stale_operations=stale_operations,
+            premature_terminal_operations=premature_terminal_operations,
         )
         hook_history = self._hook_history_snapshot()
         correlation = self._diagnostic_correlation(context)
@@ -6467,6 +6690,7 @@ class ToolService:
             "appServer": app_status,
             "activeWork": active_work,
             "pendingInteractions": pending,
+            "prematureTerminalOperations": [_operation_summary_to_tool(row) for row in premature_terminal_operations],
             "operationSummary": _operation_summary_to_tool(context["operation"]) if context["operation"] is not None else None,
             "operations": [_operation_summary_to_tool(row) for row in context["operations"]],
             "workflowSummary": [_workflow_summary_to_tool(row) for row in workflows if row is not None],
@@ -6634,6 +6858,9 @@ class ToolService:
         elif action_name == "recover_stale_operations":
             repair_result = self._repair_recover_stale_operations(args, dry_run=dry_run)
             changed = bool(repair_result.get("resetOperationIds") or repair_result.get("runningOperationIds"))
+        elif action_name == "reconcile_operations_with_tracked_turns":
+            repair_result = self._repair_reconcile_operations_with_tracked_turns(args, dry_run=dry_run)
+            changed = bool(repair_result.get("correctedOperationIds") or repair_result.get("refreshedFinalReportOperationIds"))
         elif action_name == "refresh_catalog_and_history":
             repair_result = self._repair_refresh_catalog_and_history(args, dry_run=dry_run)
             changed = bool(repair_result.get("changed"))
@@ -6966,6 +7193,7 @@ class ToolService:
         event_pointers: list[dict[str, Any]],
         log_path: Path,
         stale_operations: list[dict[str, Any]] | None = None,
+        premature_terminal_operations: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         checks: list[dict[str, Any]] = []
         checks.append(
@@ -7068,6 +7296,23 @@ class ToolService:
             )
         else:
             checks.append(diagnostic_check("stale_operations", "ok", "No stale active operations found."))
+        premature_terminal_operations = premature_terminal_operations or []
+        if premature_terminal_operations:
+            checks.append(
+                diagnostic_check(
+                    "premature_terminal_operation",
+                    "error",
+                    f"{len(premature_terminal_operations)} operations are terminal while their tracked turns are not trusted terminal.",
+                    details={
+                        "count": len(premature_terminal_operations),
+                        "operationIds": [row.get("operation_id") for row in premature_terminal_operations[:20]],
+                        "category": "premature_terminal_operation",
+                    },
+                    suggested_action="reconcile_operations_with_tracked_turns",
+                )
+            )
+        else:
+            checks.append(diagnostic_check("premature_terminal_operation", "ok", "No premature terminal operations found."))
         orphaned = [item for item in workflows if item and item.get("phase") == "orphaned_after_app_server_exit"]
         if orphaned:
             checks.append(
@@ -7151,6 +7396,51 @@ class ToolService:
             "warnings": warnings,
         }
 
+    def _premature_terminal_operations(self, *, context: dict[str, Any] | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        terminal_placeholders = ",".join("?" for _ in OPERATION_TERMINAL_STATUSES)
+        clauses = [
+            f"operations.status IN ({terminal_placeholders})",
+            "operations.turn_id IS NOT NULL",
+            """
+            (
+              turns.turn_id IS NULL
+              OR turns.status NOT IN ('completed', 'failed', 'aborted', 'cancelled', 'canceled', 'interrupted', 'unknown_after_app_server_exit')
+              OR turns.completed_at IS NULL
+            )
+            """,
+        ]
+        params: list[Any] = list(OPERATION_TERMINAL_STATUSES)
+        context = context or {}
+        operation_id = _optional_string(context.get("operationId"))
+        workflow_id = _optional_string(context.get("workflowId"))
+        thread_id = _optional_string(context.get("threadId"))
+        turn_id = _optional_string(context.get("turnId"))
+        if operation_id:
+            clauses.append("operations.operation_id = ?")
+            params.append(operation_id)
+        if workflow_id:
+            clauses.append("operations.workflow_id = ?")
+            params.append(workflow_id)
+        if thread_id:
+            clauses.append("operations.thread_id = ?")
+            params.append(thread_id)
+        if turn_id:
+            clauses.append("operations.turn_id = ?")
+            params.append(turn_id)
+        where = " AND ".join(f"({clause})" for clause in clauses)
+        rows = self.storage.connection.execute(
+            f"""
+            SELECT operations.*
+            FROM codex_operations operations
+            LEFT JOIN tracked_turns turns ON turns.turn_id = operations.turn_id
+            WHERE {where}
+            ORDER BY operations.updated_at DESC
+            LIMIT ?
+            """,
+            (*params, limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def _repair_cleanup_prompt_submissions(self, args: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
         older_than_days = _bounded_int(args.get("older_than_days", 30), 1, 3650)
         cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).isoformat()
@@ -7171,6 +7461,62 @@ class ToolService:
             dry_run=dry_run,
             limit=50,
         )
+
+    def _repair_reconcile_operations_with_tracked_turns(self, args: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
+        context = self._diagnostic_context(args)
+        operations = self._premature_terminal_operations(context=context, limit=100)
+        corrected: list[str] = []
+        refreshed_reports: list[str] = []
+        previews: list[dict[str, Any]] = []
+        for operation in operations:
+            operation_id = str(operation.get("operation_id") or "")
+            turn_id = _optional_string(operation.get("turn_id"))
+            thread_id = _optional_string(operation.get("thread_id"))
+            if not operation_id or not turn_id:
+                continue
+            turn_status = self._tracked_turn_status(
+                turn_id,
+                last_messages=10,
+                message_max_chars=8000,
+                progress_events=0,
+                progress_max_chars=2000,
+            )
+            if turn_status is None:
+                previews.append({"operationId": operation_id, "action": "skip", "reason": "tracked turn missing"})
+                continue
+            before_status = str(operation.get("status") or "")
+            before_report_hash = operation.get("latest_report_hash")
+            if dry_run:
+                target_status = "running"
+                if _turn_status_has_trusted_terminal_evidence(turn_status):
+                    target_status = str(turn_status.get("status") or "unknown")
+                previews.append(
+                    {
+                        "operationId": operation_id,
+                        "turnId": turn_id,
+                        "threadId": thread_id,
+                        "currentStatus": before_status,
+                        "targetStatus": target_status,
+                        "trustedTerminal": _turn_status_has_trusted_terminal_evidence(turn_status),
+                    }
+                )
+                continue
+            updated = self._reconcile_operation_with_turn(operation, turn_status)
+            after_status = str(updated.get("status") or "")
+            if after_status != before_status:
+                corrected.append(operation_id)
+            final_report = self._operation_final_report(updated, turn_status=turn_status, message_max_chars=8000)
+            refreshed = self.storage.get_operation(operation_id) or updated
+            if final_report is not None and refreshed.get("latest_report_hash") != before_report_hash:
+                refreshed_reports.append(operation_id)
+        return {
+            "dryRun": dry_run,
+            "inspectedOperationIds": [row.get("operation_id") for row in operations],
+            "wouldReconcile": dry_run,
+            "previews": previews,
+            "correctedOperationIds": corrected,
+            "refreshedFinalReportOperationIds": refreshed_reports,
+        }
 
     def _repair_refresh_catalog_and_history(self, args: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
         before_index = self._search_index_snapshot()
@@ -7779,9 +8125,59 @@ def _tracked_turn_last_error(row: dict[str, Any]) -> Any:
 
 def _turn_status_with_final_message(status: Any, final_message: str | None) -> str:
     value = str(status or "unknown").strip().lower()
-    if value == "ready" and final_message and final_message.strip():
-        return "completed"
     return value or "unknown"
+
+
+def _terminal_evidence_from_status(
+    status: Any,
+    *,
+    source: str,
+    observed_at: Any,
+    method: str,
+) -> dict[str, Any]:
+    status_value = str(status or "").strip().lower()
+    trusted = status_value in TURN_TERMINAL_STATUSES and bool(observed_at)
+    return {
+        "trusted": trusted,
+        "source": source if trusted else None,
+        "method": method if trusted else None,
+        "observedAt": observed_at if trusted else None,
+    }
+
+
+def _turn_status_has_trusted_terminal_evidence(status: dict[str, Any] | None) -> bool:
+    if not isinstance(status, dict):
+        return False
+    terminal_evidence = status.get("terminalEvidence")
+    if isinstance(terminal_evidence, dict):
+        return bool(terminal_evidence.get("trusted"))
+    status_value = str(status.get("status") or "").strip().lower()
+    if status_value not in TURN_TERMINAL_STATUSES:
+        return False
+    return bool(status.get("completedAt") or status.get("completed_at")) and bool(status.get("completionObserved"))
+
+
+def _merge_turn_messages(live: dict[str, Any], fallback: dict[str, Any], *, source: str) -> dict[str, Any]:
+    merged = dict(live)
+    messages = fallback.get("latestMessages") or fallback.get("last_messages") or []
+    merged["latestMessages"] = messages
+    merged["last_messages"] = messages
+    merged["hasMore"] = fallback.get("hasMore", merged.get("hasMore"))
+    merged["source"] = source
+    return merged
+
+
+def _operation_reconciliation_state(operation: dict[str, Any], turn_status: dict[str, Any] | None) -> dict[str, Any]:
+    evidence = turn_status.get("terminalEvidence") if isinstance(turn_status, dict) else None
+    trusted_terminal = _turn_status_has_trusted_terminal_evidence(turn_status)
+    operation_status = str(operation.get("status") or "")
+    turn_status_value = str((turn_status or {}).get("status") or "")
+    return {
+        "trustedTerminal": trusted_terminal,
+        "terminalEvidenceSource": (evidence or {}).get("source") if isinstance(evidence, dict) else None,
+        "terminalEventAt": (evidence or {}).get("observedAt") if isinstance(evidence, dict) else None,
+        "statusCorrected": bool(operation.get("_status_corrected")),
+    }
 
 
 def _tracked_turn_summary_to_tool(row: dict[str, Any]) -> dict[str, Any]:
@@ -7829,6 +8225,22 @@ def _json_loads_dict(value: Any) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _config_fingerprint_summary(config: ServerConfig) -> dict[str, Any]:
+    return {
+        "codexHome": str(config.codex_home),
+        "sessionsDir": str(config.sessions_dir),
+        "codexStateDb": str(config.codex_state_db),
+        "stateDbPath": str(config.state_db_path),
+        "codexBinaryPath": str(config.codex_binary_path),
+        "allowedRoots": [str(root) for root in config.allowed_roots],
+    }
+
+
+def _config_fingerprint(config: ServerConfig) -> str:
+    payload = _config_fingerprint_summary(config)
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def _recent_error_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -8136,6 +8548,13 @@ def _staleness_seconds(updated_at: str) -> int | None:
     if parsed is None:
         return None
     return max(0, int((datetime.now(timezone.utc) - parsed).total_seconds()))
+
+
+def _stable_mtime_ns(updated_at: str | None) -> int:
+    parsed = _parse_iso_datetime(updated_at)
+    if parsed is None:
+        return 0
+    return int(parsed.timestamp() * 1_000_000_000)
 
 
 def _operation_next_action(payload: dict[str, Any]) -> str:

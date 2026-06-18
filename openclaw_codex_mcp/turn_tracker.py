@@ -91,6 +91,7 @@ class TurnTracker:
                 "completed_at": (current or {}).get("completed_at"),
                 "first_message_at": (current or {}).get("first_message_at"),
                 "final_message": (current or {}).get("final_message"),
+                "last_assistant_message": (current or {}).get("last_assistant_message"),
                 "last_error": (current or {}).get("last_error"),
                 "source": "app_server",
                 "accepted_at": (current or {}).get("accepted_at") or timestamp,
@@ -168,7 +169,15 @@ class TurnTracker:
 
         status = _event_status(payload)
         if status:
-            final_message = message["text"] if message is not None else None
+            current_after_message = self.storage.get_tracked_turn(turn_id) or current or {}
+            final_message = None
+            if status in TERMINAL_STATUSES:
+                final_message = (
+                    message["text"]
+                    if message is not None
+                    else str(current_after_message.get("last_assistant_message") or "")
+                )
+                final_message = final_message if final_message.strip() else None
             failure_status = status in {"failed", "aborted", "cancelled", "canceled"}
             last_error = _event_error(payload) if failure_status else None
             self.storage.update_tracked_turn_status(
@@ -177,6 +186,7 @@ class TurnTracker:
                 updated_at=received_at,
                 completed_at=received_at if status in TERMINAL_STATUSES else None,
                 final_message=final_message,
+                last_assistant_message=(message["text"] if message is not None else None),
                 last_error=last_error,
                 clear_last_error=status in TERMINAL_STATUSES and not failure_status,
             )
@@ -229,6 +239,7 @@ class TurnTracker:
                     "completed_at": _ms_to_iso(raw_turn.get("completedAt")) or (current or {}).get("completed_at"),
                     "first_message_at": (current or {}).get("first_message_at"),
                     "final_message": (current or {}).get("final_message"),
+                    "last_assistant_message": (current or {}).get("last_assistant_message"),
                     "last_error": _snapshot_turn_error(raw_turn) or (current or {}).get("last_error"),
                     "clear_last_error": status in TERMINAL_STATUSES and _snapshot_turn_error(raw_turn) is None,
                     "source": "app_server",
@@ -316,6 +327,9 @@ class TurnTracker:
         final_message = _truncate(turn.get("final_message"), message_max_chars)
         status = _status_with_final_message(turn["status"], final_message)
         completion_observed = status in COMPLETION_OBSERVED_STATUSES
+        terminal_evidence = _terminal_evidence(turn, status)
+        if not terminal_evidence.get("trusted"):
+            final_message = None
         last_error = _visible_last_error(turn)
         pending_interactions = [
             interaction_row_to_tool(row)
@@ -336,6 +350,7 @@ class TurnTracker:
             "status": status,
             "completion_observed": completion_observed,
             "completionObserved": completion_observed,
+            "terminalEvidence": terminal_evidence,
             "started_at": turn.get("started_at"),
             "startedAt": turn.get("started_at"),
             "updated_at": turn.get("updated_at"),
@@ -740,7 +755,7 @@ def _event_status(payload: dict[str, Any]) -> str | None:
         return "waiting_for_approval"
     if method in {"turn/started", "turn/start"}:
         return "running"
-    if status:
+    if method in {"turn/updated", "turn/status/updated"} and status:
         return _normalize_status(status)
     return None
 
@@ -751,7 +766,7 @@ def _normalize_status(value: Any) -> str:
     normalized = str(value or "").strip().lower()
     if normalized in {"idle", "complete", "completed", "done"}:
         return "completed"
-    if normalized in {"in_progress", "running", "started"}:
+    if normalized in {"in_progress", "inprogress", "running", "started"}:
         return "running"
     if normalized in {"cancelled", "canceled"}:
         return "cancelled"
@@ -767,10 +782,18 @@ def _normalize_status(value: Any) -> str:
 
 
 def _status_with_final_message(status: Any, final_message: str | None) -> str:
-    normalized = _normalize_status(status)
-    if normalized == "ready" and isinstance(final_message, str) and final_message.strip():
-        return "completed"
-    return normalized
+    return _normalize_status(status)
+
+
+def _terminal_evidence(turn: dict[str, Any], status: str) -> dict[str, Any]:
+    completed_at = turn.get("completed_at")
+    trusted = status in TERMINAL_STATUSES and bool(completed_at)
+    return {
+        "trusted": trusted,
+        "source": "app_server" if trusted else None,
+        "method": "turn_lifecycle_event" if trusted else None,
+        "observedAt": completed_at if trusted else None,
+    }
 
 
 def _event_error(payload: dict[str, Any]) -> str | None:

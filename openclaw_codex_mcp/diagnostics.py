@@ -185,6 +185,13 @@ def actions_for_category(category: str) -> list[dict[str, Any]]:
         ]
     if category == "stale_operation":
         return [action("recover_stale_operations", expected_effect="Reset recoverable queued/starting operations without starting duplicate turns.")]
+    if category == "premature_terminal_operation":
+        return [
+            action(
+                "reconcile_operations_with_tracked_turns",
+                expected_effect="Recompute durable operation statuses and final reports from trusted tracked turn evidence.",
+            )
+        ]
     if category == "stale_turn":
         return [action("mark_orphaned_after_exit", expected_effect="Close stale tracked running turns as unknown after app-server exit.")]
     if category in {"pending_interaction_stale", "pending_interaction_orphaned", "pending_approval", "pending_user_input"}:
