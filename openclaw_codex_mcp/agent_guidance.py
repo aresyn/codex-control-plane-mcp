@@ -46,7 +46,11 @@ def build_guidance_for_error(
     scope_type, scope_id = _scope_from_details(details)
     evidence_refs = _evidence_refs_from_details(details)
     if code == "CODEX_DUPLICATE_PROMPT_ACTIVE":
-        operation_id = _optional_string(details.get("operationId")) or _optional_string(details.get("operation_id"))
+        operation_id = (
+            _optional_string(details.get("existingOperationId"))
+            or _optional_string(details.get("operationId"))
+            or _optional_string(details.get("operation_id"))
+        )
         instruction = _instruction(
             "poll_existing_operation",
             "codex_get_operation_status",
@@ -112,6 +116,30 @@ def build_guidance_for_error(
             ],
             "evidenceRefs": evidence_refs,
             "recommendedPollAfterSeconds": 0,
+        }
+        return build_guidance(context, attempt_lookup=attempt_lookup, now=now)
+    if code == "CODEX_STATE_BUSY":
+        client_request_id = _optional_string(details.get("client_request_id")) or _optional_string(details.get("clientRequestId"))
+        context = {
+            "problemState": "wait",
+            "category": "state_busy",
+            "summary": "The MCP state DB is busy. Retry the same request identity instead of minting a new turn.",
+            "scopeType": scope_type,
+            "scopeId": scope_id,
+            "action": "retry_same_client_request_id",
+            "instructions": [
+                _instruction(
+                    "retry_write_same_id",
+                    tool_name,
+                    {"client_request_id": client_request_id} if client_request_id else {},
+                    reason="The durable write may have been partially recorded while SQLite was busy.",
+                    expected="The same client_request_id either returns the existing operation or creates one durable operation.",
+                    stop_if="a durable operationId is returned",
+                    continue_if="CODEX_STATE_BUSY repeats after the cooldown",
+                )
+            ],
+            "evidenceRefs": evidence_refs,
+            "recommendedPollAfterSeconds": 5,
         }
         return build_guidance(context, attempt_lookup=attempt_lookup, now=now)
     if code in {"CODEX_APP_SERVER_UNAVAILABLE", "CODEX_SEND_FAILED", "CODEX_BUSY"}:

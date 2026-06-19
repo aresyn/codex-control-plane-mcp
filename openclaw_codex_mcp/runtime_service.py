@@ -50,15 +50,18 @@ class RuntimeServiceMixin:
     def codex_get_app_server_status(self, args: dict[str, Any]) -> dict[str, Any]:
         include_recent_events = bool(args.get("include_recent_events", False))
         if self.config.execution_mode in {"client", "observe"}:
+            active_snapshot = worker_active_turns_snapshot(self.storage)
+            worker_active_turns = active_snapshot["activeTurns"]
             worker = _runtime_live_worker_snapshot(self.storage)
+            latest_worker = worker or _runtime_latest_worker_snapshot(self.storage)
+            heartbeat_age = _worker_heartbeat_age_seconds(latest_worker)
+            heartbeat_stale = bool(latest_worker and heartbeat_age is not None and heartbeat_age >= 120)
             if worker is not None:
                 local_status = (
                     self._app_server.status_snapshot(include_recent_events=False)
                     if self._app_server is not None
                     else None
                 )
-                active_snapshot = worker_active_turns_snapshot(self.storage)
-                worker_active_turns = active_snapshot["activeTurns"]
                 result = {
                     "ok": True,
                     "running": True,
@@ -73,6 +76,14 @@ class RuntimeServiceMixin:
                     "activeTurnCount": len(worker_active_turns),
                     "workerDerivedActiveTurns": worker_active_turns,
                     "appServerReportedActiveTurns": [],
+                    "appServerLiveState": "worker_live",
+                    "workerState": {
+                        "workerId": worker.get("worker_id"),
+                        "status": worker.get("status"),
+                        "heartbeatAgeSeconds": heartbeat_age,
+                        "heartbeatStale": False,
+                    },
+                    "workerHeartbeatStale": False,
                     "staleActiveRecordsExcluded": active_snapshot["staleActiveRecordsExcluded"],
                     "codexBinaryPath": str(self.config.codex_binary_path),
                     "codexBinaryExists": self.config.codex_binary_path.exists(),
@@ -95,13 +106,23 @@ class RuntimeServiceMixin:
                 "started": False,
                 "scope": "worker_managed",
                 "workerManaged": True,
-                "workerId": None,
-                "pid": None,
-                "processGeneration": 0,
+                "workerId": (latest_worker or {}).get("worker_id"),
+                "pid": (latest_worker or {}).get("pid"),
+                "processGeneration": (latest_worker or {}).get("app_server_generation") or 0,
                 "pendingRequests": 0,
-                "activeTurns": [],
-                "activeTurnCount": 0,
+                "activeTurns": worker_active_turns,
+                "activeTurnCount": len(worker_active_turns),
+                "workerDerivedActiveTurns": worker_active_turns,
                 "appServerReportedActiveTurns": [],
+                "appServerLiveState": "unknown_stale_worker" if latest_worker else "unknown_no_worker",
+                "workerState": {
+                    "workerId": (latest_worker or {}).get("worker_id"),
+                    "status": (latest_worker or {}).get("status"),
+                    "heartbeatAgeSeconds": heartbeat_age,
+                    "heartbeatStale": heartbeat_stale,
+                },
+                "workerHeartbeatStale": heartbeat_stale,
+                "staleActiveRecordsExcluded": active_snapshot["staleActiveRecordsExcluded"],
                 "codexBinaryPath": str(self.config.codex_binary_path),
                 "codexBinaryExists": self.config.codex_binary_path.exists(),
                 "warning": "No live worker is registered for this client-mode MCP process.",
@@ -640,3 +661,22 @@ def _runtime_live_worker_snapshot(storage: Any) -> dict[str, Any] | None:
         if int((now - heartbeat.astimezone(timezone.utc)).total_seconds()) < 120:
             return row
     return None
+
+
+def _runtime_latest_worker_snapshot(storage: Any) -> dict[str, Any] | None:
+    for row in storage.list_workers(limit=20):
+        if row.get("role") == "worker":
+            return row
+    return None
+
+
+def _worker_heartbeat_age_seconds(row: dict[str, Any] | None) -> int | None:
+    if row is None:
+        return None
+    try:
+        heartbeat = datetime.fromisoformat(str(row.get("last_heartbeat_at") or "").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if heartbeat.tzinfo is None:
+        heartbeat = heartbeat.replace(tzinfo=timezone.utc)
+    return int((datetime.now(timezone.utc) - heartbeat.astimezone(timezone.utc)).total_seconds())

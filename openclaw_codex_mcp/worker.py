@@ -10,6 +10,11 @@ from pathlib import Path
 from typing import Any
 
 from .config import ServerConfig, path_key
+from .lock_planner import (
+    operation_consumes_turn_slot as planner_operation_consumes_turn_slot,
+    operation_is_write_turn as planner_operation_is_write_turn,
+    operation_thread_id as planner_operation_thread_id,
+)
 from .logging_utils import get_logger
 from .statuses import OPERATION_STARTABLE_STATUSES, OPERATION_TERMINAL_STATUSES, TURN_ACTIVE_STATUSES
 from .tools import ToolService, _future_iso, _now_iso, _operation_request_from_row, _optional_string, redact_payload
@@ -34,12 +39,12 @@ class CentralWorker:
         role = "observe" if self.observe else "worker"
         self.service.config.execution_mode = role
         self._heartbeat(status="running", role=role, last_error=None)
+        heartbeat_task = asyncio.create_task(self._heartbeat_loop(role))
         LOG.info("central worker started worker_id=%s role=%s", self.worker_id, role)
         try:
             while not self._stop.is_set():
                 last_error: str | None = None
                 try:
-                    self._heartbeat(status="running", role=role, last_error=None)
                     if not self.observe:
                         await self._process_worker_commands()
                         await self._schedule_startable_operations()
@@ -54,6 +59,9 @@ class CentralWorker:
                 except asyncio.TimeoutError:
                     pass
         finally:
+            heartbeat_task.cancel()
+            with suppress(BaseException):
+                await heartbeat_task
             self._heartbeat(status="stopped", role=role, last_error=None)
             await self.service.close()
             LOG.info("central worker stopped worker_id=%s", self.worker_id)
@@ -78,6 +86,15 @@ class CentralWorker:
             app_server_generation=app_generation,
             last_error=last_error,
         )
+
+    async def _heartbeat_loop(self, role: str) -> None:
+        while not self._stop.is_set():
+            with suppress(Exception):
+                self._heartbeat(status="running", role=role, last_error=None)
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                pass
 
     def _active_turn_count(self) -> int:
         rows = self.service.storage.connection.execute(
@@ -446,31 +463,15 @@ def _project_key(operation: dict[str, Any]) -> str:
 
 
 def _operation_thread_id(operation: dict[str, Any], request: dict[str, Any]) -> str | None:
-    return (
-        _optional_string(operation.get("thread_id"))
-        or _optional_string(request.get("_resolved_thread_id"))
-        or _optional_string(request.get("thread_id"))
-        or _optional_string(request.get("chat_id"))
-    )
+    return planner_operation_thread_id(operation, request)
 
 
 def _operation_is_write_turn(operation: dict[str, Any], request: dict[str, Any]) -> bool:
-    operation_type = str(operation.get("operation_type") or "")
-    if operation_type == "fork_thread" and not _optional_string(request.get("message")):
-        return False
-    if not _operation_consumes_turn_slot(operation, request):
-        return False
-    sandbox = str(request.get("sandbox") or "").strip()
-    return sandbox in {"workspace-write", "danger-full-access"}
+    return planner_operation_is_write_turn(operation, request)
 
 
 def _operation_consumes_turn_slot(operation: dict[str, Any], request: dict[str, Any]) -> bool:
-    operation_type = str(operation.get("operation_type") or "")
-    if operation_type == "steer_turn":
-        return False
-    if operation_type == "fork_thread" and not _optional_string(request.get("message")):
-        return False
-    return True
+    return planner_operation_consumes_turn_slot(operation, request)
 
 
 def _worker_command_timeout_seconds(args: dict[str, Any]) -> int:

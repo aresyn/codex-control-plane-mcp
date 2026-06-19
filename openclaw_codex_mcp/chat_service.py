@@ -13,10 +13,20 @@ class ChatServiceMixin:
         refresh = bool(args.get("refresh", False))
         include_private_details = bool(args.get("include_private_details", False))
         root_filters = [path_key(item) for item in (args.get("roots") or []) if str(item or "").strip()]
+        started = time.monotonic()
+        time_budget_seconds = _bounded_int(args.get("time_budget_seconds", 5), 1, 60)
         cache_hit = False
+        refresh_skipped_reason = None
         if refresh:
-            self.catalog.refresh()
-            projects_raw = self.catalog.list_projects()
+            if compact and root_filters and not include_private_details:
+                projects_raw = self.catalog.load_cached_projects()
+                cache_hit = bool(projects_raw)
+                refresh_skipped_reason = "scoped_compact_refresh_uses_cache"
+                if not projects_raw:
+                    projects_raw = self.catalog.list_projects()
+            else:
+                self.catalog.refresh()
+                projects_raw = self.catalog.list_projects()
         else:
             projects_raw = self.catalog.load_cached_projects()
             cache_hit = bool(projects_raw)
@@ -45,6 +55,9 @@ class ChatServiceMixin:
                 "hit": cache_hit,
                 "source": "storage_cache" if cache_hit else "catalog_refresh",
                 "refreshRequested": refresh,
+                "refreshSkippedReason": refresh_skipped_reason,
+                "timeBudgetSeconds": time_budget_seconds,
+                "timeBudgetExhausted": (time.monotonic() - started) > time_budget_seconds,
             },
         }
         return _with_budget(result, tool_name="codex_list_projects")
@@ -148,6 +161,7 @@ class ChatServiceMixin:
         snippet_max_chars = _bounded_int(args.get("snippet_max_chars", 240), 80, 1000)
         refresh_index = bool(args.get("refresh_index", True))
         index_time_budget_seconds = _bounded_int(args.get("index_time_budget_seconds", 8), 1, 60)
+        started = time.monotonic()
         match_mode = str(args.get("match_mode") or "auto")
         search_index = SearchIndex(self.config, self.storage, self.catalog)
         index_status = None
@@ -203,6 +217,10 @@ class ChatServiceMixin:
             "source": "chat_search_fts_index",
         }
         exhausted = bool((result["index_status"] or {}).get("time_budget_exhausted"))
+        if time.monotonic() - started > index_time_budget_seconds:
+            exhausted = True
+            result["index_status"]["time_budget_exhausted"] = True
+            result["index_status"]["end_to_end_time_budget_exhausted"] = True
         result["nextRecommendedAction"] = "retry_without_refresh_or_increase_budget" if exhausted else "none"
         result["recommendedPollAfterSeconds"] = 0
         result["pollRecommended"] = False
@@ -451,61 +469,8 @@ class ChatServiceMixin:
         }
 
     def _resolve_chat_for_read(self, chat_id: str, project_id: str | None) -> Chat | None:
-        chat = self.catalog.get_chat(chat_id, project_id)
-        if chat is not None:
-            return chat
-        with suppress(Exception):
-            self.catalog.refresh()
-        chat = self.catalog.get_chat(chat_id, project_id)
-        if chat is not None:
-            return chat
-
-        hook_uri = self.catalog.hook_history.locate_thread(chat_id)
-        if hook_uri is not None:
-            hook_thread = self.storage.get_hook_thread(chat_id) or {}
-            project_path = _optional_string(hook_thread.get("project_path"))
-            return Chat(
-                chat_id=chat_id,
-                thread_id=chat_id,
-                project_id=project_id or (project_id_for_path(project_path) if project_path else None),
-                project_path=project_path,
-                title=_optional_string(hook_thread.get("title")),
-                created_at=_optional_string(hook_thread.get("created_at")),
-                updated_at=_optional_string(hook_thread.get("updated_at")),
-                transcript_path=hook_uri,
-                status="unknown",
-                source="hook_history",
-            )
-
-        tracked_turn = self.storage.get_latest_tracked_turn_for_thread(chat_id)
-        if tracked_turn is not None:
-            project_path = _optional_string(tracked_turn.get("project_path"))
-            return Chat(
-                chat_id=chat_id,
-                thread_id=chat_id,
-                project_id=project_id or _optional_string(tracked_turn.get("project_id")) or (project_id_for_path(project_path) if project_path else None),
-                project_path=project_path,
-                title=chat_id[:16],
-                created_at=_optional_string(tracked_turn.get("started_at")),
-                updated_at=_optional_string(tracked_turn.get("updated_at")),
-                transcript_path=f"{TRACKED_TURN_HISTORY_PREFIX}{chat_id}",
-                status=str(tracked_turn.get("status") or "unknown"),
-                source="tracked_turn",
-            )
-
-        thread_dir = self.catalog.kb_history.locate_thread_dir(chat_id)
-        if thread_dir is not None:
-            return Chat(
-                chat_id=chat_id,
-                thread_id=chat_id,
-                project_id=project_id,
-                project_path=None,
-                title=chat_id[:16],
-                transcript_path=str(thread_dir),
-                status="unknown",
-                source="kb_history",
-            )
-        return None
+        resolution = self.thread_resolver.resolve(chat_id, project_id, refresh_catalog=True)
+        return resolution.chat if resolution is not None else None
 
     def _refresh_thread_tracking_from_transcript(self, thread_id: str, *, chat: Chat | None = None) -> dict[str, Any]:
         if not thread_id:

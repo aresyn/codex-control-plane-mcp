@@ -289,6 +289,36 @@ class WorkerStoreMixin:
             (thread_id, project_id, operation_id),
         )
 
+    def ensure_thread_active_lock_for_operation(
+        self,
+        operation_id: str,
+        *,
+        thread_id: str | None,
+        project_id: str | None,
+        worker_id: str | None,
+        expires_at: str,
+        created_at: str,
+    ) -> None:
+        if not thread_id:
+            return
+        self.execute_write_with_retry(
+            """
+            INSERT OR IGNORE INTO codex_resource_locks(
+              lock_key, operation_id, thread_id, project_id, lock_mode, worker_id, expires_at, created_at
+            )
+            VALUES (?, ?, ?, ?, 'exclusive', ?, ?, ?)
+            """,
+            (
+                f"thread:{thread_id}:active-turn",
+                operation_id,
+                thread_id,
+                project_id,
+                worker_id or "unknown",
+                expires_at,
+                created_at,
+            ),
+        )
+
     def create_worker_command(
         self,
         *,

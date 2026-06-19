@@ -940,7 +940,7 @@ def _progress_event(
         category = "token_usage"
         text = "Token usage updated."
         truncated = False
-        metadata = {"tokenUsage": _safe_metadata(params.get("tokenUsage"))}
+        metadata = {"tokenUsage": _compact_token_usage(params.get("tokenUsage"))}
     elif method == "model/rerouted":
         category = "model_reroute"
         from_model = _optional_str(params.get("fromModel"))
@@ -1076,6 +1076,8 @@ def turn_progress_status_fields(
 def _compact_token_usage(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
+    if value.get("precision") == "coarse" and "totalTokensBand" in value:
+        return dict(value)
     totals = _collect_token_counts(value)
     return {
         "available": bool(totals),
@@ -1140,6 +1142,8 @@ def progress_event_to_tool(row: dict[str, Any], max_chars: int = 2000) -> dict[s
 def _progress_event_to_tool(row: dict[str, Any], max_chars: int) -> dict[str, Any]:
     text, budget = _truncate_with_budget(row.get("text"), max_chars)
     metadata = _json_loads_dict(row.get("metadata_json"))
+    if isinstance(metadata.get("tokenUsage"), dict):
+        metadata["tokenUsage"] = _compact_token_usage(metadata.get("tokenUsage"))
     return {
         "id": row.get("id"),
         "eventHash": row.get("event_hash"),

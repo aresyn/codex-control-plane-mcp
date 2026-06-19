@@ -353,6 +353,7 @@ class DiagnosticServiceMixin:
             self.storage.list_stale_operations(stale_before=stale_before, limit=50),
         )[:20]
         premature_terminal_operations = self._premature_terminal_operations(context=context, limit=20)
+        terminal_reconcile_checks = self._terminal_reconcile_stuck_checks(context)
         log_path = _diagnostic_log_path()
         checks = self._diagnostic_checks(
             app_status=app_status,
@@ -363,6 +364,7 @@ class DiagnosticServiceMixin:
             stale_operations=stale_operations,
             premature_terminal_operations=premature_terminal_operations,
         )
+        checks.extend(terminal_reconcile_checks)
         scoped_checks = checks
         background_checks: list[dict[str, Any]] = []
         hook_history = self._hook_history_snapshot()
@@ -510,8 +512,10 @@ class DiagnosticServiceMixin:
         }
 
     def codex_analyze_issue(self, args: dict[str, Any]) -> dict[str, Any]:
+        started = time.monotonic()
         problem_text = _optional_string(args.get("problem_text"))
         since_minutes = _bounded_int(args.get("since_minutes", 120), 1, 10080)
+        scoped_request = bool(args.get("operation_id") or args.get("workflow_id") or args.get("thread_id") or args.get("turn_id"))
         context = self.codex_collect_diagnostics(
             {
                 "operation_id": args.get("operation_id"),
@@ -524,19 +528,34 @@ class DiagnosticServiceMixin:
                 "timeline_limit": _bounded_int(args.get("timeline_limit", 50), 1, 100),
             }
         )
-        logs = self.codex_get_diagnostic_logs(
-            {
-                "source": "all",
-                "workflow_id": context.get("filters", {}).get("workflowId") or args.get("workflow_id"),
-                "thread_id": context.get("filters", {}).get("threadId") or args.get("thread_id"),
-                "turn_id": context.get("filters", {}).get("turnId") or args.get("turn_id"),
-                "since_minutes": since_minutes,
-                "limit": _bounded_int(args.get("event_limit", 50), 1, 100),
-                "max_line_chars": 500,
-                "include_payload": False,
-            }
+        scoped_terminal_reconcile = any(
+            isinstance(item, dict) and (
+                item.get("name") == "terminal_reconcile_stuck"
+                or (isinstance(item.get("details"), dict) and item["details"].get("category") == "terminal_reconcile_stuck")
+            )
+            for item in context.get("checks") or []
         )
+        logs: dict[str, Any]
+        if scoped_terminal_reconcile or time.monotonic() - started > 8:
+            logs = {"ok": True, "source": "skipped", "logs": [], "events": [], "returnedLogCount": 0, "returnedEventCount": 0}
+        else:
+            logs = self.codex_get_diagnostic_logs(
+                {
+                    "source": "app_server_events" if scoped_request else "all",
+                    "workflow_id": context.get("filters", {}).get("workflowId") or args.get("workflow_id"),
+                    "thread_id": context.get("filters", {}).get("threadId") or args.get("thread_id"),
+                    "turn_id": context.get("filters", {}).get("turnId") or args.get("turn_id"),
+                    "since_minutes": min(since_minutes, 60) if scoped_request else since_minutes,
+                    "limit": _bounded_int(args.get("event_limit", 50), 1, 100),
+                    "max_line_chars": 500,
+                    "include_payload": False,
+                }
+            )
         analysis = analyze_context(problem_text, context, logs)
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        analysis_timed_out = elapsed_ms > 10_000
+        if analysis_timed_out:
+            analysis["analysisTimedOut"] = True
         evidence_truncated = _compact_analysis_evidence(analysis)
         diagnosis_id = "diag_" + uuid.uuid4().hex
         created_at = _now_iso()
@@ -568,6 +587,9 @@ class DiagnosticServiceMixin:
             "ok": True,
             "diagnosisId": diagnosis_id,
             "createdAt": created_at,
+            "analysisElapsedMs": elapsed_ms,
+            "analysisTimedOut": analysis_timed_out,
+            "analysisScope": "scoped" if scoped_request else "global",
             "evidenceTruncated": evidence_truncated,
             **analysis,
         }
@@ -1237,6 +1259,88 @@ class DiagnosticServiceMixin:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def _terminal_reconcile_stuck_checks(self, context: dict[str, Any]) -> list[dict[str, Any]]:
+        operation = context.get("operation") if isinstance(context.get("operation"), dict) else None
+        if operation is None:
+            return []
+        operation_status = str(operation.get("status") or "")
+        if operation_status in OPERATION_TERMINAL_STATUSES:
+            return []
+        turn_id = _optional_string(operation.get("turn_id"))
+        if not turn_id:
+            return []
+        thread_id = _optional_string(operation.get("thread_id"))
+        try:
+            turn_status = self.codex_get_turn_status(
+                {
+                    "turn_id": turn_id,
+                    "thread_id": thread_id,
+                    "last_messages": 3,
+                    "message_max_chars": 2000,
+                    "progress_events": 0,
+                }
+            )
+        except Exception:
+            return []
+        if not _turn_status_has_trusted_terminal_evidence(turn_status):
+            return []
+        turn_state = str(turn_status.get("status") or "")
+        if turn_state not in TURN_TERMINAL_STATUSES:
+            return []
+        evidence = turn_status.get("terminalEvidence") if isinstance(turn_status.get("terminalEvidence"), dict) else {}
+        return [
+            diagnostic_check(
+                "terminal_reconcile_stuck",
+                "warning",
+                "Operation is still non-terminal, but the same turn has trusted terminal evidence.",
+                operationId=operation.get("operation_id"),
+                threadId=thread_id,
+                turnId=turn_id,
+                operationStatus=operation_status,
+                turnStatus=turn_state,
+                terminalEvidence=evidence,
+                category="terminal_reconcile_stuck",
+                suggestedAction="reconcile_operations_with_tracked_turns",
+            )
+        ]
+
+    def _terminal_reconcile_candidate_operations(self, *, context: dict[str, Any] | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        terminal_placeholders = ",".join("?" for _ in OPERATION_TERMINAL_STATUSES)
+        clauses = [
+            f"operations.status NOT IN ({terminal_placeholders})",
+            "operations.turn_id IS NOT NULL",
+        ]
+        params: list[Any] = list(OPERATION_TERMINAL_STATUSES)
+        context = context or {}
+        operation_id = _optional_string(context.get("operationId"))
+        workflow_id = _optional_string(context.get("workflowId"))
+        thread_id = _optional_string(context.get("threadId"))
+        turn_id = _optional_string(context.get("turnId"))
+        if operation_id:
+            clauses.append("operations.operation_id = ?")
+            params.append(operation_id)
+        if workflow_id:
+            clauses.append("operations.workflow_id = ?")
+            params.append(workflow_id)
+        if thread_id:
+            clauses.append("operations.thread_id = ?")
+            params.append(thread_id)
+        if turn_id:
+            clauses.append("operations.turn_id = ?")
+            params.append(turn_id)
+        where = " AND ".join(f"({clause})" for clause in clauses)
+        rows = self.storage.connection.execute(
+            f"""
+            SELECT operations.*
+            FROM codex_operations operations
+            WHERE {where}
+            ORDER BY operations.updated_at DESC
+            LIMIT ?
+            """,
+            (*params, limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def _repair_cleanup_prompt_submissions(self, args: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
         older_than_days = _bounded_int(args.get("older_than_days", 30), 1, 3650)
         cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).isoformat()
@@ -1260,7 +1364,12 @@ class DiagnosticServiceMixin:
 
     def _repair_reconcile_operations_with_tracked_turns(self, args: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
         context = self._diagnostic_context(args)
-        operations = self._premature_terminal_operations(context=context, limit=100)
+        operations_by_id: dict[str, dict[str, Any]] = {}
+        for row in self._premature_terminal_operations(context=context, limit=100):
+            operations_by_id[str(row.get("operation_id") or "")] = row
+        for row in self._terminal_reconcile_candidate_operations(context=context, limit=100):
+            operations_by_id[str(row.get("operation_id") or "")] = row
+        operations = [row for key, row in operations_by_id.items() if key]
         corrected: list[str] = []
         refreshed_reports: list[str] = []
         previews: list[dict[str, Any]] = []
@@ -1270,14 +1379,17 @@ class DiagnosticServiceMixin:
             thread_id = _optional_string(operation.get("thread_id"))
             if not operation_id or not turn_id:
                 continue
-            turn_status = self._tracked_turn_status(
-                turn_id,
-                last_messages=10,
-                message_max_chars=8000,
-                progress_events=0,
-                progress_max_chars=2000,
-            )
-            if turn_status is None:
+            try:
+                turn_status = self.codex_get_turn_status(
+                    {
+                        "turn_id": turn_id,
+                        "thread_id": thread_id,
+                        "last_messages": 10,
+                        "message_max_chars": 8000,
+                        "progress_events": 0,
+                    }
+                )
+            except Exception:
                 previews.append({"operationId": operation_id, "action": "skip", "reason": "tracked turn missing"})
                 continue
             before_status = str(operation.get("status") or "")

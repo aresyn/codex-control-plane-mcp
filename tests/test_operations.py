@@ -118,6 +118,41 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertEqual({"type": "dangerFullAccess"}, turn_start_calls[0]["sandbox_policy"])
         self.assertEqual("never", turn_start_calls[0]["approval_policy"])
 
+    def test_submit_task_returns_retryable_state_busy_when_operation_create_is_locked(self) -> None:
+        async def scenario() -> dict:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                service = ToolService(_search_service_config(root, root / ".codex" / "state_5.sqlite"))
+                project_id = project_id_for_path(str(project))
+                original_create_operation = service.storage.create_operation
+
+                def locked_create_operation(row: dict) -> bool:
+                    raise sqlite3.OperationalError("database is locked")
+
+                service.storage.create_operation = locked_create_operation  # type: ignore[method-assign]
+                try:
+                    return await service.call(
+                        "codex_submit_task",
+                        {
+                            "operation_type": "start_chat",
+                            "project_id": project_id,
+                            "message": "locked submit",
+                            "client_request_id": "locked-submit-same-id",
+                        },
+                    )
+                finally:
+                    service.storage.create_operation = original_create_operation  # type: ignore[method-assign]
+                    await service.close()
+
+        result = asyncio.run(scenario())
+
+        self.assertEqual("CODEX_STATE_BUSY", result["error"]["code"])
+        self.assertTrue(result["error"]["retryable"])
+        self.assertEqual("locked-submit-same-id", result["error"]["details"]["client_request_id"])
+        self.assertEqual("retry_write_same_id", result["agentGuidance"]["instructions"][0]["kind"])
+
     def test_operation_status_corrects_premature_completed_when_turn_is_active(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -167,6 +202,92 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertIsNone(repaired["completed_at"])
         self.assertIsNone(repaired["final_report_json"])
         self.assertTrue(any(item["name"] == "premature_terminal_operation" for item in diagnostics["checks"]))
+
+    def test_operation_status_recovers_terminal_from_transcript_and_releases_slot(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "Project"
+            project.mkdir()
+            config = _search_service_config(root, root / ".codex" / "state_5.sqlite")
+            service = ToolService(config)
+            try:
+                _write_kb_turn(
+                    config.kb_history_projects_root,
+                    project,
+                    "thread-recovered",
+                    "turn-recovered",
+                    [("assistant", "Recovered final report")],
+                    status="completed",
+                    updated_at="2026-05-25T00:05:00Z",
+                )
+                operation = _storage_operation_row(
+                    "op-recovered",
+                    status="running",
+                    thread_id="thread-recovered",
+                    turn_id="turn-recovered",
+                    cwd=str(project),
+                    updated_at="2026-05-25T00:00:05+00:00",
+                )
+                operation["request_json"] = json.dumps({"message": "long test", "sandbox": "danger-full-access"})
+                service.storage.create_operation(operation)
+                service.storage.upsert_tracked_turn(
+                    {
+                        "turn_id": "turn-recovered",
+                        "thread_id": "thread-recovered",
+                        "chat_id": "thread-recovered",
+                        "project_id": "project",
+                        "project_path": str(project),
+                        "status": "running",
+                        "started_at": "2026-05-25T00:00:00+00:00",
+                        "updated_at": "2026-05-25T00:00:06+00:00",
+                        "completed_at": None,
+                        "first_message_at": "2026-05-25T00:00:01+00:00",
+                        "final_message": None,
+                        "last_assistant_message": "working",
+                        "last_error": None,
+                        "source": "app_server",
+                    }
+                )
+                service.storage.upsert_operation_scheduling(
+                    operation_id="op-recovered",
+                    agent_id="agent",
+                    priority="normal",
+                    estimated_cost_class="normal",
+                    resource_keys=[],
+                    queue_status="running",
+                    queued_reason=None,
+                    created_at="2026-05-25T00:00:00+00:00",
+                    updated_at="2026-05-25T00:00:00+00:00",
+                )
+                service.storage.replace_resource_locks_for_operation(
+                    operation_id="op-recovered",
+                    locks=[
+                        {
+                            "lock_key": "thread:thread-recovered:active-turn",
+                            "operation_id": "op-recovered",
+                            "thread_id": "thread-recovered",
+                            "project_id": "project",
+                            "lock_mode": "exclusive",
+                            "worker_id": "worker",
+                            "created_at": "2026-05-25T00:00:00+00:00",
+                            "expires_at": "2026-05-25T06:00:00+00:00",
+                        }
+                    ],
+                )
+
+                status = service.codex_get_operation_status({"operation_id": "op-recovered"})
+                stored = service.storage.get_operation("op-recovered") or {}
+                scheduling = service.storage.get_operation_scheduling("op-recovered") or {}
+                locks = service.storage.list_resource_locks(operation_id="op-recovered")
+            finally:
+                asyncio.run(service.close())
+
+        self.assertEqual("completed", status["status"])
+        self.assertEqual("completed", stored["status"])
+        self.assertEqual("transcript_terminal", status["turnStatus"]["terminalEvidence"]["source"])
+        self.assertTrue(status["turnStatus"]["terminalEvidence"]["recovered"])
+        self.assertEqual("completed", scheduling["queue_status"])
+        self.assertEqual([], locks)
 
     def test_config_mismatch_status_does_not_mutate_foreign_operation(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -1237,7 +1358,7 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertEqual("queued", first["status"])
         self.assertEqual("queued", second["status"])
 
-    def test_submit_task_inactive_duplicate_continues_existing_thread(self) -> None:
+    def test_submit_task_inactive_duplicate_continues_existing_thread_when_explicitly_allowed(self) -> None:
         async def scenario() -> tuple[dict, dict, dict, list[dict], list[dict]]:
             with TemporaryDirectory() as tmp:
                 root = Path(tmp)
@@ -1281,6 +1402,8 @@ class McpDefinitionTests(unittest.TestCase):
                             "operation_type": "start_chat",
                             "project_id": project_id,
                             "message": "Investigate duplicate prompt continuation after completed work.",
+                            "thread_mode": "auto",
+                            "allow_historical_continuation": True,
                         },
                     )
                     repeated_status = repeated
@@ -1303,6 +1426,73 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertEqual("thread-new", repeated_status["threadId"])
         self.assertEqual("turn-fake-2", repeated_status["turnId"])
         self.assertEqual(1, len(thread_start_calls))
+        self.assertEqual(2, len(turn_start_calls))
+
+    def test_submit_task_inactive_duplicate_starts_new_thread_by_default(self) -> None:
+        async def scenario() -> tuple[dict, dict, dict, list[dict], list[dict]]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                state_db = root / ".codex" / "state_5.sqlite"
+                service = ToolService(_search_service_config(root, state_db))
+                fake = FakeAppServer(service.storage, first_message="new thread first")
+                service._app_server = fake  # type: ignore[assignment]
+                project_id = project_id_for_path(str(project))
+                try:
+                    first = await service.call(
+                        "codex_submit_task",
+                        {
+                            "operation_type": "start_chat",
+                            "project_id": project_id,
+                            "message": "Investigate duplicate prompt fresh thread default.",
+                        },
+                    )
+                    first_status = first
+                    for _ in range(50):
+                        first_status = service.codex_get_operation_status({"operation_id": first["operationId"]})
+                        if first_status.get("turnId"):
+                            break
+                        await asyncio.sleep(0.01)
+                    fake.tracker.record_event(
+                        {
+                            "method": "turn/completed",
+                            "params": {
+                                "threadId": first_status["threadId"],
+                                "turnId": first_status["turnId"],
+                                "status": "completed",
+                            },
+                        },
+                        received_at="2026-05-25T00:00:02+00:00",
+                    )
+                    service.codex_get_operation_status({"operation_id": first["operationId"]})
+                    repeated = await service.call(
+                        "codex_submit_task",
+                        {
+                            "operation_type": "start_chat",
+                            "project_id": project_id,
+                            "message": "Investigate duplicate prompt fresh thread default.",
+                        },
+                    )
+                    repeated_status = repeated
+                    for _ in range(50):
+                        repeated_status = service.codex_get_operation_status({"operation_id": repeated["operationId"]})
+                        if repeated_status.get("turnId"):
+                            break
+                        await asyncio.sleep(0.01)
+                    return first_status, repeated, repeated_status, fake.thread_start_calls, fake.turn_start_calls
+                finally:
+                    await service.close()
+
+        first_status, repeated, repeated_status, thread_start_calls, turn_start_calls = asyncio.run(scenario())
+
+        self.assertEqual("thread-new", first_status["threadId"])
+        self.assertFalse(repeated.get("deduplicated", False))
+        self.assertEqual("start_chat", repeated["operationType"])
+        self.assertNotEqual(first_status["operationId"], repeated["operationId"])
+        self.assertEqual("thread-new", repeated_status["threadId"])
+        self.assertEqual("turn-fake-2", repeated_status["turnId"])
+        self.assertEqual(2, len(thread_start_calls))
         self.assertEqual(2, len(turn_start_calls))
 
     def test_submit_task_failed_duplicate_starts_new_thread(self) -> None:

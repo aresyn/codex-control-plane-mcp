@@ -86,6 +86,7 @@ class OperationServiceMixin:
         ignore_operation_id: str | None = None,
         strict_hash_only: bool = False,
         resource_keys: list[str] | None = None,
+        allow_historical_continuation: bool = False,
     ) -> dict[str, Any] | None:
         candidates_by_id: dict[str, tuple[dict[str, Any], float]] = {}
         for row in self.storage.find_prompt_submissions_by_hash(project_path_key, normalized_hash, limit=50):
@@ -128,6 +129,8 @@ class OperationServiceMixin:
         active = [row for row in matches if row.get("active")]
         if active:
             return sorted(active, key=lambda row: (float(row.get("similarity") or 0), str(row.get("updated_at") or "")), reverse=True)[0]
+        if not allow_historical_continuation:
+            return None
         resumable = [row for row in matches if self._prompt_duplicate_can_continue(row)]
         if not resumable:
             return None
@@ -237,18 +240,23 @@ class OperationServiceMixin:
         ignore_operation_id: str | None = None,
         strict_hash_only: bool = False,
         resource_keys: list[str] | None = None,
+        dedup_policy: str = "active_prompt_guard",
+        allow_historical_continuation: bool = False,
     ) -> dict[str, Any]:
         normalized_prompt = normalize_prompt(dedup_basis)
         normalized_hash = prompt_hash(normalized_prompt)
-        match = self._find_prompt_duplicate(
-            project_path_key=project_path_key,
-            normalized_prompt=normalized_prompt,
-            normalized_hash=normalized_hash,
-            ignore_submission_id=ignore_submission_id,
-            ignore_operation_id=ignore_operation_id,
-            strict_hash_only=strict_hash_only,
-            resource_keys=resource_keys,
-        )
+        match = None
+        if dedup_policy != "idempotency_only":
+            match = self._find_prompt_duplicate(
+                project_path_key=project_path_key,
+                normalized_prompt=normalized_prompt,
+                normalized_hash=normalized_hash,
+                ignore_submission_id=ignore_submission_id,
+                ignore_operation_id=ignore_operation_id,
+                strict_hash_only=strict_hash_only,
+                resource_keys=resource_keys,
+                allow_historical_continuation=allow_historical_continuation,
+            )
         if match is not None and match.get("active"):
             raise self._duplicate_prompt_error(match)
 
@@ -1234,32 +1242,48 @@ class OperationServiceMixin:
         if live is None:
             if hook is not None:
                 return self._attach_agent_guidance(
-                    self._attach_progress_status(hook, turn_id, progress_events=progress_events, progress_max_chars=progress_max_chars),
+                    normalize_public_status_payload(
+                        self._attach_progress_status(hook, turn_id, progress_events=progress_events, progress_max_chars=progress_max_chars),
+                        surface="turn_status",
+                    ),
                     surface="turn_status",
                 )
             if kb is None:
                 raise turn_not_found(turn_id)
             return self._attach_agent_guidance(
-                self._attach_progress_status(kb, turn_id, progress_events=progress_events, progress_max_chars=progress_max_chars),
+                normalize_public_status_payload(
+                    self._attach_progress_status(kb, turn_id, progress_events=progress_events, progress_max_chars=progress_max_chars),
+                    surface="turn_status",
+                ),
                 surface="turn_status",
             )
         live_status = str(live.get("status") or "unknown")
         live_unknown = live_status in {"unknown", "unknown_after_app_server_exit"}
         live_active = live_status in TURN_ACTIVE_STATUSES or live_status in {"starting", "ready"}
         if hook is not None:
-            if live_unknown and _turn_status_has_trusted_terminal_evidence(hook):
-                hook["source"] = "app_server+hook_history"
+            if _fallback_terminal_should_replace_live(live, hook):
+                hook["source"] = "storage+hook_history"
+                _mark_recovered_terminal_evidence(hook)
+                self._persist_recovered_turn_terminal(turn_id, hook)
                 return self._attach_agent_guidance(
-                    self._attach_progress_status(hook, turn_id, progress_events=progress_events, progress_max_chars=progress_max_chars),
+                    normalize_public_status_payload(
+                        self._attach_progress_status(hook, turn_id, progress_events=progress_events, progress_max_chars=progress_max_chars),
+                        surface="turn_status",
+                    ),
                     surface="turn_status",
                 )
             if not live.get("last_messages") and hook.get("last_messages"):
                 live = _merge_turn_messages(live, hook, source="app_server+hook_history")
         if kb is not None:
-            if live_unknown and _turn_status_has_trusted_terminal_evidence(kb):
-                kb["source"] = "app_server+kb_history"
+            if _fallback_terminal_should_replace_live(live, kb):
+                kb["source"] = "storage+kb_history"
+                _mark_recovered_terminal_evidence(kb)
+                self._persist_recovered_turn_terminal(turn_id, kb)
                 return self._attach_agent_guidance(
-                    self._attach_progress_status(kb, turn_id, progress_events=progress_events, progress_max_chars=progress_max_chars),
+                    normalize_public_status_payload(
+                        self._attach_progress_status(kb, turn_id, progress_events=progress_events, progress_max_chars=progress_max_chars),
+                        surface="turn_status",
+                    ),
                     surface="turn_status",
                 )
             if not live.get("last_messages") and kb.get("last_messages"):
@@ -1267,7 +1291,7 @@ class OperationServiceMixin:
         if live_active:
             live["completion_observed"] = False
             live["completionObserved"] = False
-        return self._attach_agent_guidance(live, surface="turn_status")
+        return self._attach_agent_guidance(normalize_public_status_payload(live, surface="turn_status"), surface="turn_status")
 
     async def codex_execute_plan(self, args: dict[str, Any]) -> dict[str, Any]:
         if self._should_delegate_compatibility_write("codex_execute_plan", args):
@@ -1377,6 +1401,11 @@ class OperationServiceMixin:
         priority = _priority_value(args.get("priority"))
         estimated_cost_class = _estimated_cost_class_value(args.get("estimated_cost_class"))
         resource_keys = _resource_keys_value(args.get("resource_keys"))
+        thread_mode = _thread_mode_value(args.get("thread_mode"), operation_type=operation_type)
+        dedup_policy = _dedup_policy_value(args.get("dedup_policy"))
+        allow_historical_continuation = bool(args.get("allow_historical_continuation", False))
+        if operation_type == "start_chat" and not (thread_mode == "auto" and allow_historical_continuation):
+            allow_historical_continuation = False
         if explicit_client_request_id:
             existing = self.storage.get_operation_by_client_request_id(explicit_client_request_id)
             if existing is not None:
@@ -1483,15 +1512,20 @@ class OperationServiceMixin:
             if not is_allowed_path(project_path, self.config.allowed_roots):
                 raise invalid_argument("Requested cwd is outside the allowlist.", cwd=project_path)
         elif operation_type == "send_message":
-            chat = self.catalog.get_chat(str(initial_chat_id), project_id)
-            if chat is None:
+            resolution = self.thread_resolver.resolve(str(initial_chat_id), project_id, refresh_catalog=True)
+            if resolution is None:
                 raise thread_not_found(str(initial_chat_id))
+            chat = resolution.chat
             project_id = chat.project_id
             initial_chat_id = chat.chat_id
             initial_thread_id = chat.thread_id
             project_path = canonical_existing_path(chat.project_path)
+            if not project_path and project_id:
+                project = self.catalog.get_project(str(project_id))
+                project_path = canonical_existing_path((project.path if project is not None else None))
             if not project_path or not is_allowed_path(project_path, self.config.allowed_roots):
                 raise invalid_argument("Chat project path is outside the allowlist.", project_path=chat.project_path)
+            actual_args["_thread_resolution"] = resolution.to_tool()
         else:
             workflow_id = _optional_string(args.get("workflow_id"))
             if workflow_id:
@@ -1540,19 +1574,35 @@ class OperationServiceMixin:
                 dedup_basis = f"{dedup_basis}\noutput_schema:{output_schema_state['schemaHash']}"
             if input_item_state is not None:
                 dedup_basis = f"{dedup_basis}\ninput_items:{input_item_state['dedupHash']}"
-            dedup = self._prepare_prompt_submission(
-                project_id=project_id,
-                project_path_key=path_key(project_path),
-                operation_type=operation_type,
-                message=str(message or ""),
-                dedup_basis=dedup_basis,
-                operation_id=operation_id,
-                chat_id=initial_chat_id,
-                thread_id=initial_thread_id,
-                workflow_id=_optional_string(args.get("workflow_id")),
-                strict_hash_only=input_item_state is not None,
-                resource_keys=resource_keys,
-            )
+            try:
+                dedup = self.storage._sqlite_retry(
+                    lambda: self._prepare_prompt_submission(
+                        project_id=project_id,
+                        project_path_key=path_key(project_path),
+                        operation_type=operation_type,
+                        message=str(message or ""),
+                        dedup_basis=dedup_basis,
+                        operation_id=operation_id,
+                        chat_id=initial_chat_id,
+                        thread_id=initial_thread_id,
+                        workflow_id=_optional_string(args.get("workflow_id")),
+                        strict_hash_only=input_item_state is not None,
+                        resource_keys=resource_keys,
+                        dedup_policy=dedup_policy,
+                        allow_historical_continuation=allow_historical_continuation,
+                    ),
+                    attempts=8,
+                    base_delay_seconds=0.05,
+                    max_delay_seconds=0.75,
+                )
+            except Exception as exc:
+                if _is_sqlite_busy_exception(exc):
+                    raise state_busy(
+                        "MCP state DB is busy while recording prompt submission. Retry the same client_request_id.",
+                        client_request_id=explicit_client_request_id,
+                        operationType=operation_type,
+                    ) from exc
+                raise
             prompt_submission_id = _optional_string(dedup.get("promptSubmissionId"))
         if operation_type not in {"steer_turn", "fork_thread"} and dedup.get("action") == "continue_existing_chat":
             actual_operation_type = "send_message"
@@ -1580,6 +1630,9 @@ class OperationServiceMixin:
         if dedup_metadata is not None:
             actual_args["_dedup_metadata"] = dedup_metadata
             actual_args["original_operation_type"] = operation_type
+        actual_args["_thread_mode"] = thread_mode
+        actual_args["_dedup_policy"] = dedup_policy
+        actual_args["_allow_historical_continuation"] = allow_historical_continuation
         if operation_type == "execute_plan":
             actual_args["_prompt_dedup_operation_type"] = "execute_plan"
             actual_args["_prompt_dedup_basis"] = dedup_basis
@@ -1606,6 +1659,9 @@ class OperationServiceMixin:
         if dedup_metadata is not None:
             request_payload["_dedup_metadata"] = dedup_metadata
             request_payload["original_operation_type"] = operation_type
+        request_payload["thread_mode"] = thread_mode
+        request_payload["dedup_policy"] = dedup_policy
+        request_payload["allow_historical_continuation"] = allow_historical_continuation
         if operation_type == "execute_plan":
             request_payload["_prompt_dedup_operation_type"] = "execute_plan"
             request_payload["_prompt_dedup_basis"] = dedup_basis
@@ -1638,20 +1694,40 @@ class OperationServiceMixin:
             "submitter_config_fingerprint": self._config_fingerprint,
             "worker_config_summary_json": self._config_summary_json,
         }
-        created = self.storage.create_operation(row)
-        operation = self.storage.get_operation(operation_id) if created else self.storage.get_operation_by_client_request_id(client_request_id)
-        if operation is None:
-            if prompt_submission_id:
-                self.storage.update_prompt_submission(prompt_submission_id, status="failed", updated_at=_now_iso())
-            raise send_failed("Failed to create Codex operation.")
-        self._ensure_operation_scheduling(
-            operation,
-            agent_id=agent_id,
-            priority=priority,
-            estimated_cost_class=estimated_cost_class,
-            resource_keys=resource_keys,
-            queued_reason="waiting_for_worker" if not self._can_schedule_inline() else None,
-        )
+        try:
+            created = self.storage._sqlite_retry(
+                lambda: self.storage.create_operation(row),
+                attempts=8,
+                base_delay_seconds=0.05,
+                max_delay_seconds=0.75,
+            )
+            operation = self.storage.get_operation(operation_id) if created else self.storage.get_operation_by_client_request_id(client_request_id)
+            if operation is None:
+                if prompt_submission_id:
+                    self.storage.update_prompt_submission(prompt_submission_id, status="failed", updated_at=_now_iso())
+                raise send_failed("Failed to create Codex operation.")
+            self.storage._sqlite_retry(
+                lambda: self._ensure_operation_scheduling(
+                    operation,
+                    agent_id=agent_id,
+                    priority=priority,
+                    estimated_cost_class=estimated_cost_class,
+                    resource_keys=resource_keys,
+                    queued_reason="waiting_for_worker" if not self._can_schedule_inline() else None,
+                ),
+                attempts=8,
+                base_delay_seconds=0.05,
+                max_delay_seconds=0.75,
+            )
+        except Exception as exc:
+            if _is_sqlite_busy_exception(exc):
+                raise state_busy(
+                    "MCP state DB is busy while creating the durable operation. Retry the same client_request_id.",
+                    client_request_id=client_request_id,
+                    operationId=operation_id,
+                    operationType=operation_type,
+                ) from exc
+            raise
         if self._can_schedule_inline():
             self._schedule_operation_if_needed(operation)
         status = self._operation_status_payload(operation, last_messages=10, message_max_chars=8000)
@@ -2184,6 +2260,16 @@ class OperationServiceMixin:
             worker = self.storage.get_worker(worker_id) if worker_id else None
             terminal_queue = str(latest.get("status") or "") in OPERATION_TERMINAL_STATUSES
             consumes_slot = _operation_consumes_turn_slot_for_status(latest)
+            if thread_id and consumes_slot and not terminal_queue:
+                with suppress(Exception):
+                    self.storage.ensure_thread_active_lock_for_operation(
+                        operation_id,
+                        thread_id=thread_id,
+                        project_id=_optional_string(latest.get("project_id")),
+                        worker_id=worker_id,
+                        expires_at=_future_iso(6 * 60 * 60),
+                        created_at=_now_iso(),
+                    )
             if not slot_claim and not terminal_queue and scheduling.get("queue_status") in {"scheduled", "running"} and consumes_slot:
                 slot_claim = {
                     "claimed": True,
@@ -2339,7 +2425,7 @@ class OperationServiceMixin:
                 event_to_tool(row, include_payload=False)
                 for row in self.storage.list_app_server_events(thread_id=thread_id, turn_id=turn_id, limit=50)
             ]
-        return self._attach_agent_guidance(response, surface="operation_status")
+        return self._attach_agent_guidance(normalize_public_status_payload(response, surface="operation_status"), surface="operation_status")
 
     def _operation_final_report(
         self,
@@ -2475,12 +2561,43 @@ class OperationServiceMixin:
                 status=next_status,
                 updated_at=_now_iso(),
             )
+            if next_status in OPERATION_TERMINAL_STATUSES:
+                self._finalize_operation_queue_state(str(operation["operation_id"]), next_status=next_status)
             updated_operation = self.storage.get_operation(str(operation["operation_id"])) or operation
             if status_corrected:
                 updated_operation = dict(updated_operation)
                 updated_operation["_status_corrected"] = True
             return updated_operation
         return operation
+
+    def _finalize_operation_queue_state(self, operation_id: str, *, next_status: str) -> None:
+        with suppress(Exception):
+            self.storage.update_operation_scheduling(
+                operation_id,
+                queue_status=next_status,
+                queued_reason=None,
+                updated_at=_now_iso(),
+                slot_claim={"claimed": False},
+            )
+        with suppress(Exception):
+            self.storage.release_resource_locks_for_operation(operation_id)
+
+    def _persist_recovered_turn_terminal(self, turn_id: str, status: dict[str, Any]) -> None:
+        evidence = status.get("terminalEvidence") if isinstance(status.get("terminalEvidence"), dict) else {}
+        if not evidence.get("trusted"):
+            return
+        completed_at = _optional_string(status.get("completedAt")) or _optional_string(status.get("completed_at")) or _optional_string(evidence.get("observedAt"))
+        final_message = _optional_string(status.get("finalMessage")) or _optional_string(status.get("final_message"))
+        with suppress(Exception):
+            self.storage.update_tracked_turn_status(
+                turn_id,
+                status=str(status.get("status") or "completed"),
+                updated_at=completed_at or _now_iso(),
+                completed_at=completed_at,
+                final_message=final_message,
+                last_assistant_message=final_message,
+                clear_last_error=str(status.get("status") or "") == "completed",
+            )
 
     def _operation_config_mismatch(self, operation: dict[str, Any]) -> bool:
         if self._allow_cross_config_recovery:
@@ -2537,6 +2654,9 @@ class OperationServiceMixin:
                 status["last_messages"] = status["latestMessages"]
                 if status.get("tokenUsage") is not None:
                     status["tokenUsage"] = _compact_turn_token_usage(status.get("tokenUsage"))
+                if str(status.get("status") or "") != "completed":
+                    status["finalMessage"] = None
+                    status["final_message"] = None
             return status
         turn = self.storage.get_tracked_turn(turn_id)
         if turn is None:
@@ -2559,7 +2679,7 @@ class OperationServiceMixin:
             method="turn_lifecycle_event",
         )
         completion_observed = bool(terminal_evidence.get("trusted"))
-        if not completion_observed:
+        if not completion_observed or status_value != "completed":
             final_message = None
         last_error = _tracked_turn_last_error(turn)
         plans = [_plan_row_to_tool(row, message_max_chars) for row in self.storage.get_tracked_turn_plans(turn_id)]
@@ -2642,12 +2762,12 @@ class OperationServiceMixin:
         final_message = _truncate_text(turns_last_assistant(summary.messages, turn_id), message_max_chars)[0]
         terminal_evidence = _terminal_evidence_from_status(
             turn.status,
-            source="hook_history",
+            source="hook_stop",
             observed_at=turn.completed_at,
-            method="hook_terminal_marker",
+            method="hook_stop",
         )
         completion_observed = bool(terminal_evidence.get("trusted"))
-        if not completion_observed:
+        if not completion_observed or turn.status != "completed":
             final_message = None
         plans = [_plan_row_to_tool(row, message_max_chars) for row in self.storage.get_tracked_turn_plans(turn_id)]
         latest_plan = _latest_plan(plans)
@@ -2724,12 +2844,12 @@ class OperationServiceMixin:
         final_message = messages[-1]["text"] if messages else None
         terminal_evidence = _terminal_evidence_from_status(
             turn.status,
-            source="kb_history",
+            source="transcript_terminal",
             observed_at=turn.completed_at,
-            method="kb_terminal_marker",
+            method="transcript_terminal_record",
         )
         completion_observed = bool(terminal_evidence.get("trusted"))
-        if not completion_observed:
+        if not completion_observed or turn.status != "completed":
             final_message = None
         plans = [_plan_row_to_tool(row, message_max_chars) for row in self.storage.get_tracked_turn_plans(turn_id)]
         latest_plan = _latest_plan(plans)
@@ -2803,6 +2923,32 @@ def _resource_keys_value(value: Any) -> list[str]:
     if len(keys) > 50:
         raise invalid_argument("Too many resource_keys.", maxItems=50, actualItems=len(keys))
     return keys
+
+
+def _thread_mode_value(value: Any, *, operation_type: str) -> str:
+    if value in (None, ""):
+        if operation_type == "start_chat":
+            return "new_thread"
+        if operation_type in {"send_message", "execute_plan", "steer_turn"}:
+            return "continue_thread"
+        return "auto"
+    selected = str(value).strip()
+    if selected not in {"new_thread", "continue_thread", "auto"}:
+        raise invalid_argument("Unsupported thread_mode.", thread_mode=selected)
+    if operation_type == "start_chat" and selected == "continue_thread":
+        raise invalid_argument("start_chat cannot use thread_mode=continue_thread.")
+    if operation_type in {"send_message", "execute_plan", "steer_turn"} and selected == "new_thread":
+        raise invalid_argument(f"{operation_type} cannot use thread_mode=new_thread.", operation_type=operation_type)
+    return selected
+
+
+def _dedup_policy_value(value: Any) -> str:
+    if value in (None, ""):
+        return "active_prompt_guard"
+    selected = str(value).strip()
+    if selected not in {"idempotency_only", "active_prompt_guard", "allow_parallel_with_resource_keys"}:
+        raise invalid_argument("Unsupported dedup_policy.", dedup_policy=selected)
+    return selected
 
 
 def _dedup_resource_key_decision(current: list[str], existing: list[str]) -> dict[str, Any]:

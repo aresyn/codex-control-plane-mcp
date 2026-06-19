@@ -280,6 +280,73 @@ class StorageSchemaMixin:
             ON codex_worker_commands(status, updated_at)
             """
         )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS codex_thread_index(
+              thread_id TEXT PRIMARY KEY,
+              canonical_thread_id TEXT NOT NULL,
+              project_id TEXT,
+              project_path_key TEXT,
+              title TEXT,
+              archived INTEGER NOT NULL DEFAULT 0,
+              source TEXT NOT NULL,
+              source_priority INTEGER NOT NULL DEFAULT 100,
+              alias_of_thread_id TEXT,
+              created_at TEXT,
+              updated_at TEXT NOT NULL,
+              metadata_json TEXT NOT NULL DEFAULT '{}'
+            )
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_codex_thread_index_project
+            ON codex_thread_index(project_id, updated_at)
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS codex_turn_state(
+              turn_id TEXT PRIMARY KEY,
+              canonical_turn_id TEXT NOT NULL,
+              thread_id TEXT NOT NULL,
+              status TEXT NOT NULL,
+              terminal_trusted INTEGER NOT NULL DEFAULT 0,
+              terminal_source TEXT,
+              terminal_observed_at TEXT,
+              latest_message_ref TEXT,
+              final_message_ref TEXT,
+              token_usage_json TEXT,
+              created_at TEXT,
+              updated_at TEXT NOT NULL,
+              metadata_json TEXT NOT NULL DEFAULT '{}'
+            )
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_codex_turn_state_thread
+            ON codex_turn_state(thread_id, updated_at)
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS codex_status_snapshots(
+              snapshot_key TEXT PRIMARY KEY,
+              snapshot_type TEXT NOT NULL,
+              scope_id TEXT,
+              payload_json TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              expires_at TEXT
+            )
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_codex_status_snapshots_type
+            ON codex_status_snapshots(snapshot_type, scope_id, created_at)
+            """
+        )
 
     def _add_column_if_missing(self, table: str, column: str, declaration: str) -> None:
         columns = {

@@ -15,6 +15,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from . import __version__
+from .agent_safe_redactor import AgentSafeRedactor
 from .agent_guidance import (
     attempt_scope_from_args,
     build_guidance_for_error,
@@ -47,6 +48,7 @@ from .errors import (
     pending_interaction_unavailable,
     project_not_found,
     send_failed,
+    state_busy,
     thread_not_found,
     transcript_not_found,
     turn_not_found,
@@ -85,6 +87,8 @@ from .statuses import (
     TURN_TERMINAL_STATUSES,
 )
 from .storage import McpStorage
+from .status_assembler import normalize_public_status_payload
+from .thread_resolver import ThreadResolver
 from .transcript_importer import import_transcript_to_tracking
 from .transcripts import parse_transcript
 from .turn_tracker import WAITING_FOR_OPENCLAW_ERROR, progress_event_to_tool, turn_progress_status_fields
@@ -614,6 +618,23 @@ TOOLS: list[dict[str, Any]] = [
                 },
                 "priority": {"type": "string", "enum": ["low", "normal", "high"], "default": "normal"},
                 "estimated_cost_class": {"type": "string", "enum": ["light", "normal", "heavy"], "default": "normal"},
+                "thread_mode": {
+                    "type": ["string", "null"],
+                    "enum": ["new_thread", "continue_thread", "auto", None],
+                    "default": None,
+                    "description": "Explicit thread intent. Defaults to new_thread for start_chat and continue_thread for send_message/execute_plan.",
+                },
+                "dedup_policy": {
+                    "type": ["string", "null"],
+                    "enum": ["idempotency_only", "active_prompt_guard", "allow_parallel_with_resource_keys", None],
+                    "default": None,
+                    "description": "Controls prompt duplicate handling without changing client_request_id idempotency.",
+                },
+                "allow_historical_continuation": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Opt-in only. Allows fuzzy duplicate matching to continue a completed historical thread.",
+                },
                 "project_id": {"type": ["string", "null"], "default": None},
                 "chat_id": {"type": ["string", "null"], "default": None},
                 "thread_id": {
@@ -826,7 +847,7 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "include_recent_commands": {"type": "boolean", "default": True},
+                "include_recent_commands": {"type": "boolean", "default": False},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
             },
             "additionalProperties": False,
@@ -1079,6 +1100,19 @@ class ToolService:
         if self._startup_recovery.get("resetOperationIds") or self._startup_recovery.get("runningOperationIds"):
             LOG.info("operation startup recovery owner=%s result=%s", self._worker_owner, self._startup_recovery)
         self.catalog = ProjectChatCatalog(self.config, self.storage)
+        self.thread_resolver = ThreadResolver(catalog=self.catalog, storage=self.storage)
+        self.agent_safe_redactor = AgentSafeRedactor(
+            allowed_roots=self.config.allowed_roots,
+            private_roots=[
+                self.config.codex_home,
+                self.config.sessions_dir,
+                self.config.archived_sessions_dir,
+                self.config.codex_state_db,
+                self.config.codex_logs_db,
+                self.config.state_db_path,
+                self.config.codex_binary_path,
+            ],
+        )
         self._app_server: CodexAppServerClient | None = None
         self._operation_tasks: dict[str, asyncio.Task[None]] = {}
         self._runtime_capabilities_cache: dict[str, Any] | None = None
@@ -1281,6 +1315,12 @@ class ToolService:
             now=now,
         )
 
+    def _finalize_public_result(self, tool_name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        mode = "raw_audit" if tool_name == "codex_get_diagnostic_logs" and payload.get("includePayload") else "agent_safe"
+        normalized = normalize_public_status_payload(payload, surface=tool_name)
+        redacted = self.agent_safe_redactor.redact(normalized, mode=mode)
+        return redacted if isinstance(redacted, dict) else normalized
+
     async def call(self, name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
         args = arguments or {}
         started = time.monotonic()
@@ -1291,7 +1331,7 @@ class ToolService:
             if self._should_delegate_compatibility_write(name, args):
                 result = self._delegated_compatibility_write_payload(name, args)
                 LOG.info("call delegated compatibility write name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if (
                 self._delegates_control_to_worker()
                 and name == "codex_get_runtime_capabilities"
@@ -1299,7 +1339,7 @@ class ToolService:
             ):
                 result = self._enqueue_worker_command(name, args)
                 LOG.info("call delegated name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if (
                 self._delegates_control_to_worker()
                 and name in WORKER_COMMAND_TOOLS
@@ -1307,165 +1347,165 @@ class ToolService:
             ):
                 result = self._enqueue_worker_command(name, args)
                 LOG.info("call delegated name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_list_projects":
                 result = self.codex_list_projects(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_list_project_chats":
                 result = self.codex_list_project_chats(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_list_active_chats":
                 result = self.codex_list_active_chats(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_search_chats":
                 result = self.codex_search_chats(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_get_chat_status":
                 result = self.codex_get_chat_status(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_get_chat":
                 result = self.codex_get_chat(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_send_message":
                 result = await self.codex_send_message(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_start_chat":
                 result = await self.codex_start_chat(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_start_plan_workflow":
                 result = await self.codex_start_plan_workflow(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_start_review_workflow":
                 result = self.codex_start_review_workflow(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_get_workflow_status":
                 result = await self.codex_get_workflow_status_async(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_adopt_workflow_plan":
                 result = self.codex_adopt_workflow_plan(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_approve_plan":
                 result = self.codex_approve_plan(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_preflight_project_run":
                 result = await self.codex_preflight_project_run(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_get_turn_status":
                 result = self.codex_get_turn_status(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_execute_plan":
                 result = await self.codex_execute_plan(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_submit_task":
                 result = self.codex_submit_task(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_get_operation_status":
                 result = self.codex_get_operation_status(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_list_pending_interactions":
                 result = self.codex_list_pending_interactions(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_answer_pending_interaction":
                 result = await self.codex_answer_pending_interaction(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_interrupt_turn":
                 result = await self.codex_interrupt_turn(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_archive_thread":
                 result = await self.codex_archive_thread(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_unarchive_thread":
                 result = await self.codex_unarchive_thread(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_start_thread_compaction":
                 result = await self.codex_start_thread_compaction(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_get_thread_compaction_status":
                 result = self.codex_get_thread_compaction_status(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_get_worker_status":
                 result = self.codex_get_worker_status(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_get_queue_status":
                 result = self.codex_get_queue_status(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_get_concurrency_status":
                 result = self.codex_get_concurrency_status(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_get_worker_command_status":
                 result = self.codex_get_worker_command_status(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_restart_app_server":
                 result = await self.codex_restart_app_server(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_get_app_server_status":
                 result = self.codex_get_app_server_status(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_get_runtime_capabilities":
                 result = await self.codex_get_runtime_capabilities(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_health_summary":
                 result = self.codex_health_summary(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_collect_diagnostics":
                 result = self.codex_collect_diagnostics(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_get_diagnostic_logs":
                 result = self.codex_get_diagnostic_logs(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_analyze_issue":
                 result = self.codex_analyze_issue(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             if name == "codex_repair_issue":
                 result = await self.codex_repair_issue(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
-                return result
+                return self._finalize_public_result(name, result)
             raise invalid_argument(f"Unknown tool: {name}")
         except CodexMcpError as exc:
             LOG.warning("call codex error name=%s code=%s retryable=%s", name, exc.code, exc.retryable)
-            return self._attach_error_guidance(exc.to_dict(), tool_name=name)
+            return self._finalize_public_result(name, self._attach_error_guidance(exc.to_dict(), tool_name=name))
         except RuntimeError as exc:
             LOG.exception("call runtime error name=%s", name)
-            return self._attach_error_guidance(send_failed(str(exc)).to_dict(), tool_name=name)
+            return self._finalize_public_result(name, self._attach_error_guidance(send_failed(str(exc)).to_dict(), tool_name=name))
         except Exception as exc:
             LOG.exception("call unexpected error name=%s", name)
-            return self._attach_error_guidance(send_failed(str(exc)).to_dict(), tool_name=name)
+            return self._finalize_public_result(name, self._attach_error_guidance(send_failed(str(exc)).to_dict(), tool_name=name))
 
     async def _app(self) -> CodexAppServerClient:
         if self._app_server is None:
@@ -1714,6 +1754,15 @@ def _validate_output_schema_node(schema: dict[str, Any], *, path: str) -> None:
             path=path,
         )
     if isinstance(properties, dict):
+        required = set(str(item) for item in schema.get("required") or [])
+        if _schema_type_includes(schema_type, "object") or schema.get("additionalProperties") is False:
+            missing = sorted(str(name) for name in properties.keys() if str(name) not in required)
+            if missing:
+                raise invalid_argument(
+                    "output_schema object properties must all be listed in required for strict structured output.",
+                    path=path,
+                    missingRequired=missing[:20],
+                )
         for name, child in properties.items():
             if isinstance(child, dict):
                 _validate_output_schema_node(child, path=f"{path}.properties.{name}")
@@ -1939,6 +1988,33 @@ def _turn_status_has_trusted_terminal_evidence(status: dict[str, Any] | None) ->
     return bool(status.get("completedAt") or status.get("completed_at")) and bool(status.get("completionObserved"))
 
 
+def _fallback_terminal_should_replace_live(live: dict[str, Any] | None, fallback: dict[str, Any] | None) -> bool:
+    if not _turn_status_has_trusted_terminal_evidence(fallback):
+        return False
+    if not isinstance(live, dict):
+        return True
+    if _turn_status_has_trusted_terminal_evidence(live):
+        return False
+    live_source = str(live.get("source") or "")
+    live_status = str(live.get("status") or "").strip().lower()
+    if live_source == "live" and live_status in TURN_ACTIVE_STATUSES:
+        return False
+    return live_source != "live" or live_status in {"unknown", "unknown_after_app_server_exit", "ready"}
+
+
+def _mark_recovered_terminal_evidence(status: dict[str, Any]) -> None:
+    evidence = status.get("terminalEvidence")
+    if isinstance(evidence, dict) and evidence.get("trusted"):
+        evidence["recovered"] = True
+    status["completion_observed"] = True
+    status["completionObserved"] = True
+
+
+def _is_sqlite_busy_exception(exc: BaseException) -> bool:
+    text = str(exc).casefold()
+    return "database is locked" in text or "database table is locked" in text or "database is busy" in text
+
+
 def _merge_turn_messages(live: dict[str, Any], fallback: dict[str, Any], *, source: str) -> dict[str, Any]:
     merged = dict(live)
     messages = fallback.get("latestMessages") or fallback.get("last_messages") or []
@@ -1957,6 +2033,7 @@ def _operation_reconciliation_state(operation: dict[str, Any], turn_status: dict
     return {
         "trustedTerminal": trusted_terminal,
         "terminalEvidenceSource": (evidence or {}).get("source") if isinstance(evidence, dict) else None,
+        "terminalEvidenceRecovered": bool((evidence or {}).get("recovered")) if isinstance(evidence, dict) else False,
         "terminalEventAt": (evidence or {}).get("observedAt") if isinstance(evidence, dict) else None,
         "statusCorrected": bool(operation.get("_status_corrected")),
     }

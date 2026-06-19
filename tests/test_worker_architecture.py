@@ -515,10 +515,91 @@ class CentralWorkerArchitectureTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await service.close()
 
-            rendered = json.dumps(status, ensure_ascii=False)
-            self.assertEqual("stale", status["workers"][0]["effectiveStatus"])
-            self.assertNotIn("secret.jsonl", rendered)
-            self.assertTrue(status["recentCommands"][0]["result"]["appServerResult"]["redacted"])
+        rendered = json.dumps(status, ensure_ascii=False)
+        self.assertEqual("stale", status["workers"][0]["effectiveStatus"])
+        self.assertNotIn("secret.jsonl", rendered)
+        self.assertTrue(status["recentCommands"][0]["resultAvailable"])
+        self.assertFalse(status["recentCommands"][0]["resultIncluded"])
+        self.assertIsNone(status["recentCommands"][0]["result"])
+
+    async def test_client_app_server_status_keeps_worker_derived_active_turns_when_worker_stale(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_db = root / ".codex" / "state_5.sqlite"
+            config = _search_service_config(root, state_db)
+            config.execution_mode = "client"
+            service = ToolService(config)
+            try:
+                now = "2026-05-25T00:00:00+00:00"
+                service.storage.upsert_worker(
+                    worker_id="worker-stale",
+                    role="worker",
+                    status="running",
+                    pid=123,
+                    hostname="host",
+                    config_fingerprint="fp",
+                    started_at=now,
+                    last_heartbeat_at=now,
+                    active_operation_count=1,
+                    active_turn_count=1,
+                )
+                service.storage.create_operation(
+                    {
+                        "operation_id": "op-active-stale-worker",
+                        "client_request_id": "op-active-stale-worker",
+                        "operation_type": "start_chat",
+                        "status": "running",
+                        "phase": "running",
+                        "project_id": "project",
+                        "chat_id": "thread-active",
+                        "thread_id": "thread-active",
+                        "turn_id": "turn-active",
+                        "workflow_id": None,
+                        "cwd": str(root),
+                        "title": None,
+                        "request_json": '{"sandbox":"danger-full-access"}',
+                        "created_at": now,
+                        "updated_at": now,
+                    }
+                )
+                service.storage.upsert_tracked_turn(
+                    {
+                        "turn_id": "turn-active",
+                        "thread_id": "thread-active",
+                        "chat_id": "thread-active",
+                        "project_id": "project",
+                        "project_path": str(root),
+                        "status": "running",
+                        "started_at": now,
+                        "updated_at": now,
+                        "completed_at": None,
+                        "first_message_at": None,
+                        "final_message": None,
+                        "last_assistant_message": None,
+                        "last_error": None,
+                        "source": "app_server",
+                    }
+                )
+                service.storage.upsert_operation_scheduling(
+                    operation_id="op-active-stale-worker",
+                    agent_id="agent",
+                    priority="normal",
+                    estimated_cost_class="normal",
+                    resource_keys=[],
+                    queue_status="running",
+                    queued_reason=None,
+                    created_at=now,
+                    updated_at=now,
+                )
+
+                status = await service.call("codex_get_app_server_status", {})
+            finally:
+                await service.close()
+
+        self.assertEqual(1, status["activeTurnCount"])
+        self.assertEqual("turn-active", status["workerDerivedActiveTurns"][0]["turnId"])
+        self.assertTrue(status["workerHeartbeatStale"])
+        self.assertEqual("unknown_stale_worker", status["appServerLiveState"])
 
     async def test_worker_command_status_is_bounded_and_can_omit_result(self) -> None:
         with TemporaryDirectory() as tmp:

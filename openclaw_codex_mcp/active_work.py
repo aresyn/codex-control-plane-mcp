@@ -7,7 +7,7 @@ from .statuses import OPERATION_ACTIVE_STATUSES, OPERATION_TERMINAL_STATUSES, TU
 
 
 ACTIVE_QUEUE_STATUSES = {"scheduled", "running"}
-ACTIVE_TURN_CANDIDATE_STATUSES = set(TURN_ACTIVE_STATUSES) | {"ready", "starting"}
+ACTIVE_TURN_CANDIDATE_STATUSES = set(TURN_ACTIVE_STATUSES)
 
 
 def worker_active_turns_snapshot(storage: Any, *, limit: int = 100) -> dict[str, Any]:

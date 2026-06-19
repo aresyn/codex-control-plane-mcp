@@ -194,7 +194,7 @@ def actions_for_category(category: str) -> list[dict[str, Any]]:
         ]
     if category == "stale_operation":
         return [action("recover_stale_operations", expected_effect="Reset recoverable queued/starting operations without starting duplicate turns.")]
-    if category == "premature_terminal_operation":
+    if category in {"premature_terminal_operation", "terminal_reconcile_stuck"}:
         return [
             action(
                 "reconcile_operations_with_tracked_turns",
@@ -494,6 +494,8 @@ def next_steps_for_findings(findings: list[dict[str, Any]]) -> list[str]:
         steps.append("Review workflowObservation.candidatePlans and adopt the valid candidate before approving execution.")
     if categories & {"app_server_stdout_closed", "app_server_not_running", "app_server_exited"}:
         steps.append("Inspect recent MCP log lines and app_server_events around the last processGeneration.")
+    if "terminal_reconcile_stuck" in categories:
+        steps.append("Run codex_repair_issue(action='reconcile_operations_with_tracked_turns', dry_run=true) for the scoped operation, then execute once if the preview only affects that operation.")
     if categories & {"stale_turn", "stale_operation"}:
         steps.append("Check affected durable operation/turn status before running the recommended dry-run repair.")
     if categories & {"pending_interaction_stale", "pending_approval", "pending_user_input"}:

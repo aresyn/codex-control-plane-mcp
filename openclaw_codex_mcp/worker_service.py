@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from . import tools as _tools
+from .lock_planner import operation_consumes_turn_slot as planner_operation_consumes_turn_slot
 from .statuses import OPERATION_TERMINAL_STATUSES, TURN_ACTIVE_STATUSES
 
 globals().update(_tools.__dict__)
@@ -14,8 +15,11 @@ class WorkerServiceMixin:
         limit = _bounded_int(args.get("limit", 20), 1, 100)
         workers = [_worker_row_to_tool(row) for row in self.storage.list_workers(limit=limit)]
         commands: list[dict[str, Any]] = []
-        if bool(args.get("include_recent_commands", True)):
-            commands = [_worker_command_row_to_tool(row) for row in self.storage.list_worker_commands(limit=limit)]
+        if bool(args.get("include_recent_commands", False)):
+            commands = [
+                _worker_command_row_to_tool(row, include_result=False)
+                for row in self.storage.list_worker_commands(limit=limit)
+            ]
         return {
             "ok": True,
             "executionMode": self.config.execution_mode,
@@ -412,12 +416,7 @@ def _project_concurrency_key(row: dict[str, Any]) -> str:
 
 
 def _operation_consumes_turn_slot(row: dict[str, Any], request: dict[str, Any]) -> bool:
-    operation_type = str(row.get("operation_type") or "")
-    if operation_type == "steer_turn":
-        return False
-    if operation_type == "fork_thread" and not _optional_string(request.get("message")):
-        return False
-    return True
+    return planner_operation_consumes_turn_slot(row, request)
 
 
 def _concurrency_limits_to_tool(config: Any) -> dict[str, Any]:

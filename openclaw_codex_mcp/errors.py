@@ -74,6 +74,10 @@ def send_failed(message: str, **details: Any) -> CodexMcpError:
     return CodexMcpError("CODEX_SEND_FAILED", message, details, retryable=False)
 
 
+def state_busy(message: str, **details: Any) -> CodexMcpError:
+    return CodexMcpError("CODEX_STATE_BUSY", message, details, retryable=True)
+
+
 def timeout(message: str, **details: Any) -> CodexMcpError:
     return CodexMcpError("CODEX_TIMEOUT", message, details, retryable=True)
 

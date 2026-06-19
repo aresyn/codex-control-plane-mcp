@@ -229,47 +229,24 @@ class ThreadLifecycleServiceMixin:
         }
 
     def _resolve_lifecycle_thread_context(self, *, thread_id: str, project_id: str | None = None) -> dict[str, Any]:
-        resolved_project_id = project_id
-        chat = self.catalog.get_chat(thread_id, project_id)
-        tracked_turn = self.storage.get_latest_tracked_turn_for_thread(thread_id)
-        hook_thread = self.storage.get_hook_thread(thread_id)
-        known_thread = self._resolve_known_thread_context(thread_id, project_id)
-        source = "unknown"
-        project_path: str | None = None
-        archived: bool | None = None
-
-        if chat is not None:
-            source = str(chat.source or "catalog")
-            resolved_project_id = chat.project_id or resolved_project_id
-            project_path = _optional_string(chat.project_path)
-            archived = bool(chat.archived)
-        elif tracked_turn is not None:
-            source = "tracked_turn"
-            resolved_project_id = _optional_string(tracked_turn.get("project_id")) or resolved_project_id
-            project_path = _optional_string(tracked_turn.get("project_path"))
-            archived = None
-        elif hook_thread is not None:
-            source = "hook_history"
-            project_path = _optional_string(hook_thread.get("project_path"))
-            resolved_project_id = resolved_project_id or (project_id_for_path(project_path) if project_path else None)
-            archived = False
-        elif known_thread is not None:
-            source = _optional_string(known_thread.get("source")) or "operation"
-            project_path = _optional_string(known_thread.get("projectPath"))
-            resolved_project_id = _optional_string(known_thread.get("projectId")) or resolved_project_id
-            archived = None
-        else:
+        resolution = self.thread_resolver.resolve(thread_id, project_id, refresh_catalog=True)
+        known_thread = self._resolve_known_thread_context(thread_id, project_id) if resolution is None else None
+        if resolution is None and known_thread is None:
             raise thread_not_found(thread_id)
-
+        chat = resolution.chat if resolution is not None else None
+        resolved_project_id = (
+            _optional_string(chat.project_id) if chat is not None else _optional_string((known_thread or {}).get("projectId"))
+        ) or project_id
         if project_id and resolved_project_id and project_id != resolved_project_id:
             raise thread_not_found(thread_id)
         return {
             "threadId": thread_id,
             "projectId": resolved_project_id,
-            "projectPath": project_path,
-            "archived": archived,
-            "source": source,
+            "projectPath": _optional_string(chat.project_path) if chat is not None else _optional_string((known_thread or {}).get("projectPath")),
+            "archived": bool(chat.archived) if chat is not None and chat.archived is not None else None,
+            "source": resolution.source if resolution is not None else (_optional_string((known_thread or {}).get("source")) or "operation"),
             "chat": chat,
+            "threadResolution": resolution.to_tool() if resolution is not None else None,
         }
 
     def _assert_thread_lifecycle_safe(self, thread_id: str) -> None:
@@ -287,7 +264,8 @@ class ThreadLifecycleServiceMixin:
         project_id: str | None = None,
         expected_archived: bool | None = None,
     ) -> dict[str, Any]:
-        chat = self.catalog.get_chat(thread_id, project_id)
+        resolution = self.thread_resolver.resolve(thread_id, project_id, refresh_catalog=False)
+        chat = resolution.chat if resolution is not None else None
         tracked_turn = self.storage.get_latest_tracked_turn_for_thread(thread_id)
         known_thread = self._resolve_known_thread_context(thread_id, project_id)
         pending = self._pending_interactions_for_context(thread_id=thread_id, turn_id=None, status="pending", limit=20)
@@ -297,7 +275,7 @@ class ThreadLifecycleServiceMixin:
             archived = bool(chat.archived)
         known = bool(chat is not None or tracked_turn is not None or self.storage.get_hook_thread(thread_id) is not None or known_thread is not None)
         known_source = (
-            chat.source if chat is not None else (
+            resolution.source if resolution is not None else (
                 "tracked_turn" if tracked_turn is not None else (
                     "hook_history" if self.storage.get_hook_thread(thread_id) is not None else _optional_string((known_thread or {}).get("source"))
                 )
