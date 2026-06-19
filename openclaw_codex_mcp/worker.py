@@ -82,7 +82,7 @@ class CentralWorker:
     def _active_turn_count(self) -> int:
         rows = self.service.storage.connection.execute(
             f"""
-            SELECT COUNT(*) AS count
+            SELECT COUNT(DISTINCT turns.turn_id) AS count
               FROM codex_operations AS ops
               JOIN tracked_turns AS turns ON turns.turn_id = ops.turn_id
              WHERE turns.status IN ({','.join('?' for _ in TURN_ACTIVE_STATUSES)})
@@ -205,6 +205,24 @@ class CentralWorker:
         project_key = _project_key(operation)
         thread_id = _operation_thread_id(operation, request)
 
+        if not _operation_consumes_turn_slot(operation, request):
+            return {
+                "allowed": True,
+                "reason": None,
+                "locks": [],
+                "slotClaim": {
+                    "claimed": False,
+                    "workerId": self.worker_id,
+                    "controlOperation": True,
+                    "operationType": str(operation.get("operation_type") or ""),
+                    "projectKey": project_key,
+                    "agentId": agent_id,
+                    "threadId": thread_id,
+                    "lockKeys": [],
+                    "claimedAt": _now_iso(),
+                },
+            }
+
         if len(active) >= self.service.config.max_active_turns_global:
             return _deny("global_slot_limit")
         if _count_by(active, lambda row: _project_key(row) == project_key) >= self.service.config.max_active_turns_per_project:
@@ -263,7 +281,12 @@ class CentralWorker:
             """,
             starting + turn_active,
         ).fetchall()
-        return [dict(row) for row in rows]
+        active: list[dict[str, Any]] = []
+        for row in rows:
+            operation = dict(row)
+            if _operation_consumes_turn_slot(operation, _json_dict(operation.get("request_json"))):
+                active.append(operation)
+        return active
 
     def _locks_for_operation(
         self,
@@ -398,8 +421,19 @@ def _operation_is_write_turn(operation: dict[str, Any], request: dict[str, Any])
     operation_type = str(operation.get("operation_type") or "")
     if operation_type == "fork_thread" and not _optional_string(request.get("message")):
         return False
+    if not _operation_consumes_turn_slot(operation, request):
+        return False
     sandbox = str(request.get("sandbox") or "").strip()
     return sandbox in {"workspace-write", "danger-full-access"}
+
+
+def _operation_consumes_turn_slot(operation: dict[str, Any], request: dict[str, Any]) -> bool:
+    operation_type = str(operation.get("operation_type") or "")
+    if operation_type == "steer_turn":
+        return False
+    if operation_type == "fork_thread" and not _optional_string(request.get("message")):
+        return False
+    return True
 
 
 def _count_by(rows: list[dict[str, Any]], predicate: Any) -> int:

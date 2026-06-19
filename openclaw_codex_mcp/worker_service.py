@@ -65,6 +65,7 @@ class WorkerServiceMixin:
         active_operations = self.storage.connection.execute(
             """
             SELECT ops.operation_id, ops.operation_type, ops.status, ops.project_id, ops.cwd,
+                   ops.request_json,
                    ops.thread_id, ops.turn_id, sched.agent_id, sched.resource_keys_json
               FROM codex_operations AS ops
               LEFT JOIN codex_operation_scheduling AS sched ON sched.operation_id = ops.operation_id
@@ -77,7 +78,11 @@ class WorkerServiceMixin:
             """,
             SLOT_STARTING_STATUSES + tuple(TURN_ACTIVE_STATUSES) + (limit,),
         ).fetchall()
-        active = [dict(row) for row in active_operations]
+        active = [
+            row
+            for row in (dict(item) for item in active_operations)
+            if _operation_consumes_turn_slot(row, _json_dict(row.get("request_json")))
+        ]
         per_project: dict[str, int] = {}
         per_agent: dict[str, int] = {}
         per_thread: dict[str, int] = {}
@@ -237,6 +242,15 @@ def _project_concurrency_key(row: dict[str, Any]) -> str:
     if row.get("cwd"):
         return "cwd:" + path_key(row.get("cwd"))
     return "unknown"
+
+
+def _operation_consumes_turn_slot(row: dict[str, Any], request: dict[str, Any]) -> bool:
+    operation_type = str(row.get("operation_type") or "")
+    if operation_type == "steer_turn":
+        return False
+    if operation_type == "fork_thread" and not _optional_string(request.get("message")):
+        return False
+    return True
 
 
 def _concurrency_limits_to_tool(config: Any) -> dict[str, Any]:

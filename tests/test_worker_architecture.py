@@ -156,6 +156,68 @@ class CentralWorkerArchitectureTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(1, concurrency["activeTurnCount"])
             self.assertEqual(fresh["operationId"], concurrency["activeOperations"][0]["operationId"])
 
+    async def test_steer_turn_bypasses_turn_slot_limits_and_does_not_double_count_active_turn(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "Project"
+            project.mkdir()
+            state_db = root / ".codex" / "state_5.sqlite"
+            project_id = project_id_for_path(str(project))
+            client_config = _search_service_config(root, state_db)
+            client_config.execution_mode = "client"
+            client = ToolService(client_config)
+            worker_config = _search_service_config(root, state_db)
+            worker_config.execution_mode = "worker"
+            worker_config.max_active_turns_global = 1
+            worker_config.max_active_turns_per_project = 1
+            worker_config.max_active_turns_per_agent = 1
+            worker_service = ToolService(worker_config)
+            fake = FakeAppServer(worker_service.storage, first_message=None)
+            worker_service._app_server = fake  # type: ignore[assignment]
+            worker = CentralWorker(worker_service)
+            try:
+                started = await client.call(
+                    "codex_submit_task",
+                    {
+                        "operation_type": "start_chat",
+                        "project_id": project_id,
+                        "message": "long running task",
+                        "client_request_id": "slot-limit-running-task",
+                        "agent_id": "codex-dev",
+                        "sandbox": "read-only",
+                    },
+                )
+                await worker._schedule_startable_operations()
+                await _wait_for_turn_starts(fake, expected=1)
+                running = await worker_service.call("codex_get_operation_status", {"operation_id": started["operationId"]})
+
+                steer = await client.call(
+                    "codex_submit_task",
+                    {
+                        "operation_type": "steer_turn",
+                        "thread_id": running["threadId"],
+                        "expected_turn_id": running["turnId"],
+                        "message": "steer the already running task",
+                        "client_request_id": "slot-limit-steer-task",
+                        "agent_id": "codex-dev",
+                    },
+                )
+                await worker._schedule_startable_operations()
+                await _wait_for_steer_calls(fake, expected=1)
+                steer_status = await worker_service.call("codex_get_operation_status", {"operation_id": steer["operationId"]})
+                concurrency = await worker_service.call("codex_get_concurrency_status", {"include_locks": False})
+            finally:
+                await client.close()
+                await worker_service.close()
+
+            self.assertEqual(1, len(fake.turn_start_calls))
+            self.assertEqual(1, len(fake.turn_steer_calls))
+            self.assertEqual("running", steer_status["status"])
+            self.assertTrue(steer_status["steerState"]["accepted"])
+            self.assertEqual("turn-fake", fake.turn_steer_calls[0]["expected_turn_id"])
+            self.assertEqual(1, concurrency["activeTurnCount"])
+            self.assertEqual(1, concurrency["counts"]["global"])
+
     async def test_terminal_scheduling_rows_do_not_appear_in_active_queue(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -314,5 +376,12 @@ class CentralWorkerArchitectureTests(unittest.IsolatedAsyncioTestCase):
 async def _wait_for_turn_starts(fake: FakeAppServer, *, expected: int) -> None:
     for _ in range(100):
         if len(fake.turn_start_calls) >= expected:
+            return
+        await asyncio.sleep(0.01)
+
+
+async def _wait_for_steer_calls(fake: FakeAppServer, *, expected: int) -> None:
+    for _ in range(100):
+        if len(fake.turn_steer_calls) >= expected:
             return
         await asyncio.sleep(0.01)
