@@ -66,6 +66,10 @@ These tools are the supported surface for long-running Codex orchestration:
 - `codex_unarchive_thread`
 - `codex_start_thread_compaction`
 - `codex_get_thread_compaction_status`
+- `codex_get_worker_status`
+- `codex_get_queue_status`
+- `codex_get_concurrency_status`
+- `codex_get_worker_command_status`
 - `codex_get_runtime_capabilities`
 - `codex_preflight_project_run`
 - `codex_health_summary`
@@ -94,6 +98,54 @@ MCP sends `workspace-write` to app-server instead. Status output includes
 `requestedSandbox`, `effectiveSandbox`, `runtimePolicyAdjusted`, and
 `runtimePolicy` so clients can audit the adjustment. Non-plan write operations
 keep normal sandbox semantics.
+
+## Execution modes and central worker
+
+`CODEX_MCP_EXECUTION_MODE` controls whether an MCP process may execute queued
+operations:
+
+- `inline`: default. The stdio server can submit, poll, and execute operations.
+- `client`: submit/status/read surface only. It never picks up queued durable
+  operations and delegates control actions to the worker command queue.
+- `worker`: long-running scheduler. It owns app-server, leases, queue slots, and
+  resource locks.
+- `observe`: read-only heartbeat process for rollout checks. It never acquires
+  leases.
+
+In `client` mode, `codex_submit_task` creates a durable operation and returns a
+fast ACK. `codex_get_operation_status` remains passive and does not call
+`_schedule_recoverable_operations`.
+
+The worker uses these limits:
+
+- `CODEX_MCP_MAX_ACTIVE_TURNS_GLOBAL`, default `4`
+- `CODEX_MCP_MAX_ACTIVE_TURNS_PER_PROJECT`, default `3`
+- `CODEX_MCP_MAX_ACTIVE_TURNS_PER_AGENT`, default `3`
+- `CODEX_MCP_MAX_ACTIVE_TURNS_PER_THREAD`, default `1`
+- `CODEX_MCP_MAX_ACTIVE_WRITE_TURNS_PER_PROJECT`, default `1`
+- `CODEX_MCP_MAX_APP_SERVER_PENDING_REQUESTS`, default `8`
+
+`codex_submit_task` accepts scheduling hints:
+
+- `agent_id`: stable orchestrator id such as `codex-dev`.
+- `resource_keys`: write scopes for parallel work in one project.
+- `priority`: `low`, `normal`, or `high`.
+- `estimated_cost_class`: `light`, `normal`, or `heavy`.
+
+If a write turn uses `workspace-write` or `danger-full-access` without
+`resource_keys`, the worker takes a broad `project:<cwd>:write` lock. With
+disjoint `resource_keys`, write turns in one project may run in parallel.
+
+Operation status adds:
+
+- `queueState`
+- `workerState`
+- `slotState`
+- `resourceLockState`
+
+Queued operations use `nextRecommendedAction="wait_for_worker_slot"` when a
+limit or lock blocks scheduling. Worker health problems use
+`nextRecommendedAction="inspect_worker_health"`.
 
 ## Durable operation types
 

@@ -1172,10 +1172,23 @@ class OperationServiceMixin:
         else:
             message = _required_string(args, "message")
         explicit_client_request_id = _optional_string(args.get("client_request_id"))
+        agent_id = _optional_string(args.get("agent_id"))
+        priority = _priority_value(args.get("priority"))
+        estimated_cost_class = _estimated_cost_class_value(args.get("estimated_cost_class"))
+        resource_keys = _resource_keys_value(args.get("resource_keys"))
         if explicit_client_request_id:
             existing = self.storage.get_operation_by_client_request_id(explicit_client_request_id)
             if existing is not None:
-                self._schedule_operation_if_needed(existing)
+                self._ensure_operation_scheduling(
+                    existing,
+                    agent_id=agent_id,
+                    priority=priority,
+                    estimated_cost_class=estimated_cost_class,
+                    resource_keys=resource_keys,
+                    queued_reason="idempotent_existing_operation",
+                )
+                if self._can_schedule_inline():
+                    self._schedule_operation_if_needed(existing)
                 status = self._operation_status_payload(
                     existing,
                     last_messages=10,
@@ -1429,7 +1442,16 @@ class OperationServiceMixin:
             if prompt_submission_id:
                 self.storage.update_prompt_submission(prompt_submission_id, status="failed", updated_at=_now_iso())
             raise send_failed("Failed to create Codex operation.")
-        self._schedule_operation_if_needed(operation)
+        self._ensure_operation_scheduling(
+            operation,
+            agent_id=agent_id,
+            priority=priority,
+            estimated_cost_class=estimated_cost_class,
+            resource_keys=resource_keys,
+            queued_reason="waiting_for_worker" if not self._can_schedule_inline() else None,
+        )
+        if self._can_schedule_inline():
+            self._schedule_operation_if_needed(operation)
         status = self._operation_status_payload(operation, last_messages=10, message_max_chars=8000)
         status["idempotent"] = False
         status.update(self._dedup_metadata_for_result(dedup_metadata))
@@ -1440,8 +1462,9 @@ class OperationServiceMixin:
         operation = self.storage.get_operation(operation_id)
         if operation is None:
             raise invalid_argument("Codex operation was not found.", operation_id=operation_id)
-        self._schedule_recoverable_operations()
-        self._schedule_operation_if_needed(operation)
+        if self._can_schedule_inline():
+            self._schedule_recoverable_operations()
+            self._schedule_operation_if_needed(operation)
         return self._operation_status_payload(
             operation,
             last_messages=_bounded_int(args.get("last_messages", 10), 1, 50),
@@ -1454,6 +1477,8 @@ class OperationServiceMixin:
     def _schedule_operation_if_needed(self, operation: dict[str, Any]) -> None:
         operation_id = str(operation.get("operation_id") or "")
         if not operation_id:
+            return
+        if not self._can_execute_operations():
             return
         if str(operation.get("status") or "") not in OPERATION_STARTABLE_STATUSES:
             return
@@ -1478,6 +1503,8 @@ class OperationServiceMixin:
         self._operation_tasks[operation_id] = task
 
     def _schedule_recoverable_operations(self, *, limit: int = 20) -> None:
+        if not self._can_execute_operations():
+            return
         try:
             asyncio.get_running_loop()
         except RuntimeError:
@@ -1803,10 +1830,62 @@ class OperationServiceMixin:
             heartbeat_task.cancel()
             with suppress(BaseException):
                 await heartbeat_task
+            with suppress(Exception):
+                latest_for_locks = self.storage.get_operation(operation_id) or {}
+                if str(latest_for_locks.get("status") or "") not in {"running", "first_message_received", "waiting_for_approval", "waiting_for_user_input"}:
+                    self.storage.release_resource_locks_for_operation(operation_id)
+            with suppress(Exception):
+                latest_after_run = self.storage.get_operation(operation_id) or {}
+                latest_status = str(latest_after_run.get("status") or "")
+                if latest_status in OPERATION_TERMINAL_STATUSES:
+                    queue_status = "completed" if latest_status == "completed" else "failed"
+                    queued_reason = None
+                elif latest_status in OPERATION_STARTABLE_STATUSES:
+                    queue_status = "queued"
+                    queued_reason = "retry_after_worker_error" if latest_after_run.get("last_error") else "waiting_for_worker"
+                else:
+                    queue_status = "running"
+                    queued_reason = None
+                self.storage.update_operation_scheduling(
+                    operation_id,
+                    queue_status=queue_status,
+                    queued_reason=queued_reason,
+                    updated_at=_now_iso(),
+                    worker_id=self._worker_owner,
+                )
             self.storage.release_operation_lease(operation_id, lease_owner=self._worker_owner, updated_at=_now_iso())
             task = self._operation_tasks.get(operation_id)
             if task is not None and task.done():
                 self._operation_tasks.pop(operation_id, None)
+
+    def _ensure_operation_scheduling(
+        self,
+        operation: dict[str, Any],
+        *,
+        agent_id: str | None = None,
+        priority: str = "normal",
+        estimated_cost_class: str = "normal",
+        resource_keys: list[str] | None = None,
+        queued_reason: str | None = None,
+    ) -> None:
+        operation_id = str(operation.get("operation_id") or "")
+        if not operation_id:
+            return
+        existing = self.storage.get_operation_scheduling(operation_id)
+        now = _now_iso()
+        if existing is not None:
+            return
+        self.storage.upsert_operation_scheduling(
+            operation_id=operation_id,
+            agent_id=agent_id,
+            priority=priority,
+            estimated_cost_class=estimated_cost_class,
+            resource_keys=resource_keys or [],
+            queue_status="queued",
+            queued_reason=queued_reason,
+            created_at=now,
+            updated_at=now,
+        )
 
     def _operation_status_payload(
         self,
@@ -1847,6 +1926,56 @@ class OperationServiceMixin:
         response["operationSource"] = "durable_queue"
         response["lease_state"] = self._operation_lease_state(latest)
         response["leaseState"] = response["lease_state"]
+        scheduling = self.storage.get_operation_scheduling(operation_id)
+        if scheduling is not None:
+            slot_claim = _safe_json_dict(scheduling.get("slot_claim_json"))
+            worker_id = _optional_string(scheduling.get("worker_id"))
+            worker = self.storage.get_worker(worker_id) if worker_id else None
+            response["queueState"] = {
+                "queueStatus": scheduling.get("queue_status"),
+                "queuedReason": scheduling.get("queued_reason"),
+                "priority": scheduling.get("priority"),
+                "estimatedCostClass": scheduling.get("estimated_cost_class"),
+                "agentId": scheduling.get("agent_id"),
+                "resourceKeys": _safe_json_list(scheduling.get("resource_keys_json")),
+                "workerId": worker_id,
+                "scheduledAt": scheduling.get("scheduled_at"),
+                "updatedAt": scheduling.get("updated_at"),
+            }
+            response["slotState"] = slot_claim or {"claimed": False}
+            response["workerState"] = {
+                "workerId": worker_id,
+                "status": (worker or {}).get("status"),
+                "role": (worker or {}).get("role"),
+                "lastHeartbeatAt": (worker or {}).get("last_heartbeat_at"),
+                "stalenessSeconds": _staleness_seconds(str((worker or {}).get("last_heartbeat_at") or "")) if worker else None,
+            }
+            response["resourceLockState"] = {
+                "locks": [
+                    {
+                        "lockKey": row.get("lock_key"),
+                        "lockMode": row.get("lock_mode"),
+                        "workerId": row.get("worker_id"),
+                        "expiresAt": row.get("expires_at"),
+                    }
+                    for row in self.storage.list_resource_locks(operation_id=operation_id, limit=20)
+                ]
+            }
+        else:
+            response["queueState"] = {
+                "queueStatus": "legacy_inline",
+                "queuedReason": None,
+                "priority": "normal",
+                "estimatedCostClass": "normal",
+                "agentId": None,
+                "resourceKeys": [],
+                "workerId": None,
+                "scheduledAt": None,
+                "updatedAt": latest.get("updated_at"),
+            }
+            response["slotState"] = {"claimed": False}
+            response["workerState"] = {"workerId": None, "status": None, "role": None}
+            response["resourceLockState"] = {"locks": []}
         if self._operation_config_mismatch(latest):
             response["configRecoveryState"] = {
                 "state": "mismatch",
@@ -1917,6 +2046,10 @@ class OperationServiceMixin:
         response["source"] = "live" if turn_status and turn_status.get("source") == "live" else "storage"
         response["stalenessSeconds"] = _staleness_seconds(str(latest.get("updated_at") or ""))
         response["nextRecommendedAction"] = _operation_next_action(response)
+        if response.get("queueState", {}).get("queuedReason") in {"resource_lock_conflict", "global_slot_limit", "project_slot_limit", "agent_slot_limit", "thread_slot_limit", "write_project_slot_limit"}:
+            response["nextRecommendedAction"] = "wait_for_worker_slot"
+        elif response.get("queueState", {}).get("queuedReason") in {"worker_health_degraded", "app_server_backpressure"}:
+            response["nextRecommendedAction"] = "inspect_worker_health"
         if response.get("configRecoveryState", {}).get("state") == "mismatch":
             response["nextRecommendedAction"] = "inspect_diagnostics"
         response["recommendedPollAfterSeconds"] = _operation_poll_after(response)
@@ -2348,4 +2481,56 @@ class OperationServiceMixin:
             "appServerGeneration": None,
             "stalenessSeconds": _min_staleness([turn.completed_at, summary.updated_at]),
         }
+
+
+def _priority_value(value: Any) -> str:
+    selected = str(value or "normal").strip().lower()
+    if selected not in {"low", "normal", "high"}:
+        raise invalid_argument("Unsupported operation priority.", priority=selected)
+    return selected
+
+
+def _estimated_cost_class_value(value: Any) -> str:
+    selected = str(value or "normal").strip().lower()
+    if selected not in {"light", "normal", "heavy"}:
+        raise invalid_argument("Unsupported estimated_cost_class.", estimated_cost_class=selected)
+    return selected
+
+
+def _resource_keys_value(value: Any) -> list[str]:
+    if value in (None, ""):
+        return []
+    if not isinstance(value, list):
+        raise invalid_argument("resource_keys must be an array of strings.")
+    keys: list[str] = []
+    seen: set[str] = set()
+    for index, raw in enumerate(value):
+        key = str(raw or "").strip()
+        if not key:
+            raise invalid_argument("resource_keys entries must be non-empty strings.", index=index)
+        if len(key) > 300:
+            raise invalid_argument("resource_keys entry is too long.", index=index, maxLength=300)
+        normalized = re.sub(r"\s+", " ", key)
+        if normalized not in seen:
+            seen.add(normalized)
+            keys.append(normalized)
+    if len(keys) > 50:
+        raise invalid_argument("Too many resource_keys.", maxItems=50, actualItems=len(keys))
+    return keys
+
+
+def _safe_json_dict(value: Any) -> dict[str, Any]:
+    try:
+        parsed = json.loads(str(value or "{}"))
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _safe_json_list(value: Any) -> list[Any]:
+    try:
+        parsed = json.loads(str(value or "[]"))
+    except json.JSONDecodeError:
+        return []
+    return parsed if isinstance(parsed, list) else []
 

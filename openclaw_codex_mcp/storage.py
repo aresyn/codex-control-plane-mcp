@@ -778,6 +778,7 @@ def _install_storage_mixins() -> None:
     from .search_store import SearchStoreMixin
     from .storage_schema import StorageSchemaMixin
     from .turn_store import TurnStoreMixin
+    from .worker_store import WorkerStoreMixin
     from .workflow_store import WorkflowStoreMixin
 
     for mixin in (
@@ -786,6 +787,7 @@ def _install_storage_mixins() -> None:
         TurnStoreMixin,
         WorkflowStoreMixin,
         OperationStoreMixin,
+        WorkerStoreMixin,
         DiagnosticStoreMixin,
         SearchStoreMixin,
     ):

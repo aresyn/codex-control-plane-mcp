@@ -62,6 +62,44 @@ If `codex_health_summary` is missing or returns a JSON-RPC protocol error,
 OpenClaw should treat the MCP server as incompatible and must not call write
 tools.
 
+## Worker architecture for OpenClaw
+
+For normal OpenClaw operation, MCP clients should run in `client` mode and a
+single background worker should run in `worker` mode.
+
+Client mode:
+
+```powershell
+CODEX_MCP_EXECUTION_MODE=client
+codex-control-plane-mcp
+```
+
+Worker mode:
+
+```powershell
+CODEX_MCP_EXECUTION_MODE=worker
+codex-control-plane-mcp-worker
+```
+
+In this architecture OpenClaw agents only submit tasks, answer interactions, and
+read status. The worker owns `codex-app-server`, queue slots, leases, and
+resource locks.
+
+OpenClaw should pass these fields on long-running writes:
+
+- `agent_id`: stable agent id, for example `codex-dev` or `book-codex-agent`;
+- `resource_keys`: affected write scopes when the task may edit files;
+- `priority`: usually `normal`;
+- `estimated_cost_class`: `light`, `normal`, or `heavy`.
+
+When `codex_get_operation_status` returns `queueState.queuedReason`, do not mint
+a new operation. Follow `nextRecommendedAction`:
+
+- `wait_for_worker_slot`: keep polling the same operation;
+- `inspect_worker_health`: call `codex_get_worker_status` and
+  `codex_get_concurrency_status`;
+- `inspect_diagnostics`: collect diagnostics for the same operation or workflow.
+
 ## Core rules
 
 1. Use `codex_submit_task` for new long-running tasks.

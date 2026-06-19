@@ -176,6 +176,60 @@ py -m codex_control_plane_mcp.server
 Старые команды `openclaw-codex-mcp` и `openclaw-codex-mcp-hooks` остаются
 compatibility aliases на одну release line.
 
+## Центральный worker mode
+
+`inline` остается режимом по умолчанию: один MCP-процесс может и принимать, и
+исполнять операции. Для OpenClaw, Hermes и любых сценариев с несколькими
+MCP-клиентами лучше включить центральный worker.
+
+Рекомендуемая локальная схема:
+
+- все MCP clients используют общий `CODEX_HOME` и общий `CODEX_MCP_STATE_DB`;
+- entries OpenClaw gateway запускаются с `CODEX_MCP_EXECUTION_MODE=client`;
+- один долгоживущий `codex-control-plane-mcp-worker` владеет
+  `codex-app-server`, leases, slots и resource locks;
+- clients вызывают `codex_submit_task` и читают status. Они не исполняют queued
+  operations сами.
+
+Запуск worker:
+
+```powershell
+$env:CODEX_MCP_EXECUTION_MODE = "worker"
+codex-control-plane-mcp-worker
+```
+
+Безопасный режим наблюдения перед переключением gateway:
+
+```powershell
+codex-control-plane-mcp-worker --observe
+```
+
+Дефолтные лимиты:
+
+```powershell
+CODEX_MCP_MAX_ACTIVE_TURNS_GLOBAL=4
+CODEX_MCP_MAX_ACTIVE_TURNS_PER_PROJECT=3
+CODEX_MCP_MAX_ACTIVE_TURNS_PER_AGENT=3
+CODEX_MCP_MAX_ACTIVE_TURNS_PER_THREAD=1
+CODEX_MCP_MAX_ACTIVE_WRITE_TURNS_PER_PROJECT=1
+CODEX_MCP_MAX_APP_SERVER_PENDING_REQUESTS=8
+```
+
+Для write-turns в одном проекте передавайте `resource_keys` в
+`codex_submit_task`. Без них `workspace-write` и `danger-full-access` берут
+широкий project write lock. Если ключи не пересекаются, worker может запустить
+несколько write-turns параллельно.
+
+Новые status tools:
+
+- `codex_get_worker_status`
+- `codex_get_queue_status`
+- `codex_get_concurrency_status`
+- `codex_get_worker_command_status`
+
+`codex_get_operation_status` также возвращает `queueState`, `workerState`,
+`slotState` и `resourceLockState`.
+
 ## Первый setup
 
 Admin helper может напечатать более полный MCP client config, поставить hooks и

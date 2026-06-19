@@ -57,6 +57,13 @@ class ServerConfig:
     max_image_input_bytes: int = 20_000_000
     turn_stall_timeout_seconds: int = 900
     stalled_turn_action: str = "diagnose_only"
+    execution_mode: str = "inline"
+    max_active_turns_global: int = 4
+    max_active_turns_per_project: int = 3
+    max_active_turns_per_agent: int = 3
+    max_active_turns_per_thread: int = 1
+    max_active_write_turns_per_project: int = 1
+    max_app_server_pending_requests: int = 8
 
     @classmethod
     def load(cls, base_dir: Path | None = None) -> "ServerConfig":
@@ -213,6 +220,41 @@ class ServerConfig:
                 os.environ.get("CODEX_MCP_STALLED_TURN_ACTION")
                 or payload.get("stalled_turn_action"),
                 "diagnose_only",
+            ),
+            execution_mode=_execution_mode_value(
+                os.environ.get("CODEX_MCP_EXECUTION_MODE")
+                or payload.get("execution_mode"),
+                "inline",
+            ),
+            max_active_turns_global=_int_value(
+                os.environ.get("CODEX_MCP_MAX_ACTIVE_TURNS_GLOBAL")
+                or payload.get("max_active_turns_global"),
+                4,
+            ),
+            max_active_turns_per_project=_int_value(
+                os.environ.get("CODEX_MCP_MAX_ACTIVE_TURNS_PER_PROJECT")
+                or payload.get("max_active_turns_per_project"),
+                3,
+            ),
+            max_active_turns_per_agent=_int_value(
+                os.environ.get("CODEX_MCP_MAX_ACTIVE_TURNS_PER_AGENT")
+                or payload.get("max_active_turns_per_agent"),
+                3,
+            ),
+            max_active_turns_per_thread=_int_value(
+                os.environ.get("CODEX_MCP_MAX_ACTIVE_TURNS_PER_THREAD")
+                or payload.get("max_active_turns_per_thread"),
+                1,
+            ),
+            max_active_write_turns_per_project=_int_value(
+                os.environ.get("CODEX_MCP_MAX_ACTIVE_WRITE_TURNS_PER_PROJECT")
+                or payload.get("max_active_write_turns_per_project"),
+                1,
+            ),
+            max_app_server_pending_requests=_int_value(
+                os.environ.get("CODEX_MCP_MAX_APP_SERVER_PENDING_REQUESTS")
+                or payload.get("max_app_server_pending_requests"),
+                8,
             ),
         )
 
@@ -490,3 +532,10 @@ def _stalled_turn_action_value(value: object, default: str) -> str:
     if selected in {"diagnose_only", "interrupt"}:
         return selected
     raise ValueError(f"Unsupported stalled turn action: {selected}")
+
+
+def _execution_mode_value(value: object, default: str) -> str:
+    selected = str(value or default).strip().lower()
+    if selected in {"inline", "client", "worker", "observe"}:
+        return selected
+    raise ValueError(f"Unsupported execution mode: {selected}")

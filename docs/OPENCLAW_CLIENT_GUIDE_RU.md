@@ -61,6 +61,45 @@ transcript-файлы. Все write/control действия идут через
 Если `codex_health_summary` недоступен или возвращает protocol error, OpenClaw
 должен считать MCP несовместимым и не запускать write tools.
 
+## Worker-архитектура для OpenClaw
+
+Для обычной работы OpenClaw MCP-клиенты должны быть в `client` mode, а отдельный
+фоновой worker - в `worker` mode.
+
+Client mode:
+
+```powershell
+CODEX_MCP_EXECUTION_MODE=client
+codex-control-plane-mcp
+```
+
+Worker mode:
+
+```powershell
+CODEX_MCP_EXECUTION_MODE=worker
+codex-control-plane-mcp-worker
+```
+
+В такой схеме OpenClaw-агенты только ставят задачи, отвечают на interactions и
+читают status. Worker единолично владеет `codex-app-server`, queue slots, leases
+и resource locks.
+
+В долгих write-запросах OpenClaw должен передавать:
+
+- `agent_id`: стабильный id агента, например `codex-dev` или
+  `book-codex-agent`;
+- `resource_keys`: write scopes, если задача может менять файлы;
+- `priority`: обычно `normal`;
+- `estimated_cost_class`: `light`, `normal` или `heavy`.
+
+Если `codex_get_operation_status` вернул `queueState.queuedReason`, не создавай
+новую operation. Следуй `nextRecommendedAction`:
+
+- `wait_for_worker_slot`: продолжай poll той же operation;
+- `inspect_worker_health`: вызови `codex_get_worker_status` и
+  `codex_get_concurrency_status`;
+- `inspect_diagnostics`: собери diagnostics по той же operation или workflow.
+
 ## Главные правила для OpenClaw
 
 1. Для новых долгих задач используй `codex_submit_task`.

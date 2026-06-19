@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on Keep a Changelog and this project uses semantic
 versioning after the public `0.1.0` release.
 
+## [Unreleased]
+
+### Added
+
+- Add central MCP worker mode with `codex-control-plane-mcp-worker`.
+- Add `CODEX_MCP_EXECUTION_MODE=inline|client|worker|observe`.
+- Add worker, queue, concurrency, and worker command status tools.
+- Add scheduler metadata for `agent_id`, `resource_keys`, priority, and
+  estimated cost class.
+
+### Changed
+
+- `client` mode submit/status calls are passive and do not execute queued
+  operations.
+- Worker scheduling enforces global, per-project, per-agent, per-thread, and
+  write resource limits before starting a turn.
+
 ## [0.1.4] - 2026-06-19
 
 ### Added

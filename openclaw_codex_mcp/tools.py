@@ -105,6 +105,14 @@ LOG = get_logger("tools")
 PROMPT_OPERATION_ACTIVE_STATUSES = OPERATION_ACTIVE_STATUSES
 CONTRACT_VERSION = "1"
 SERVER_NAME = "codex-control-plane-mcp"
+WORKER_COMMAND_TOOLS = {
+    "codex_answer_pending_interaction",
+    "codex_interrupt_turn",
+    "codex_archive_thread",
+    "codex_unarchive_thread",
+    "codex_start_thread_compaction",
+    "codex_restart_app_server",
+}
 
 STABLE_OPENCLAW_TOOLS = {
     "codex_submit_task",
@@ -122,6 +130,10 @@ STABLE_OPENCLAW_TOOLS = {
     "codex_unarchive_thread",
     "codex_start_thread_compaction",
     "codex_get_thread_compaction_status",
+    "codex_get_worker_status",
+    "codex_get_queue_status",
+    "codex_get_concurrency_status",
+    "codex_get_worker_command_status",
     "codex_get_runtime_capabilities",
     "codex_health_summary",
     "codex_collect_diagnostics",
@@ -566,6 +578,20 @@ TOOLS: list[dict[str, Any]] = [
                     "default": None,
                     "description": "Stable retry idempotency key. If omitted, MCP creates a new operation and relies on prompt deduplication to prevent active duplicate turns.",
                 },
+                "agent_id": {
+                    "type": ["string", "null"],
+                    "default": None,
+                    "description": "Optional orchestrator/agent id used by the central worker scheduler for per-agent limits.",
+                },
+                "resource_keys": {
+                    "type": ["array", "null"],
+                    "default": None,
+                    "description": "Optional write-scope keys. Disjoint keys allow parallel workspace-write/danger-full-access turns in the same project.",
+                    "items": {"type": "string", "minLength": 1, "maxLength": 300},
+                    "maxItems": 50,
+                },
+                "priority": {"type": "string", "enum": ["low", "normal", "high"], "default": "normal"},
+                "estimated_cost_class": {"type": "string", "enum": ["light", "normal", "heavy"], "default": "normal"},
                 "project_id": {"type": ["string", "null"], "default": None},
                 "chat_id": {"type": ["string", "null"], "default": None},
                 "thread_id": {
@@ -773,6 +799,58 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "codex_get_worker_status",
+        "description": "Read central MCP worker heartbeats and execution mode state without starting codex-app-server.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "include_recent_commands": {"type": "boolean", "default": True},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "codex_get_queue_status",
+        "description": "Read durable operation queue state, queued reasons, and assigned worker ids.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "status": {
+                    "type": ["string", "null"],
+                    "enum": ["queued", "scheduled", "running", "completed", "failed", "blocked", None],
+                    "default": None,
+                },
+                "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "codex_get_concurrency_status",
+        "description": "Read active turn counts and resource locks used by the central MCP worker scheduler.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "include_locks": {"type": "boolean", "default": True},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 200},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "codex_get_worker_command_status",
+        "description": "Poll a control command delegated to the central MCP worker from client mode.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["command_id"],
+            "properties": {
+                "command_id": {"type": "string", "minLength": 1},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "codex_restart_app_server",
         "description": "Restart only the MCP-owned Codex app-server subprocess. This does not restart Codex Desktop and refuses to run while the MCP app-server has active turns, captures, or pending requests.",
         "inputSchema": {
@@ -966,7 +1044,14 @@ class ToolService:
         self._config_fingerprint = _config_fingerprint(self.config)
         self._config_summary_json = json.dumps(_config_fingerprint_summary(self.config), ensure_ascii=False, sort_keys=True)
         self._allow_cross_config_recovery = os.environ.get("CODEX_MCP_ALLOW_CROSS_CONFIG_RECOVERY") == "1"
-        self._startup_recovery = self.storage.recover_startup_operations(now=_now_iso())
+        if self.config.execution_mode in {"inline", "worker"}:
+            self._startup_recovery = self.storage.recover_startup_operations(now=_now_iso())
+        else:
+            self._startup_recovery = {
+                "skipped": True,
+                "executionMode": self.config.execution_mode,
+                "reason": "This MCP process is not allowed to execute durable operations.",
+            }
         if self._startup_recovery.get("resetOperationIds") or self._startup_recovery.get("runningOperationIds"):
             LOG.info("operation startup recovery owner=%s result=%s", self._worker_owner, self._startup_recovery)
         self.catalog = ProjectChatCatalog(self.config, self.storage)
@@ -975,6 +1060,67 @@ class ToolService:
         self._runtime_capabilities_cache: dict[str, Any] | None = None
         self._runtime_capabilities_cache_key: str | None = None
         self._runtime_capabilities_cache_at: float | None = None
+
+    def _can_schedule_inline(self) -> bool:
+        return self.config.execution_mode == "inline"
+
+    def _can_execute_operations(self) -> bool:
+        return self.config.execution_mode in {"inline", "worker"}
+
+    def _delegates_control_to_worker(self) -> bool:
+        return self.config.execution_mode == "client"
+
+    def _enqueue_worker_command(self, tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+        command_id = "cmd_" + uuid.uuid4().hex
+        now = _now_iso()
+        request = {"toolName": tool_name, "arguments": args}
+        self.storage.create_worker_command(
+            command_id=command_id,
+            command_type=tool_name,
+            status="queued",
+            request=request,
+            created_at=now,
+            updated_at=now,
+        )
+        return {
+            "ok": True,
+            "commandId": command_id,
+            "commandType": tool_name,
+            "status": "queued",
+            "executionMode": self.config.execution_mode,
+            "nextRecommendedAction": "poll_worker_command",
+            "recommendedPollAfterSeconds": 2,
+            "pollRecommended": True,
+            "agentGuidance": {
+                "schemaVersion": "agent-guidance/v1",
+                "problemState": "wait",
+                "summary": "Control action was delegated to the central MCP worker.",
+                "instructions": [
+                    {
+                        "kind": "poll",
+                        "toolName": "codex_get_worker_command_status",
+                        "arguments": {"command_id": command_id},
+                        "dryRunFirst": False,
+                        "stopIf": "status is completed or failed",
+                        "continueIf": "status is queued or running",
+                    }
+                ],
+                "loopGuard": {
+                    "guardKey": f"worker-command:{command_id}",
+                    "attemptCount": 0,
+                    "maxAttempts": 1,
+                    "allowed": True,
+                    "blockedReason": None,
+                    "escalationAction": None,
+                },
+                "evidenceRefs": [{"type": "workerCommand", "id": command_id}],
+            },
+            "agentGuidanceText": (
+                "Команда передана центральному MCP worker. "
+                "Не выполняй это действие повторно напрямую. "
+                "Опроси codex_get_worker_command_status по commandId и продолжай только после completed."
+            ),
+        }
 
     async def close(self) -> None:
         for task in list(self._operation_tasks.values()):
@@ -1066,8 +1212,13 @@ class ToolService:
         args = arguments or {}
         started = time.monotonic()
         LOG.info("call start name=%s argument_keys=%s", name, sorted(args.keys()))
-        self._schedule_recoverable_operations()
+        if self._can_schedule_inline():
+            self._schedule_recoverable_operations()
         try:
+            if self._delegates_control_to_worker() and name in WORKER_COMMAND_TOOLS:
+                result = self._enqueue_worker_command(name, args)
+                LOG.info("call delegated name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
+                return result
             if name == "codex_list_projects":
                 result = self.codex_list_projects()
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
@@ -1166,6 +1317,22 @@ class ToolService:
                 return result
             if name == "codex_get_thread_compaction_status":
                 result = self.codex_get_thread_compaction_status(args)
+                LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
+                return result
+            if name == "codex_get_worker_status":
+                result = self.codex_get_worker_status(args)
+                LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
+                return result
+            if name == "codex_get_queue_status":
+                result = self.codex_get_queue_status(args)
+                LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
+                return result
+            if name == "codex_get_concurrency_status":
+                result = self.codex_get_concurrency_status(args)
+                LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
+                return result
+            if name == "codex_get_worker_command_status":
+                result = self.codex_get_worker_command_status(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
                 return result
             if name == "codex_restart_app_server":
@@ -2972,6 +3139,7 @@ def _install_tool_service_mixins() -> None:
     from .review_service import ReviewServiceMixin
     from .runtime_service import RuntimeServiceMixin
     from .thread_lifecycle_service import ThreadLifecycleServiceMixin
+    from .worker_service import WorkerServiceMixin
     from .workflow_service import WorkflowServiceMixin
 
     for mixin in (
@@ -2981,6 +3149,7 @@ def _install_tool_service_mixins() -> None:
         ReviewServiceMixin,
         RuntimeServiceMixin,
         ThreadLifecycleServiceMixin,
+        WorkerServiceMixin,
         WorkflowServiceMixin,
     ):
         for name, value in mixin.__dict__.items():

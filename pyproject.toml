@@ -54,8 +54,10 @@ Source = "https://github.com/aresyn/codex-control-plane-mcp"
 codex-control-plane-mcp = "codex_control_plane_mcp.server:main"
 codex-control-plane-mcp-hooks = "codex_control_plane_mcp.hook_installer:main"
 codex-control-plane-mcp-admin = "codex_control_plane_mcp.admin:main"
+codex-control-plane-mcp-worker = "codex_control_plane_mcp.worker:main"
 openclaw-codex-mcp = "openclaw_codex_mcp.server:main"
 openclaw-codex-mcp-hooks = "openclaw_codex_mcp.hook_installer:main"
+openclaw-codex-mcp-worker = "openclaw_codex_mcp.worker:main"
 
 [build-system]
 requires = ["setuptools>=77", "wheel"]

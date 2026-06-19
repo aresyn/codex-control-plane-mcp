@@ -184,6 +184,102 @@ class StorageSchemaMixin:
             ON agent_guidance_attempts(scope_type, scope_id, action)
             """
         )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS codex_workers(
+              worker_id TEXT PRIMARY KEY,
+              role TEXT NOT NULL,
+              status TEXT NOT NULL,
+              pid INTEGER,
+              hostname TEXT,
+              config_fingerprint TEXT,
+              started_at TEXT NOT NULL,
+              last_heartbeat_at TEXT NOT NULL,
+              active_operation_count INTEGER NOT NULL DEFAULT 0,
+              active_turn_count INTEGER NOT NULL DEFAULT 0,
+              app_server_generation INTEGER,
+              last_error TEXT
+            )
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_codex_workers_status
+            ON codex_workers(status, last_heartbeat_at)
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS codex_operation_scheduling(
+              operation_id TEXT PRIMARY KEY,
+              agent_id TEXT,
+              queue_status TEXT NOT NULL DEFAULT 'queued',
+              queued_reason TEXT,
+              priority TEXT NOT NULL DEFAULT 'normal',
+              estimated_cost_class TEXT NOT NULL DEFAULT 'normal',
+              resource_keys_json TEXT NOT NULL DEFAULT '[]',
+              slot_claim_json TEXT,
+              worker_id TEXT,
+              scheduled_at TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_codex_operation_scheduling_queue
+            ON codex_operation_scheduling(queue_status, priority, updated_at)
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS codex_resource_locks(
+              lock_key TEXT PRIMARY KEY,
+              operation_id TEXT NOT NULL,
+              thread_id TEXT,
+              project_id TEXT,
+              lock_mode TEXT NOT NULL,
+              worker_id TEXT NOT NULL,
+              expires_at TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            )
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_codex_resource_locks_operation
+            ON codex_resource_locks(operation_id)
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_codex_resource_locks_expires
+            ON codex_resource_locks(expires_at)
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS codex_worker_commands(
+              command_id TEXT PRIMARY KEY,
+              command_type TEXT NOT NULL,
+              status TEXT NOT NULL,
+              request_json TEXT NOT NULL,
+              result_json TEXT,
+              worker_id TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              completed_at TEXT,
+              last_error TEXT
+            )
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_codex_worker_commands_status
+            ON codex_worker_commands(status, updated_at)
+            """
+        )
 
     def _add_column_if_missing(self, table: str, column: str, declaration: str) -> None:
         columns = {
