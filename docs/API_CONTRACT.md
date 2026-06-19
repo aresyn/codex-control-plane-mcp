@@ -142,10 +142,25 @@ Operation status adds:
 - `workerState`
 - `slotState`
 - `resourceLockState`
+- `operationRowAgeSeconds`
+- `turnFreshness`
+- `workerFreshness`
+- `stalenessMeaning`
+
+Running turn operations have `slotState.claimed=true` and a `slotClaim` with
+the worker id, slot type, count, and claim time. `codex_get_queue_status`
+separates `queued`, `runningOperations`, `auxiliaryOperations`,
+`activeTurnSlots`, and `blockedByLocks`; lifecycle commands and `steer_turn`
+are not counted as active turn slots.
 
 Queued operations use `nextRecommendedAction="wait_for_worker_slot"` when a
-limit or lock blocks scheduling. Worker health problems use
+slot limit blocks scheduling. Write lock conflicts use
+`nextRecommendedAction="wait_for_resource_lock"`. Worker health problems use
 `nextRecommendedAction="inspect_worker_health"`.
+
+`stalenessSeconds` remains as a compatibility alias for operation row age. New
+clients should read `stalenessMeaning`; a stale operation row is not enough to
+declare a stalled turn without `turnFreshness` and `workerFreshness` evidence.
 
 ## Durable operation types
 
@@ -308,6 +323,11 @@ and later status include:
 - `quality`: same value for compact clients.
 - `valid`: `true` only when MCP has a trusted usable plan artifact.
 
+For Plan Mode, clients must read the plan from `latestPlan`. MCP does not treat
+intermediate assistant text as `planOperation.finalReport`. When a compact plan
+summary is useful, `planOperation.planArtifactSummary` contains the plan item
+id, turn id, hash, quality, and truncated text.
+
 `codex_approve_plan` rejects blocker, question, partial, and unknown plan
 artifacts. A fallback assistant message is not treated as a valid plan unless it
 contains an explicit plan artifact such as `<proposed_plan>...</proposed_plan>`.
@@ -316,6 +336,7 @@ contains an explicit plan artifact such as `<proposed_plan>...</proposed_plan>`.
 
 - `officialPlanTurnId`: turn currently attached to the workflow.
 - `officialPlanQuality`: quality classification for that official plan.
+- `expectedExecutionTurnId`: execution turn expected by the workflow, when known.
 - `latestThreadTurnId`: latest turn known in the workflow thread.
 - `threadAdvancedAfterOfficialTurn`: later turns exist in the same thread.
 - `recoverableCandidateFound`: a later valid plan/report candidate was found.
@@ -324,6 +345,15 @@ contains an explicit plan artifact such as `<proposed_plan>...</proposed_plan>`.
 - `candidateReports`: future report candidates from the same observation pass.
 - `importStatus`: transcript import status, when MCP refreshed tracking from a
   local transcript.
+
+`threadAdvancedAfterOfficialTurn` is not set when the latest known turn is the
+expected execution turn. It is only a drift warning for manual or untracked work
+that happened after the official plan turn.
+
+Workflow status also returns `workflowOperationQueueState` for the current
+nested operation. If that operation is queued by a slot limit, top-level
+`nextRecommendedAction` is `wait_for_worker_slot`. If it is queued by a resource
+lock, the action is `wait_for_resource_lock`.
 
 When `nextRecommendedAction == "adopt_candidate_plan"`, the client should show
 the candidate to a human or policy engine, then call:
@@ -611,6 +641,10 @@ Status payloads may include:
 - `modelReroutes`
 - `warnings`
 
+`tokenUsage` in public status is coarse and redacted. It uses band fields such
+as `totalTokensBand`, `inputTokensBand`, and `outputTokensBand` instead of exact
+counts. Exact token counters are not part of the public status contract.
+
 Supported progress sources:
 
 - `item/agentMessage/delta`
@@ -654,18 +688,29 @@ Inventory calls are best effort. A timeout or error in one app-server method
 does not fail the whole tool. The response stays `ok=true` and reports the
 method state in `methodResults`.
 
+In `client` mode, the client process does not start a local app-server for live
+inventory. The default response is passive and may include
+`runtimeCapabilities.workerRuntimeSnapshot` plus `cacheSource="worker_registry"`
+when a worker heartbeat is available. With `refresh=true`, MCP enqueues a
+worker command and returns `refreshCommandId`; clients poll
+`codex_get_worker_command_status` to read the command result.
+
 Top-level result fields:
 
 - `runtimeCapabilities`
 - `cacheState`
 - `methodResults`
 - `warnings`
+- `refreshCommandId`, only when a client-mode refresh command was queued.
 - `recommendedPollAfterSeconds=0`
 - `pollRecommended=false`
 
 `runtimeCapabilities` includes:
 
 - `status`: `ok`, `partial`, or `unavailable`.
+- `cacheSource`: source of the returned snapshot, such as `worker_registry`,
+  `worker_command`, or local process cache.
+- `workerRuntimeSnapshot`: compact worker registry data in client mode.
 - `appServer`: process state plus redacted initialize metadata.
 - `schemaMethods`: compact static method manifest with source, version, hash,
   method count, and method names.
@@ -785,6 +830,38 @@ Known guidance rules:
 - invalid argument, missing project, missing thread, or missing turn: fix the
   payload or configuration before retrying.
 
+## Diagnostics and analysis
+
+`codex_collect_diagnostics` and `codex_analyze_issue` are scoped-first. If the
+request includes `operation_id`, `workflow_id`, `thread_id`, or `turn_id`, exact
+matches are ranked before same-thread, same-project, recent global, and
+historical findings.
+
+Diagnostics responses may include:
+
+- `scopedFindings`: findings that match the requested scope and should drive the
+  next action.
+- `backgroundFindings`: nearby or historical findings that are useful context
+  but should not override scoped evidence.
+- `evidenceTruncated`: true when the result hit evidence size or time caps.
+
+Routine analysis does not fetch raw diagnostic payloads. Even with
+`include_evidence=true`, `codex_analyze_issue` returns compact evidence refs:
+event id, method or category, timestamp, related operation/workflow/thread/turn
+ids, and a redacted summary. It does not return raw command output, directory
+listings, account data, tokens, full local paths, or full prompts.
+
+Default caps keep analysis suitable for agent loops:
+
+- `event_limit=50`;
+- `timeline_limit=50`;
+- max evidence text per item is 500 characters;
+- soft analysis time budget is 10 seconds.
+
+When `evidenceTruncated=true`, the preferred next action is targeted
+diagnostics for the same operation, workflow, thread, or turn. Do not switch to
+broad raw logs unless a human explicitly asks for them.
+
 ## Compatibility tools
 
 These tools remain available for UI support, direct reads, diagnostics, and old
@@ -808,6 +885,29 @@ workflows:
 
 Low-level write compatibility tools return after `turn/start`. Prefer
 `codex_submit_task` and polling for retry safety.
+
+`codex_list_projects` is compact by default. Inputs:
+
+- `compact`: default `true`.
+- `limit`: default `200`, max `1000`.
+- `refresh`: default `false`.
+- `include_private_details`: default `false`; when `true`, the response includes
+  local paths and normalized path keys.
+- `roots`: optional root filters.
+
+The response includes `cacheState`, `totalCount`, `returnedCount`, `truncated`,
+and `compact`. Compact mode is intended for startup and polling loops.
+
+`codex_search_chats` enforces the requested `index_time_budget_seconds` as an
+end-to-end refresh budget. When refresh work cannot finish inside that budget,
+the response is partial and includes `timeBudgetExhausted=true` with
+`nextRecommendedAction="retry_without_refresh_or_increase_budget"`.
+
+`codex_get_chat_status` and `codex_get_chat` prefer fresh tracked turn and hook
+history data before legacy `_kb_history`. Fresh threads can therefore return
+`source="tracked_turn"`, `source="hook_history"`, or
+`source="tracked_turn+hook_history"` instead of `CODEX_THREAD_NOT_FOUND` while
+the catalog catches up.
 
 ## Version block
 
@@ -847,6 +947,12 @@ signature.
 
 Top-level compatibility aliases are also returned: `hookHistoryStatus`,
 `lastHookEventAt`, `hookInstalled`, and `hookDbWritable`.
+
+Health summary focuses on current readiness. Historical stale operations,
+premature terminal rows, and old orphaned workflows are returned in
+`historicalDebt`. They do not change current readiness unless the request is
+scoped to that operation, workflow, thread, or turn. Use targeted cleanup or
+diagnostics for `historicalDebt.nextRecommendedAction="run_targeted_cleanup"`.
 
 Read/status tools may return these source values in addition to older values:
 

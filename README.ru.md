@@ -17,7 +17,8 @@
 `codex-control-plane-mcp` превращает Codex Desktop и `codex-app-server` в
 durable worker, которым MCP-клиент может управлять без хрупкой синхронной
 связки. Клиент отправляет задачу, сразу получает `operationId` или `workflowId`,
-poll-ит статус, утверждает Plan Mode при необходимости и читает финальный отчет.
+читает статус, утверждает Plan Mode при необходимости и забирает финальный
+отчет.
 
 Сервер берет на себя то, что обычно ломает тонкие wrapper-проекты: запуск
 app-server, создание threads и turns, retry safety, защиту от дублей, Plan Mode,
@@ -228,7 +229,16 @@ CODEX_MCP_MAX_APP_SERVER_PENDING_REQUESTS=8
 - `codex_get_worker_command_status`
 
 `codex_get_operation_status` также возвращает `queueState`, `workerState`,
-`slotState` и `resourceLockState`.
+`slotState` и `resourceLockState`. У запущенного turn будет
+`slotState.claimed=true` и `slotClaim` с worker id, типом слота и временем
+захвата. `codex_get_queue_status` отдельно показывает queued work, running turn
+operations, auxiliary operations, active turn slots и lock conflicts.
+
+Если workflow ждет capacity, `codex_get_workflow_status` показывает состояние
+вложенной operation в `workflowOperationQueueState`. При slot pressure будет
+`nextRecommendedAction="wait_for_worker_slot"`, при конфликте write lock будет
+`nextRecommendedAction="wait_for_resource_lock"`. Пока MCP возвращает одно из
+этих действий, не создавайте новую operation для той же работы.
 
 ## Первый setup
 
@@ -459,11 +469,29 @@ guidance явно не говорит стартовать replacement workflow.
 sandbox и approval policy, связывает его со старым через `workflowRetryState` и
 не пытается оживить старый terminal turn.
 
+`codex_health_summary` по умолчанию отвечает на вопрос, можно ли сейчас ставить
+новые задачи. Старые stale или orphaned записи уходят в `historicalDebt` и не
+ломают свежую orchestration, если worker, queue и app-server сейчас здоровы. Для
+такого долга используйте targeted cleanup, а не блокируйте новую работу.
+
+В status payload есть отдельные freshness-сигналы:
+
+- `operationRowAgeSeconds`: возраст durable operation row;
+- `turnFreshness.lastProgressAgeSeconds`: возраст последнего progress event;
+- `workerFreshness.heartbeatAgeSeconds`: возраст heartbeat worker-а;
+- `stalenessMeaning="operation_row_age"` для старого compatibility-поля
+  `stalenessSeconds`.
+
 ## Runtime capabilities
 
 Вызывайте `codex_get_runtime_capabilities` перед orchestration или после
 reconnect. Tool при необходимости стартует MCP-owned app-server, делает короткие
 best-effort inventory вызовы и кеширует snapshot на пять минут.
+
+В `client` mode клиентский процесс не стартует свой app-server ради live
+inventory. Он возвращает passive worker-managed snapshot, если он есть. При
+`refresh=true` MCP ставит worker command и возвращает `refreshCommandId`; дальше
+нужно вызывать `codex_get_worker_command_status`.
 
 Ответ содержит:
 
@@ -504,6 +532,11 @@ output и полные unified diffs. Diff-события сворачивают
 Если клиенту нужен старый status только с сообщениями, передайте
 `progress_events=0`. Для ограничения возвращаемого текста используйте
 `progress_max_chars`.
+
+В публичном status token usage возвращается грубыми bands, без точных token
+counts. Raw audit surfaces могут хранить redacted event payloads для отладки, но
+для orchestration нужно использовать `tokenUsage.totalTokensBand` и соседние
+band-поля.
 
 ## Tool surface
 
@@ -546,6 +579,14 @@ Compatibility и read tools:
 
 Новым клиентам лучше использовать durable operations и workflows.
 Низкоуровневые write tools остаются для compatibility.
+
+Read и diagnostic вызовы ограничены так, чтобы их можно было безопасно вызывать
+из agent loop. `codex_list_projects` по умолчанию отдает compact cached output,
+`codex_search_chats` может вернуть `timeBudgetExhausted=true` вместо долгого
+полного refresh, а чтение чатов сначала использует tracked turn и hook history, и
+только потом legacy KB fallback. Diagnostics теперь scoped-first:
+`scopedFindings` определяют следующий шаг, а `backgroundFindings` остаются
+историческим контекстом.
 
 Схемы, формат ошибок, stable tool groups и правила версионирования описаны в
 [docs/API_CONTRACT.md](docs/API_CONTRACT.md).

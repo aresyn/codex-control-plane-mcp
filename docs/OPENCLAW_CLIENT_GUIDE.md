@@ -96,9 +96,16 @@ When `codex_get_operation_status` returns `queueState.queuedReason`, do not mint
 a new operation. Follow `nextRecommendedAction`:
 
 - `wait_for_worker_slot`: keep polling the same operation;
+- `wait_for_resource_lock`: keep polling the same operation, or wait for the
+  conflicting scoped write to finish;
 - `inspect_worker_health`: call `codex_get_worker_status` and
   `codex_get_concurrency_status`;
 - `inspect_diagnostics`: collect diagnostics for the same operation or workflow.
+
+For a running turn, prefer the worker fields over local app-server guesses:
+`slotState.claimed`, `slotClaim`, `workerState`, `resourceLockState`, and
+`queueState`. In client mode the gateway must not start its own app-server just
+to answer status.
 
 ## Core rules
 
@@ -280,6 +287,10 @@ while true:
 Plan workflow actions:
 
 - `wait_plan`: keep polling;
+- `wait_for_worker_slot`: the current plan or execution operation is queued by
+  worker capacity;
+- `wait_for_resource_lock`: the current operation is waiting on a scoped write
+  lock;
 - `review_plan`: show the plan to a human or policy engine;
 - `adopt_candidate_plan`: review `workflowObservation.candidatePlans` and call
   `codex_adopt_workflow_plan` if the candidate is valid;
@@ -316,11 +327,18 @@ When a workflow returns `failed`, `plan_needs_review`, `plan_candidate_found`,
 `workflowObservation` is a drift detector. Important fields:
 
 - `officialPlanTurnId`: the turn currently attached to the workflow.
+- `expectedExecutionTurnId`: the expected execution turn after approval.
 - `officialPlanQuality`: MCP's quality classification for that plan.
-- `threadAdvancedAfterOfficialTurn`: later turns exist in the same thread.
+- `threadAdvancedAfterOfficialTurn`: later untracked turns exist in the same
+  thread. MCP should not set it for the normal expected execution turn.
 - `recoverableCandidateFound`: a later valid plan/report candidate was found.
 - `candidatePlans`: valid plan candidates from the same thread, with
   `turnId`, `planHash`, `quality`, and `markdown`.
+
+Read Plan Mode output from `latestPlan`. Do not treat
+`planOperation.finalReport` as the plan. If MCP returns
+`planOperation.planArtifactSummary`, use it only as a compact pointer to the
+plan artifact.
 
 If `nextRecommendedAction == "adopt_candidate_plan"`, the correct recovery path
 is:
@@ -819,6 +837,23 @@ Returns projects from catalog, registry, hook history, and fallback sources.
 Use it before `start_chat`, to map a local path to `projectId`, and to check path
 casing.
 
+Use compact mode for normal polling and UI lists:
+
+```json
+{
+  "tool": "codex_list_projects",
+  "arguments": {
+    "compact": true,
+    "limit": 50,
+    "refresh": false,
+    "include_private_details": false
+  }
+}
+```
+
+Only set `refresh=true` for an explicit catalog refresh. Check `cacheState` and
+`truncated` before assuming the list is complete.
+
 ### `codex_list_project_chats`
 
 Lists chats for one project. Use it for project history, last thread lookup, and
@@ -834,18 +869,28 @@ that could conflict with active work.
 Searches prompts, replies, hook history, transcripts, and summaries. Use it to
 find a thread by issue id, marker, or old report.
 
+If a refresh is requested with a small time budget, MCP may return partial
+results with `timeBudgetExhausted=true`. In that case, retry without refresh or
+increase the budget deliberately.
+
 ### `codex_get_chat_status`
 
 Returns compact chat/thread status. Use it before `send_message`, lifecycle
 actions, and recovery.
 
 Possible source values include `app_server`, `hook_history`, `transcript`,
-`app_server+hook_history`, `transcript+hook_history`, and `mixed`.
+`tracked_turn`, `tracked_turn+hook_history`, `app_server+hook_history`,
+`transcript+hook_history`, and `mixed`. Fresh threads should normally come from
+`tracked_turn` or hook history before legacy KB fallback.
 
 ### `codex_get_chat`
 
 Reads full chat/thread history. Use it after `finalReport.readFullVia`, for UI,
 or to verify fallback history.
+
+If the catalog has not seen a fresh thread yet, MCP can still build a summary
+from tracked turns and hook history. Treat `CODEX_THREAD_NOT_FOUND` as final
+only after search and diagnostics also fail.
 
 ### `codex_get_turn_status`
 
@@ -884,6 +929,12 @@ Decision rules:
 - account unauthenticated: do not start write work if Codex requires auth;
 - rate limit reached: postpone work and use backoff;
 - `status == "partial"`: inspect `methodResults`.
+
+In `client` execution mode, this tool is passive by default. It may return the
+last worker snapshot with `cacheSource="worker_registry"` and
+`workerRuntimeSnapshot`. With `refresh=true`, MCP should ask the worker to
+refresh inventory and may return `refreshCommandId`; poll worker command status
+or call capabilities again after the worker updates the snapshot.
 
 Account fields are redacted. Do not try to extract email or account identifiers
 from diagnostics.
@@ -937,6 +988,11 @@ returns a normal durable operation id.
 If `pollRecommended == true`, there is active work, pending interaction, or
 stale operation state. Continue health polling or run diagnostics.
 
+Read current readiness before reacting to historical records. Old orphaned or
+stale rows are reported under `historicalDebt`; they do not make the current
+runtime broken by themselves. Use `historicalDebt.nextRecommendedAction`, usually
+`run_targeted_cleanup`, outside the hot path.
+
 Read `stallSupervisor` before deciding to retry a long-running turn:
 
 - `mode == "diagnose_only"`: do not interrupt automatically;
@@ -971,12 +1027,20 @@ You can diagnose by:
 Read:
 
 - `summary`;
+- `scopedFindings`;
+- `backgroundFindings`;
 - `timeline`;
 - `progressJournal`;
 - `hookHistory`;
 - `issues`;
 - `recommendedActions`;
 - `repairActions`.
+
+Scoped findings are the decision input. Background findings are historical or
+nearby context and should not override a fresh matching operation, workflow,
+thread, or turn. `codex_analyze_issue` follows the same rule and should return
+compact evidence refs instead of raw payloads. If `evidenceTruncated=true`, call
+targeted diagnostics rather than broad raw logs.
 
 ### Agent guidance
 
@@ -1127,6 +1191,7 @@ Useful interpretation:
 - no final assistant message but fresh `progressEvents`: the task is still alive;
 - growing `warnings`: show them to the operator;
 - `modelReroutes`: update UI, but do not treat it as failure;
+- `tokenUsage`: use only coarse bands in public status, not exact token counts;
 - stale `latestProgressAt` while the turn is active: collect diagnostics.
 
 MCP does not store hidden chain-of-thought, raw command output, raw tool

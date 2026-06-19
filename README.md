@@ -232,7 +232,16 @@ New status tools:
 - `codex_get_worker_command_status`
 
 `codex_get_operation_status` also returns `queueState`, `workerState`,
-`slotState`, and `resourceLockState`.
+`slotState`, and `resourceLockState`. A running turn has
+`slotState.claimed=true` and a `slotClaim` with the worker id, slot type, and
+claim time. `codex_get_queue_status` separates queued work from running turn
+operations, auxiliary operations, active turn slots, and lock conflicts.
+
+When a workflow is waiting for capacity, `codex_get_workflow_status` mirrors the
+nested operation queue state in `workflowOperationQueueState`. Use
+`nextRecommendedAction="wait_for_worker_slot"` for slot pressure and
+`nextRecommendedAction="wait_for_resource_lock"` for write lock conflicts. Do
+not create another operation for the same work while either action is returned.
 
 ## First setup
 
@@ -462,11 +471,29 @@ For a broken Plan Mode workflow, use
 sandbox and approval policy, links it to the old workflow through
 `workflowRetryState`, and does not revive the old terminal turn.
 
+`codex_health_summary` is about current readiness by default. Old stale or
+orphaned rows are reported in `historicalDebt`, but they do not make fresh
+orchestration look broken when the worker, queue, and app-server are currently
+healthy. Use targeted cleanup for that debt instead of blocking new work.
+
+Status payloads now separate freshness signals:
+
+- `operationRowAgeSeconds`: age of the durable operation row;
+- `turnFreshness.lastProgressAgeSeconds`: age of the last turn progress event;
+- `workerFreshness.heartbeatAgeSeconds`: age of the worker heartbeat;
+- `stalenessMeaning="operation_row_age"` for the compatibility
+  `stalenessSeconds` field.
+
 ## Runtime capabilities
 
 Use `codex_get_runtime_capabilities` before orchestration or after reconnect. It
 starts the MCP-owned app-server if needed, calls short best-effort inventory
 methods, and returns a cached snapshot for five minutes.
+
+In `client` mode, the client process does not start its own app-server for live
+inventory. It returns a passive worker-managed snapshot when one exists. With
+`refresh=true`, it queues a worker command and returns `refreshCommandId`; poll
+`codex_get_worker_command_status` to read the refreshed inventory.
 
 The response includes:
 
@@ -505,6 +532,11 @@ counts, such as changed line count and diff size.
 
 Use `progress_events=0` when a client wants the older, message-only status
 shape. Use `progress_max_chars` to cap returned progress text.
+
+Public status returns token usage as coarse bands, not exact token counts. Raw
+audit surfaces may keep redacted event payloads for debugging, but orchestrators
+should treat `tokenUsage.totalTokensBand` and related band fields as the public
+contract.
 
 ## Tool surface
 
@@ -547,6 +579,13 @@ Compatibility and read tools:
 
 New clients should use durable operations and workflows. Low-level write tools
 stay available for compatibility.
+
+Read and diagnostic calls are bounded for agent loops. `codex_list_projects`
+defaults to compact cached output, `codex_search_chats` can return
+`timeBudgetExhausted=true` instead of blocking on a full refresh, and chat reads
+prefer tracked turn plus hook history before legacy KB fallback. Diagnostics are
+scoped-first: `scopedFindings` drive the next action, while
+`backgroundFindings` are historical context.
 
 See [docs/API_CONTRACT.md](docs/API_CONTRACT.md) for schemas, error shape,
 stable tool groups, and versioning rules.

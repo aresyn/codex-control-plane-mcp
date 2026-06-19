@@ -96,9 +96,16 @@ codex-control-plane-mcp-worker
 новую operation. Следуй `nextRecommendedAction`:
 
 - `wait_for_worker_slot`: продолжай poll той же operation;
+- `wait_for_resource_lock`: продолжай poll той же operation или жди окончания
+  конфликтующей write-задачи;
 - `inspect_worker_health`: вызови `codex_get_worker_status` и
   `codex_get_concurrency_status`;
 - `inspect_diagnostics`: собери diagnostics по той же operation или workflow.
+
+Для running turn ориентируйся на worker-поля, а не на догадки локального
+app-server: `slotState.claimed`, `slotClaim`, `workerState`,
+`resourceLockState` и `queueState`. В client mode gateway не должен запускать
+свой app-server только ради status.
 
 ## Главные правила для OpenClaw
 
@@ -117,7 +124,7 @@ codex-control-plane-mcp-worker
    `pollRecommended`.
 9. Низкоуровневые `codex_start_chat`, `codex_send_message`,
    `codex_execute_plan` используй только для совместимости.
-10. Если статус терминальный, не poll-и его дальше, кроме ручной диагностики.
+10. Если статус терминальный, не продолжай polling, кроме ручной диагностики.
 
 ## Result contract
 
@@ -279,6 +286,9 @@ while true:
 Для Plan Mode основные actions:
 
 - `wait_plan`: продолжай polling;
+- `wait_for_worker_slot`: текущая plan или execution operation ждет свободный
+  worker slot;
+- `wait_for_resource_lock`: текущая operation ждет scoped write lock;
 - `review_plan`: покажи план человеку или аналитику;
 - `adopt_candidate_plan`: проверь `workflowObservation.candidatePlans` и
   вызови `codex_adopt_workflow_plan`, если кандидат подходит;
@@ -315,11 +325,19 @@ while true:
 Важные поля:
 
 - `officialPlanTurnId`: turn, который сейчас привязан к workflow.
+- `expectedExecutionTurnId`: ожидаемый execution turn после approval.
 - `officialPlanQuality`: оценка качества официального плана.
-- `threadAdvancedAfterOfficialTurn`: в этом же thread есть более поздние turns.
+- `threadAdvancedAfterOfficialTurn`: в этом же thread есть более поздние
+  untracked turns. Для нормального ожидаемого execution turn MCP не должен
+  выставлять этот флаг.
 - `recoverableCandidateFound`: найден более поздний пригодный план или отчет.
 - `candidatePlans`: пригодные планы из того же thread, с `turnId`,
   `planHash`, `quality` и `markdown`.
+
+Плановый результат читай из `latestPlan`. Не считай
+`planOperation.finalReport` планом. Если MCP вернул
+`planOperation.planArtifactSummary`, используй его только как компактную ссылку
+на артефакт плана.
 
 Если `nextRecommendedAction == "adopt_candidate_plan"`, правильный путь
 восстановления такой:
@@ -336,7 +354,7 @@ while true:
 }
 ```
 
-После adoption снова poll-и `codex_get_workflow_status`. Вызывай
+После adoption снова вызови `codex_get_workflow_status`. Вызывай
 `codex_approve_plan` только когда `latestPlan.planQuality == "valid_plan"` и
 план соответствует задаче.
 
@@ -476,7 +494,7 @@ Fork с первым сообщением:
 - top-level `threadId` после fork означает forked thread;
 - source thread находится в `forkState.sourceThreadId`;
 - fork-only operation завершается сразу после создания thread;
-- fork-plus-message дальше poll-ится как обычный turn operation.
+- fork-plus-message дальше отслеживается как обычный turn operation.
 
 Prompt dedup для `fork_thread` выключен. Это правильно: два похожих fork могут
 быть намеренными. Retry-safety обеспечивает только `client_request_id`.
@@ -625,7 +643,7 @@ sandbox до `workspace-write` и вернет `runtimePolicyAdjusted=true`,
 `requestedSandbox` и `effectiveSandbox` в workflow status.
 
 Повторный approve с тем же workflow не должен создавать второй execution turn.
-OpenClaw должен читать `executionOperationId` и дальше poll-ить workflow.
+OpenClaw должен читать `executionOperationId` и дальше отслеживать workflow.
 
 Если `nextRecommendedAction == "review_plan"`, покажи план человеку или
 вызывающей системе. Если план пустой или не завершен, не вызывай approve.
@@ -823,6 +841,23 @@ fallbacks.
 - чтобы сопоставить локальный путь с `projectId`;
 - для проверки path casing.
 
+Для обычного polling и UI-списков используй compact mode:
+
+```json
+{
+  "tool": "codex_list_projects",
+  "arguments": {
+    "compact": true,
+    "limit": 50,
+    "refresh": false,
+    "include_private_details": false
+  }
+}
+```
+
+`refresh=true` включай только для явного обновления catalog. Перед выводом
+полного списка проверяй `cacheState` и `truncated`.
+
 ### `codex_list_project_chats`
 
 Вернет chats конкретного проекта.
@@ -853,6 +888,10 @@ fallbacks.
 - проверить, была ли похожая задача;
 - найти итоговый отчет после сбоя app-server.
 
+Если refresh запрошен с маленьким time budget, MCP может вернуть частичный
+результат с `timeBudgetExhausted=true`. Тогда повтори поиск без refresh или
+осознанно увеличь budget.
+
 ### `codex_get_chat_status`
 
 Дает компактный статус thread/chat.
@@ -862,7 +901,9 @@ fallbacks.
 - перед `send_message`;
 - перед archive/unarchive/compact;
 - чтобы понять source: `app_server`, `hook_history`, `transcript`,
-  `app_server+hook_history`, `transcript+hook_history` или `mixed`.
+  `tracked_turn`, `tracked_turn+hook_history`, `app_server+hook_history`,
+  `transcript+hook_history` или `mixed`. Для свежих threads сначала ожидай
+  `tracked_turn` или hook history, а legacy KB должен быть только fallback.
 
 ### `codex_get_chat`
 
@@ -873,6 +914,10 @@ fallbacks.
 - получить полный ответ после `finalReport.readFullVia`;
 - показать историю человеку;
 - проверить, что hooks или transcripts сохранили результат.
+
+Если catalog еще не увидел свежий thread, MCP все равно может собрать summary
+из tracked turns и hook history. Считай `CODEX_THREAD_NOT_FOUND` окончательным
+только после search и diagnostics.
 
 ### `codex_get_turn_status`
 
@@ -918,6 +963,12 @@ fallbacks.
 - rate limit reached: отложи задачу и используй `recommendedPollAfterSeconds`
   или свой backoff;
 - `status == "partial"`: смотри конкретный `methodResults`.
+
+В `client` execution mode этот tool по умолчанию пассивный. Он может вернуть
+последний worker snapshot с `cacheSource="worker_registry"` и
+`workerRuntimeSnapshot`. При `refresh=true` MCP должен попросить worker обновить
+inventory и может вернуть `refreshCommandId`; проверь status worker command или
+повтори capabilities после обновления snapshot.
 
 Account fields уже redacted. Не пытайся извлечь email или account id из
 diagnostics.
@@ -974,6 +1025,11 @@ diagnostics.
 diagnostics. Это значит, что есть active turns, pending interactions или stale
 operations.
 
+Сначала оцени текущую readiness-картину. Старые orphaned или stale записи
+попадают в `historicalDebt`; сами по себе они не означают, что runtime сейчас
+broken. Для них используй `historicalDebt.nextRecommendedAction`, обычно
+`run_targeted_cleanup`, вне горячего path.
+
 Перед retry долгого turn смотри `stallSupervisor`:
 
 - `mode == "diagnose_only"`: не прерывай turn автоматически;
@@ -1008,12 +1064,20 @@ operations.
 Читай:
 
 - `summary`;
+- `scopedFindings`;
+- `backgroundFindings`;
 - `timeline`;
 - `progressJournal`;
 - `hookHistory`;
 - `issues`;
 - `recommendedActions`;
 - `repairActions`.
+
+Решения принимай по `scopedFindings`. `backgroundFindings` это исторический или
+соседний контекст, он не должен перебивать свежий scoped match по текущей operation,
+workflow, thread или turn. `codex_analyze_issue` использует тот же принцип и
+должен возвращать compact evidence refs вместо raw payload. Если пришло
+`evidenceTruncated=true`, запускай targeted diagnostics, а не широкий raw log.
 
 ### Agent guidance
 
@@ -1165,6 +1229,8 @@ OpenClaw должен использовать progress journal для UX и ear
   жива;
 - если `warnings` растут, покажи их оператору;
 - если есть `modelReroutes`, обнови UI, но не считай это ошибкой;
+- `tokenUsage` в публичном status используй только как coarse bands, без exact
+  token counts;
 - если `latestProgressAt` старый и turn active, собери diagnostics.
 
 MCP не сохраняет hidden chain-of-thought, raw command output, raw tool payloads
@@ -1349,8 +1415,8 @@ Marker помогает search, diagnostics и человеку в Codex Desktop
 ### Восстановление после таймаута клиента
 
 1. Повтори исходный write call с тем же `client_request_id`.
-2. Если MCP вернул existing `operationId`, poll-и его.
-3. Если получил duplicate active, poll-и operation из details.
+2. Если MCP вернул existing `operationId`, отслеживай его.
+3. Если получил duplicate active, отслеживай operation из details.
 4. Если не нашел operation, используй `codex_search_chats` по marker.
 
 ### App-server пропал во время turn
@@ -1370,7 +1436,7 @@ Marker помогает search, diagnostics и человеку в Codex Desktop
 1. `codex_get_chat_status`.
 2. `codex_get_turn_status` для active turn.
 3. Если нужно добавить контекст, используй `steer_turn`.
-4. Если нужно ждать, poll-и до terminal.
+4. Если нужно ждать, отслеживай до terminal.
 5. Не запускай `send_message`, archive, unarchive или compaction пока busy.
 
 ## Public method reference
@@ -1606,7 +1672,7 @@ new_task
 Для каждой итерации polling OpenClaw должен уважать `nextRecommendedAction`.
 Если action неизвестен, безопасное поведение: подождать
 `recommendedPollAfterSeconds`, затем poll again. Если action неизвестен и
-status terminal, не poll-ить бесконечно, собрать diagnostics.
+status terminal, не продолжать polling бесконечно, собрать diagnostics.
 
 ## Быстрая проверка интеграции OpenClaw
 
