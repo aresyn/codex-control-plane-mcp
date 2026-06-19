@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 from . import tools as _tools
+from .statuses import TURN_ACTIVE_STATUSES
 
 globals().update(_tools.__dict__)
+
+
+SLOT_STARTING_STATUSES = ("starting_app_server", "starting_thread", "starting_review", "starting_turn")
 
 
 class WorkerServiceMixin:
@@ -56,13 +60,14 @@ class WorkerServiceMixin:
                    ops.thread_id, ops.turn_id, sched.agent_id, sched.resource_keys_json
               FROM codex_operations AS ops
               LEFT JOIN codex_operation_scheduling AS sched ON sched.operation_id = ops.operation_id
-             WHERE ops.status IN ('starting_app_server', 'starting_thread', 'starting_turn',
-                                  'starting_review', 'running', 'first_message_received',
-                                  'waiting_for_approval', 'waiting_for_user_input')
+              LEFT JOIN tracked_turns AS turns ON turns.turn_id = ops.turn_id
+             WHERE ops.status IN (?, ?, ?, ?)
+                OR turns.status IN (?, ?, ?, ?, ?, ?)
+                OR sched.queue_status = 'scheduled'
              ORDER BY ops.updated_at DESC
              LIMIT ?
             """,
-            (limit,),
+            SLOT_STARTING_STATUSES + tuple(TURN_ACTIVE_STATUSES) + (limit,),
         ).fetchall()
         active = [dict(row) for row in active_operations]
         per_project: dict[str, int] = {}

@@ -93,6 +93,69 @@ class CentralWorkerArchitectureTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(5, len(queued_reasons))
             self.assertEqual(3, list(queued_reasons.values()).count("global_slot_limit"))
 
+    async def test_stale_running_operation_without_active_tracked_turn_does_not_consume_slot(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "Project"
+            project.mkdir()
+            state_db = root / ".codex" / "state_5.sqlite"
+            project_id = project_id_for_path(str(project))
+            client_config = _search_service_config(root, state_db)
+            client_config.execution_mode = "client"
+            client = ToolService(client_config)
+            worker_config = _search_service_config(root, state_db)
+            worker_config.execution_mode = "worker"
+            worker_config.max_active_turns_global = 1
+            worker_config.max_active_turns_per_project = 10
+            worker_service = ToolService(worker_config)
+            fake = FakeAppServer(worker_service.storage, first_message=None)
+            worker_service._app_server = fake  # type: ignore[assignment]
+            worker = CentralWorker(worker_service)
+            try:
+                stale = await client.call(
+                    "codex_submit_task",
+                    {
+                        "operation_type": "start_chat",
+                        "project_id": project_id,
+                        "message": "historical stale operation",
+                        "client_request_id": "stale-running-slot",
+                        "agent_id": "codex-dev",
+                        "sandbox": "read-only",
+                    },
+                )
+                client.storage.update_operation(
+                    stale["operationId"],
+                    status="running",
+                    phase="running",
+                    thread_id="thread-stale",
+                    turn_id="turn-stale",
+                    updated_at="2026-05-25T00:00:00+00:00",
+                )
+                fresh = await client.call(
+                    "codex_submit_task",
+                    {
+                        "operation_type": "start_chat",
+                        "project_id": project_id,
+                        "message": "fresh queued operation",
+                        "client_request_id": "fresh-after-stale",
+                        "agent_id": "codex-dev",
+                        "sandbox": "read-only",
+                    },
+                )
+
+                await worker._schedule_startable_operations()
+                await _wait_for_turn_starts(fake, expected=1)
+                status = await worker_service.call("codex_get_operation_status", {"operation_id": fresh["operationId"]})
+                concurrency = await worker_service.call("codex_get_concurrency_status", {"include_locks": False})
+            finally:
+                await client.close()
+                await worker_service.close()
+
+            self.assertEqual(1, len(fake.turn_start_calls))
+            self.assertEqual("running", status["status"])
+            self.assertEqual(1, concurrency["activeTurnCount"])
+            self.assertEqual(fresh["operationId"], concurrency["activeOperations"][0]["operationId"])
+
     async def test_write_turns_without_resource_keys_serialize_in_same_project(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

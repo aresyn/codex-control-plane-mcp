@@ -11,13 +11,13 @@ from typing import Any
 
 from .config import ServerConfig, path_key
 from .logging_utils import get_logger
-from .statuses import OPERATION_ACTIVE_STATUSES, OPERATION_STARTABLE_STATUSES, OPERATION_TERMINAL_STATUSES
+from .statuses import OPERATION_STARTABLE_STATUSES, OPERATION_TERMINAL_STATUSES, TURN_ACTIVE_STATUSES
 from .tools import ToolService, _future_iso, _now_iso, _operation_request_from_row, _optional_string, redact_payload
 
 
 LOG = get_logger("worker")
 RESOURCE_LOCK_TTL_SECONDS = 6 * 60 * 60
-SLOT_ACTIVE_STATUSES = tuple(status for status in OPERATION_ACTIVE_STATUSES if status != "queued")
+SLOT_STARTING_STATUSES = ("starting_app_server", "starting_thread", "starting_review", "starting_turn")
 
 
 class CentralWorker:
@@ -82,11 +82,11 @@ class CentralWorker:
         rows = self.service.storage.connection.execute(
             f"""
             SELECT COUNT(*) AS count
-              FROM codex_operations
-             WHERE status IN ({','.join('?' for _ in SLOT_ACTIVE_STATUSES)})
-               AND turn_id IS NOT NULL
+              FROM codex_operations AS ops
+              JOIN tracked_turns AS turns ON turns.turn_id = ops.turn_id
+             WHERE turns.status IN ({','.join('?' for _ in TURN_ACTIVE_STATUSES)})
             """,
-            SLOT_ACTIVE_STATUSES,
+            tuple(TURN_ACTIVE_STATUSES),
         ).fetchone()
         return int(rows["count"] if rows is not None else 0)
 
@@ -247,17 +247,20 @@ class CentralWorker:
         }
 
     def _active_operations(self) -> list[dict[str, Any]]:
-        statuses = SLOT_ACTIVE_STATUSES
+        starting = SLOT_STARTING_STATUSES
+        turn_active = tuple(TURN_ACTIVE_STATUSES)
         rows = self.service.storage.connection.execute(
             f"""
             SELECT ops.*, sched.agent_id, sched.resource_keys_json
               FROM codex_operations AS ops
               LEFT JOIN codex_operation_scheduling AS sched ON sched.operation_id = ops.operation_id
-             WHERE ops.status IN ({','.join('?' for _ in statuses)})
+              LEFT JOIN tracked_turns AS turns ON turns.turn_id = ops.turn_id
+             WHERE ops.status IN ({','.join('?' for _ in starting)})
+                OR turns.status IN ({','.join('?' for _ in turn_active)})
                 OR sched.queue_status = 'scheduled'
              ORDER BY ops.updated_at DESC
             """,
-            statuses,
+            starting + turn_active,
         ).fetchall()
         return [dict(row) for row in rows]
 
