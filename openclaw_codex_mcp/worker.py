@@ -43,6 +43,7 @@ class CentralWorker:
                     if not self.observe:
                         await self._process_worker_commands()
                         await self._schedule_startable_operations()
+                        self._cleanup_terminal_scheduling()
                         self._cleanup_terminal_locks()
                 except Exception as exc:  # pragma: no cover - defensive loop guard
                     last_error = str(exc)
@@ -327,6 +328,28 @@ class CentralWorker:
             if operation is None or str(operation.get("status") or "") in OPERATION_TERMINAL_STATUSES:
                 self.service.storage.release_resource_locks_for_operation(operation_id)
 
+    def _cleanup_terminal_scheduling(self) -> None:
+        terminal = tuple(sorted(OPERATION_TERMINAL_STATUSES))
+        rows = self.service.storage.connection.execute(
+            f"""
+            SELECT sched.operation_id, ops.status
+              FROM codex_operation_scheduling AS sched
+              JOIN codex_operations AS ops ON ops.operation_id = sched.operation_id
+             WHERE ops.status IN ({','.join('?' for _ in terminal)})
+               AND sched.queue_status IN ('queued', 'scheduled', 'running')
+             LIMIT 100
+            """,
+            terminal,
+        ).fetchall()
+        now = _now_iso()
+        for row in rows:
+            self.service.storage.update_operation_scheduling(
+                str(row["operation_id"]),
+                queue_status=str(row["status"]),
+                queued_reason=None,
+                updated_at=now,
+            )
+
 
 def _deny(reason: str) -> dict[str, Any]:
     return {"allowed": False, "reason": reason, "locks": [], "slotClaim": {"claimed": False, "reason": reason}}
@@ -418,3 +441,7 @@ async def async_main(argv: list[str] | None = None) -> int:
 
 def main() -> None:
     raise SystemExit(asyncio.run(async_main()))
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised by console script / -m entrypoint
+    main()

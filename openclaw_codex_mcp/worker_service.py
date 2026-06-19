@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from . import tools as _tools
-from .statuses import TURN_ACTIVE_STATUSES
+from .statuses import OPERATION_TERMINAL_STATUSES, TURN_ACTIVE_STATUSES
 
 globals().update(_tools.__dict__)
 
@@ -32,8 +32,16 @@ class WorkerServiceMixin:
     def codex_get_queue_status(self, args: dict[str, Any]) -> dict[str, Any]:
         limit = _bounded_int(args.get("limit", 100), 1, 500)
         status_filter = _optional_string(args.get("status"))
+        include_terminal = bool(args.get("include_terminal", False))
         rows = self.storage.list_operation_scheduling(limit=limit)
         entries = [_operation_scheduling_row_to_tool(row) for row in rows]
+        if not include_terminal:
+            entries = [
+                row
+                for row in entries
+                if row.get("operationStatus") not in OPERATION_TERMINAL_STATUSES
+                and row.get("queueStatus") in {"queued", "scheduled", "running"}
+            ]
         if status_filter:
             entries = [row for row in entries if row.get("queueStatus") == status_filter]
         reasons: dict[str, int] = {}

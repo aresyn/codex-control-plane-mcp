@@ -156,6 +156,58 @@ class CentralWorkerArchitectureTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(1, concurrency["activeTurnCount"])
             self.assertEqual(fresh["operationId"], concurrency["activeOperations"][0]["operationId"])
 
+    async def test_terminal_scheduling_rows_do_not_appear_in_active_queue(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "Project"
+            project.mkdir()
+            state_db = root / ".codex" / "state_5.sqlite"
+            project_id = project_id_for_path(str(project))
+            client_config = _search_service_config(root, state_db)
+            client_config.execution_mode = "client"
+            client = ToolService(client_config)
+            worker_config = _search_service_config(root, state_db)
+            worker_config.execution_mode = "worker"
+            worker_service = ToolService(worker_config)
+            worker = CentralWorker(worker_service)
+            try:
+                result = await client.call(
+                    "codex_submit_task",
+                    {
+                        "operation_type": "start_chat",
+                        "project_id": project_id,
+                        "message": "terminal scheduling audit",
+                        "client_request_id": "terminal-scheduling-audit",
+                        "agent_id": "codex-dev",
+                    },
+                )
+                operation_id = result["operationId"]
+                client.storage.update_operation(
+                    operation_id,
+                    status="unknown_after_app_server_exit",
+                    phase="unknown_after_app_server_exit",
+                    completed_at="2026-05-25T00:00:00+00:00",
+                    updated_at="2026-05-25T00:00:00+00:00",
+                )
+                client.storage.update_operation_scheduling(
+                    operation_id,
+                    queue_status="running",
+                    queued_reason=None,
+                    updated_at="2026-05-25T00:00:00+00:00",
+                )
+
+                active_queue = await worker_service.call("codex_get_queue_status", {"limit": 10})
+                terminal_queue = await worker_service.call("codex_get_queue_status", {"limit": 10, "include_terminal": True})
+                worker._cleanup_terminal_scheduling()
+                cleaned = worker_service.storage.get_operation_scheduling(operation_id)
+            finally:
+                await client.close()
+                await worker_service.close()
+
+            self.assertEqual(0, active_queue["count"])
+            self.assertEqual(1, terminal_queue["count"])
+            self.assertEqual("unknown_after_app_server_exit", cleaned["queue_status"])
+
     async def test_write_turns_without_resource_keys_serialize_in_same_project(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
