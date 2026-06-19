@@ -88,6 +88,13 @@ Explicit tool arguments always win over server defaults. A client may submit one
 task with a stricter or more permissive policy without changing the server
 configuration.
 
+Plan Mode has a sandbox floor. When `codex_start_plan_workflow` or
+`codex_submit_task` with `collaboration_mode="plan"` resolves to `read-only`,
+MCP sends `workspace-write` to app-server instead. Status output includes
+`requestedSandbox`, `effectiveSandbox`, `runtimePolicyAdjusted`, and
+`runtimePolicy` so clients can audit the adjustment. Non-plan write operations
+keep normal sandbox semantics.
+
 ## Durable operation types
 
 `codex_submit_task` supports these operation types:
@@ -231,6 +238,17 @@ destructive action and needs a separate confirmation and threat model.
 3. Approve with `codex_approve_plan` only after the plan is valid for the task.
 4. Poll the same workflow until the final report is ready.
 
+Plan Mode never starts as `read-only`. If the caller passes `read-only`, or the
+server default is `read-only`, MCP raises the effective sandbox to
+`workspace-write`. More permissive values are passed through. The workflow ack
+and later status include:
+
+- `requestedSandbox`: sandbox requested by the caller or server default.
+- `effectiveSandbox`: sandbox sent to app-server.
+- `runtimePolicyAdjusted`: `true` when MCP raised `read-only` to
+  `workspace-write`.
+- `runtimePolicy`: compact policy block with approval policy and sandbox floor.
+
 `latestPlan` includes quality fields:
 
 - `planQuality`: `valid_plan`, `blocker`, `question`, `partial`,
@@ -274,6 +292,22 @@ the candidate to a human or policy engine, then call:
 plan hash without starting execution. It is idempotent for the same workflow and
 candidate hash. After adoption, poll `codex_get_workflow_status` again and use
 the normal approve path.
+
+When a workflow has already failed or become orphaned because of a bad runtime
+policy, use `codex_repair_issue` with
+`action="retry_workflow_with_runtime_policy"`. The action defaults to
+`dry_run=true`.
+
+Dry run returns the planned request, runtime policy, and source workflow. With
+`dry_run=false`, MCP creates a new workflow, links it to the old workflow, and
+does not revive the old terminal turn. `codex_get_workflow_status` exposes the
+link through `workflowRetryState`:
+
+- `replacesWorkflowId`: source workflow replaced by this workflow.
+- `replacedByWorkflowId`: replacement workflow for the current workflow.
+- `retryOfWorkflowId`: original workflow id for the retry.
+- `retryReason`: optional operator/client reason.
+- `retryCreatedAt`: retry creation time.
 
 Diagnostics may report:
 

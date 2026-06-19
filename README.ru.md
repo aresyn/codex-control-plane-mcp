@@ -76,6 +76,9 @@ MCP client / orchestrator
 
 - используйте `read-only` для недоверенных репозиториев;
 - используйте `on-request` approval при проверке новых workflows;
+- Plan Mode никогда не запускается в `read-only`. Если клиент запросил
+  `read-only`, MCP повышает sandbox до `workspace-write` и показывает это в
+  status output;
 - держите `state/`, `logs/`, `.env` и `.codex/` приватными.
 
 ## Что умеет сервер
@@ -88,6 +91,8 @@ MCP client / orchestrator
 - Durable `turn/steer`, чтобы добавить контекст в активный turn без второго turn.
 - Durable `thread/fork`, чтобы ответвить существующий thread, с первым сообщением или без него.
 - Plan Mode workflows: план, polling, approve, execution, финальный отчет.
+- Runtime floor для Plan Mode: `workspace-write`. Если MCP повысил
+  `read-only`, статус содержит `runtimePolicyAdjusted`.
 - Code review workflows через app-server `review/start`, polling и сохранение итогового отчета.
 - Structured final reports через `output_schema`.
 - Thread lifecycle tools для archive, unarchive и pollable compaction.
@@ -325,6 +330,12 @@ codex_get_workflow_status(workflowId)
   -> finalReport
 ```
 
+У Plan Mode есть нижняя граница runtime policy. Общий публичный default остается
+безопасным: `read-only` и `on-request`. Но на Windows Plan Mode нужен writable
+workspace. Если вызов или server default дают `read-only`, MCP передает в
+`codex-app-server` режим `workspace-write` и возвращает `requestedSandbox`,
+`effectiveSandbox` и `runtimePolicyAdjusted` в workflow и operation status.
+
 Передать цель workflow в Codex Desktop, если клиент явно ее задал:
 
 ```text
@@ -377,6 +388,11 @@ codex_repair_issue
 ```
 
 Repair actions по умолчанию идут с `dry_run=true`.
+
+Для сломанного Plan Mode workflow используйте
+`retry_workflow_with_runtime_policy`. Action создает новый workflow с выбранными
+sandbox и approval policy, связывает его со старым через `workflowRetryState` и
+не пытается оживить старый terminal turn.
 
 ## Runtime capabilities
 
@@ -528,6 +544,11 @@ stable/compatibility tools.
 Write policy значения являются дефолтами, а не жесткими ограничениями.
 MCP-клиент может переопределить `sandbox` или `approval_policy` в конкретном
 вызове, когда доверенному workflow нужен другой режим.
+
+Plan Mode отличается от обычного pass-through: `read-only` слишком ограничен
+для Plan Mode на Windows, поэтому MCP повышает его до `workspace-write`.
+Более permissive значения в конкретном вызове, например `workspace-write`,
+передаются как есть.
 
 Пример:
 

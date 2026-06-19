@@ -5,6 +5,14 @@ from . import tools as _tools
 globals().update(_tools.__dict__)
 
 
+def _diagnostic_workflow_metadata(workflow: dict[str, Any]) -> dict[str, Any]:
+    try:
+        payload = json.loads(str(workflow.get("metadata_json") or "{}"))
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 class DiagnosticServiceMixin:
     def codex_health_summary(self, args: dict[str, Any]) -> dict[str, Any]:
         since_minutes = _bounded_int(args.get("since_minutes", 120), 1, 10080)
@@ -454,6 +462,9 @@ class DiagnosticServiceMixin:
             changed = bool(repair_result.get("changed"))
         elif action_name == "reconcile_workflow_from_thread":
             repair_result = self._repair_reconcile_workflow_from_thread(args, dry_run=dry_run)
+            changed = bool(repair_result.get("changed"))
+        elif action_name == "retry_workflow_with_runtime_policy":
+            repair_result = await self._repair_retry_workflow_with_runtime_policy(args, dry_run=dry_run, force=force)
             changed = bool(repair_result.get("changed"))
         elif action_name == "mark_orphaned_after_exit":
             repair_result = self._repair_mark_orphaned_after_exit(args, dry_run=dry_run, force=force)
@@ -1189,6 +1200,204 @@ class DiagnosticServiceMixin:
             "candidatePlans": observation.get("candidatePlans") if isinstance(observation, dict) else [],
             "nextRecommendedAction": status.get("nextRecommendedAction"),
             "message": "Review candidatePlans and call codex_adopt_workflow_plan explicitly when a candidate is acceptable.",
+        }
+
+    async def _repair_retry_workflow_with_runtime_policy(
+        self,
+        args: dict[str, Any],
+        *,
+        dry_run: bool,
+        force: bool,
+    ) -> dict[str, Any]:
+        workflow_id = _required_string(args, "workflow_id")
+        workflow = self.storage.get_workflow(workflow_id)
+        if workflow is None:
+            raise invalid_argument("Codex workflow was not found.", workflow_id=workflow_id)
+        if (_optional_string(workflow.get("workflow_kind")) or "plan_then_execute") != "plan_then_execute":
+            raise invalid_argument(
+                "retry_workflow_with_runtime_policy currently supports only plan_then_execute workflows.",
+                workflow_id=workflow_id,
+                workflow_kind=workflow.get("workflow_kind"),
+            )
+        phase = str(workflow.get("phase") or "")
+        status = str(workflow.get("status") or "")
+        retryable_states = {
+            "completed",
+            "failed",
+            "orphaned",
+            "orphaned_after_app_server_exit",
+            "unknown_after_app_server_exit",
+        }
+        retryable = phase in retryable_states or status in retryable_states
+        if not dry_run and not force and not retryable:
+            raise invalid_argument(
+                "retry_workflow_with_runtime_policy requires a terminal/failed/orphaned workflow or force=true.",
+                workflow_id=workflow_id,
+                phase=phase,
+                status=status,
+            )
+        plan_operation_id = _optional_string(workflow.get("plan_operation_id"))
+        plan_operation = self.storage.get_operation(plan_operation_id) if plan_operation_id else None
+        if plan_operation is None:
+            raise invalid_argument(
+                "Source workflow has no durable plan operation to retry from.",
+                workflow_id=workflow_id,
+                plan_operation_id=plan_operation_id,
+            )
+        request_payload = _operation_request_from_row(plan_operation)
+        message = _optional_string(request_payload.get("message"))
+        if not message:
+            raise invalid_argument("Source workflow plan operation has no retryable message.", workflow_id=workflow_id)
+        sandbox = _optional_string(args.get("sandbox")) or _sandbox_value_from_policy(self.config.default_sandbox_policy)
+        approval_policy = _optional_string(args.get("approval_policy")) or self.config.default_approval_policy
+        reason = _bounded_optional_text(args.get("reason"), field_name="reason", max_chars=4000)
+        retry_client_request_id = (
+            _optional_string(args.get("client_request_id"))
+            or f"repair:retry_workflow_with_runtime_policy:{workflow_id}:{prompt_hash(normalize_prompt(sandbox + ':' + approval_policy))}"
+        )
+        retry_args: dict[str, Any] = {
+            "project_id": workflow.get("project_id") or request_payload.get("project_id"),
+            "message": message,
+            "title": request_payload.get("title"),
+            "cwd": request_payload.get("cwd"),
+            "model": request_payload.get("model"),
+            "sandbox": sandbox,
+            "approval_policy": approval_policy,
+            "client_request_id": retry_client_request_id,
+            "goal": workflow.get("goal_objective"),
+            "goal_token_budget": workflow.get("goal_token_budget"),
+            "goal_completion_action": workflow.get("goal_completion_action") or "clear",
+            "goal_completion_objective": workflow.get("goal_completion_objective"),
+            "timeout_seconds": _bounded_int(
+                request_payload.get("timeout_seconds", args.get("timeout_seconds", DEFAULT_TOOL_START_TIMEOUT_SECONDS)),
+                1,
+                7200,
+            ),
+            "first_message_max_chars": _bounded_int(
+                request_payload.get("first_message_max_chars", 8000),
+                500,
+                200000,
+            ),
+        }
+        retry_args = {key: value for key, value in retry_args.items() if value not in (None, "")}
+        preview_request = {
+            key: value
+            for key, value in retry_args.items()
+            if key not in {"message"}
+        }
+        preview_request.update(
+            {
+                "messagePreview": _redacted_preview(message, 160),
+                "messageChars": len(message),
+                "messageHash": prompt_hash(normalize_prompt(message)),
+            }
+        )
+        runtime_policy = _plan_mode_runtime_policy(
+            {
+                "sandbox": sandbox,
+                "approval_policy": approval_policy,
+                "collaboration_mode": "plan",
+            },
+            default_sandbox_policy=self.config.default_sandbox_policy,
+            default_approval_policy=self.config.default_approval_policy,
+        )
+        source_workflow = {
+            "workflowId": workflow_id,
+            "phase": phase,
+            "status": status,
+            "threadId": _optional_string(workflow.get("thread_id")),
+            "planTurnId": _optional_string(workflow.get("plan_turn_id")),
+            "planOperationId": plan_operation_id,
+        }
+        if dry_run:
+            return {
+                "dryRun": True,
+                "changed": False,
+                "wouldCreateWorkflow": True,
+                "sourceWorkflow": source_workflow,
+                "plannedRequest": preview_request,
+                "runtimePolicy": runtime_policy,
+                "replacesWorkflowId": workflow_id,
+                "nextRecommendedAction": "run_repair_with_dry_run_false",
+            }
+
+        started = await self.codex_start_plan_workflow(retry_args)
+        new_workflow_id = _optional_string(started.get("workflowId"))
+        if not new_workflow_id:
+            raise send_failed("Workflow retry did not create a new workflow.")
+        now = _now_iso()
+        new_workflow = self.storage.get_workflow(new_workflow_id)
+        if new_workflow is not None:
+            new_metadata = _diagnostic_workflow_metadata(new_workflow)
+            existing_replaces = _optional_string(new_metadata.get("replacesWorkflowId"))
+            if existing_replaces and existing_replaces != workflow_id:
+                raise invalid_argument(
+                    "client_request_id already belongs to retry of another workflow.",
+                    client_request_id=retry_client_request_id,
+                    existing_replaces_workflow_id=existing_replaces,
+                    requested_replaces_workflow_id=workflow_id,
+                )
+            new_metadata.update(
+                {
+                    "replacesWorkflowId": workflow_id,
+                    "retryOfWorkflowId": workflow_id,
+                    "retryReason": reason,
+                    "retryCreatedAt": now,
+                    "runtimePolicy": started.get("runtimePolicy") or runtime_policy,
+                    "sourcePlanOperationId": plan_operation_id,
+                }
+            )
+            self.storage.update_workflow(
+                new_workflow_id,
+                metadata_json=json.dumps(new_metadata, ensure_ascii=False, sort_keys=True),
+                updated_at=now,
+            )
+        source_metadata = _diagnostic_workflow_metadata(workflow)
+        source_metadata["replacedByWorkflowId"] = new_workflow_id
+        source_metadata["retryReason"] = reason
+        source_metadata["retryCreatedAt"] = now
+        self.storage.update_workflow(
+            workflow_id,
+            metadata_json=json.dumps(source_metadata, ensure_ascii=False, sort_keys=True),
+            updated_at=now,
+        )
+        self.storage.record_workflow_event(
+            workflow_id,
+            event_type="workflow_retry_created",
+            message="Workflow retry created with adjusted runtime policy.",
+            details={
+                "newWorkflowId": new_workflow_id,
+                "clientRequestId": retry_client_request_id,
+                "runtimePolicy": started.get("runtimePolicy") or runtime_policy,
+                "reason": reason,
+            },
+            created_at=now,
+        )
+        self.storage.record_workflow_event(
+            new_workflow_id,
+            event_type="workflow_retry_lineage_attached",
+            message="Workflow retry linked to source workflow.",
+            details={
+                "replacesWorkflowId": workflow_id,
+                "sourcePlanOperationId": plan_operation_id,
+                "reason": reason,
+            },
+            created_at=now,
+        )
+        new_status = self.codex_get_workflow_status({"workflow_id": new_workflow_id, "include_events": True})
+        return {
+            "dryRun": False,
+            "changed": True,
+            "newWorkflowId": new_workflow_id,
+            "replacesWorkflowId": workflow_id,
+            "newPlanOperationId": started.get("planOperationId"),
+            "runtimePolicy": new_status.get("runtimePolicy") or started.get("runtimePolicy") or runtime_policy,
+            "sourceWorkflow": source_workflow,
+            "newWorkflow": new_status,
+            "idempotent": bool(started.get("idempotent")),
+            "nextRecommendedAction": "poll_workflow",
+            "recommendedPollAfterSeconds": new_status.get("recommendedPollAfterSeconds", 1),
+            "pollRecommended": True,
         }
 
     def _repair_mark_orphaned_after_exit(self, args: dict[str, Any], *, dry_run: bool, force: bool) -> dict[str, Any]:

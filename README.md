@@ -80,6 +80,9 @@ Recommended first-run posture:
 
 - use `read-only` for untrusted repositories;
 - use `on-request` approval when testing new workflows;
+- Plan Mode never runs with a `read-only` sandbox. If a caller requests
+  `read-only`, MCP raises that turn to `workspace-write` and reports the
+  adjustment in status output;
 - keep `state/`, `logs/`, `.env`, and `.codex/` private.
 
 ## What it does
@@ -92,6 +95,8 @@ Recommended first-run posture:
 - Durable `turn/steer` for adding context to an active turn without creating a second turn.
 - Durable `thread/fork` for branching an existing thread, with or without an initial message.
 - Plan Mode workflows: start plan, poll, approve, execute, read final report.
+- Plan Mode runtime floor: `workspace-write`, with `runtimePolicyAdjusted` in
+  status when MCP raises a `read-only` request.
 - Code review workflows through app-server `review/start`, with polling and final report capture.
 - Structured final reports with `output_schema`.
 - Thread lifecycle tools for archive, unarchive, and pollable compaction.
@@ -327,6 +332,13 @@ codex_get_workflow_status(workflowId)
   -> finalReport
 ```
 
+Plan Mode has a runtime floor. The public default write policy is still
+`read-only` and `on-request`, but Plan Mode needs a writable workspace on
+Windows. If the caller or server default resolves to `read-only`, MCP sends
+`workspace-write` to `codex-app-server` and returns `requestedSandbox`,
+`effectiveSandbox`, and `runtimePolicyAdjusted` in workflow and operation
+status.
+
 Mirror a workflow goal into Codex Desktop when the client has one:
 
 ```text
@@ -379,6 +391,11 @@ codex_repair_issue
 ```
 
 Repair actions default to `dry_run=true`.
+
+For a broken Plan Mode workflow, use
+`retry_workflow_with_runtime_policy`. It creates a new workflow with the selected
+sandbox and approval policy, links it to the old workflow through
+`workflowRetryState`, and does not revive the old terminal turn.
 
 ## Runtime capabilities
 
@@ -528,6 +545,10 @@ Common variables:
 The write policy values are defaults, not hard limits. A client call can pass
 `sandbox` or `approval_policy` explicitly when a trusted workflow needs a
 different posture.
+
+Plan Mode is the exception to pure pass-through behavior: `read-only` is treated
+as too restrictive for Plan Mode on Windows and is raised to `workspace-write`.
+More permissive per-call values, such as `workspace-write`, are passed through.
 
 Example:
 

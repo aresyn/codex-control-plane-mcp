@@ -887,6 +887,7 @@ TOOLS: list[dict[str, Any]] = [
                         "recover_stale_operations",
                         "refresh_catalog_and_history",
                         "reconcile_workflow_from_thread",
+                        "retry_workflow_with_runtime_policy",
                         "refresh_catalog_and_kb",
                         "mark_orphaned_after_exit",
                         "restart_app_server_idle",
@@ -905,6 +906,10 @@ TOOLS: list[dict[str, Any]] = [
                 "turn_id": {"type": ["string", "null"], "default": None},
                 "operation_id": {"type": ["string", "null"], "default": None},
                 "workflow_id": {"type": ["string", "null"], "default": None},
+                "client_request_id": {"type": ["string", "null"], "default": None},
+                "reason": {"type": ["string", "null"], "default": None, "maxLength": 4000},
+                "sandbox": {"type": ["string", "null"], "enum": ["read-only", "workspace-write", "danger-full-access", None], "default": None},
+                "approval_policy": {"type": ["string", "null"], "enum": ["never", "on-request", "on-failure", "untrusted", "ask_openclaw", None], "default": None},
                 "dry_run": {"type": "boolean", "default": True},
                 "force": {"type": "boolean", "default": False},
                 "stale_after_minutes": {"type": "integer", "minimum": 1, "maximum": 10080, "default": 30},
@@ -1770,6 +1775,7 @@ def _canonical_repair_action(action_name: str) -> str:
         "rebuild_search_index": "refresh_catalog_and_history",
         "refresh_catalog_and_kb": "refresh_catalog_and_history",
         "workflow_thread_reconcile": "reconcile_workflow_from_thread",
+        "retry_workflow": "retry_workflow_with_runtime_policy",
     }
     return aliases.get(action_name, action_name)
 
@@ -1924,6 +1930,9 @@ def _operation_row_to_tool(row: dict[str, Any]) -> dict[str, Any]:
     input_item_state = request_payload.get("_input_item_state")
     if isinstance(input_item_state, dict):
         result["inputItemState"] = dict(input_item_state)
+    runtime_policy = request_payload.get("_runtime_policy")
+    if isinstance(runtime_policy, dict):
+        result.update(_runtime_policy_public_fields(runtime_policy))
     original_operation_type = request_payload.get("original_operation_type")
     if original_operation_type:
         result["originalOperationType"] = original_operation_type
@@ -2185,6 +2194,67 @@ def _sandbox_value_from_policy(policy: dict[str, Any]) -> str:
     if policy_type == "dangerFullAccess":
         return "danger-full-access"
     return "read-only"
+
+
+def _plan_mode_runtime_policy(
+    args: dict[str, Any],
+    *,
+    default_sandbox_policy: dict[str, Any],
+    default_approval_policy: str,
+) -> dict[str, Any]:
+    requested_sandbox = _optional_string(args.get("sandbox")) or _sandbox_value_from_policy(default_sandbox_policy)
+    requested_approval = _optional_string(args.get("approval_policy")) or default_approval_policy
+    effective_sandbox = requested_sandbox
+    adjusted = False
+    reason: str | None = None
+    if effective_sandbox in {"read-only", "respect_existing"}:
+        effective_sandbox = "workspace-write"
+        adjusted = True
+        reason = "plan_mode_requires_workspace_write"
+    effective_approval = _approval_policy_for_start(requested_approval, default_approval_policy)
+    return {
+        "mode": "plan",
+        "requestedSandbox": requested_sandbox,
+        "effectiveSandbox": effective_sandbox,
+        "requestedApprovalPolicy": requested_approval,
+        "effectiveApprovalPolicy": effective_approval,
+        "runtimePolicyAdjusted": adjusted,
+        "adjustmentReason": reason,
+        "sandboxFloor": "workspace-write",
+    }
+
+
+def _apply_plan_mode_runtime_policy(
+    args: dict[str, Any],
+    *,
+    default_sandbox_policy: dict[str, Any],
+    default_approval_policy: str,
+) -> dict[str, Any] | None:
+    if str(args.get("collaboration_mode") or "").strip() != "plan":
+        return None
+    state = _plan_mode_runtime_policy(
+        args,
+        default_sandbox_policy=default_sandbox_policy,
+        default_approval_policy=default_approval_policy,
+    )
+    args["sandbox"] = state["effectiveSandbox"]
+    args["approval_policy"] = state["effectiveApprovalPolicy"]
+    args["_runtime_policy"] = state
+    return state
+
+
+def _runtime_policy_public_fields(state: Any) -> dict[str, Any]:
+    if not isinstance(state, dict):
+        return {}
+    public = dict(state)
+    return {
+        "runtimePolicy": public,
+        "runtimePolicyAdjusted": bool(public.get("runtimePolicyAdjusted")),
+        "requestedSandbox": public.get("requestedSandbox"),
+        "effectiveSandbox": public.get("effectiveSandbox"),
+        "requestedApprovalPolicy": public.get("requestedApprovalPolicy"),
+        "effectiveApprovalPolicy": public.get("effectiveApprovalPolicy"),
+    }
 
 
 def _collaboration_mode(value: Any, *, model: str | None, config: ServerConfig) -> dict[str, Any] | None:

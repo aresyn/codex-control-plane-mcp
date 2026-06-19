@@ -546,7 +546,7 @@ Start:
     "project_id": "PROJECT_ID",
     "message": "Prepare an implementation plan. Do not change files yet.",
     "client_request_id": "openclaw:issue-123:plan:v1",
-    "sandbox": "read-only",
+    "sandbox": "workspace-write",
     "approval_policy": "on-request",
     "goal": "Prepare a safe implementation plan for issue 123",
     "goal_completion_action": "clear"
@@ -574,11 +574,16 @@ Approve:
     "workflow_id": "WORKFLOW_ID",
     "client_request_id": "openclaw:issue-123:approve-plan:v1",
     "message": "Implement the approved plan.",
-    "sandbox": "read-only",
+    "sandbox": "workspace-write",
     "approval_policy": "on-request"
   }
 }
 ```
+
+У Plan Mode есть нижняя граница sandbox. Не запрашивай `read-only` для Plan
+Mode намеренно. Если клиент все же передал `read-only`, MCP повысит effective
+sandbox до `workspace-write` и вернет `runtimePolicyAdjusted=true`,
+`requestedSandbox` и `effectiveSandbox` в workflow status.
 
 Повторный approve с тем же workflow не должен создавать второй execution turn.
 OpenClaw должен читать `executionOperationId` и дальше poll-ить workflow.
@@ -1008,6 +1013,28 @@ operations.
 `refresh_catalog_and_kb` остается legacy alias. Новый путь:
 `refresh_catalog_and_history`.
 
+Если Plan Mode workflow упал из-за неверного sandbox или approval policy,
+используй `retry_workflow_with_runtime_policy`. Action создает новый workflow и
+связывает его со старым через `workflowRetryState`.
+
+```json
+{
+  "tool": "codex_repair_issue",
+  "arguments": {
+    "action": "retry_workflow_with_runtime_policy",
+    "workflow_id": "OLD_WORKFLOW_ID",
+    "sandbox": "workspace-write",
+    "approval_policy": "on-request",
+    "client_request_id": "openclaw:issue-123:retry-plan:v1",
+    "reason": "Retry with a writable Plan Mode sandbox.",
+    "dry_run": true
+  }
+}
+```
+
+После успешного dry run повтори вызов с `dry_run=false`, сохрани
+`newWorkflowId` и poll-ь новый workflow. Старый terminal turn не оживляй.
+
 ## App-server status and restart
 
 Проверить:
@@ -1147,6 +1174,7 @@ OpenClaw может переопределять их в каждом tool call:
 
 - read-only анализ: `read-only` и `on-request`;
 - работа с недоверенным репозиторием: `read-only`;
+- Plan Mode planning: минимум `workspace-write`;
 - задача, где Codex может менять файлы: требуй явного решения пользователя или
   policy OpenClaw;
 - не меняй server defaults ради одной задачи, передай override в call.

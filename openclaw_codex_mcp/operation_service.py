@@ -608,6 +608,11 @@ class OperationServiceMixin:
         timeout_seconds = _bounded_int(args.get("timeout_seconds", DEFAULT_TOOL_START_TIMEOUT_SECONDS), 1, 7200)
         first_message_max_chars = _bounded_int(args.get("first_message_max_chars", 8000), 500, 200000)
         thread_row = self.catalog.get_thread_row(thread_id)
+        _apply_plan_mode_runtime_policy(
+            args,
+            default_sandbox_policy=self.config.default_sandbox_policy,
+            default_approval_policy=self.config.default_approval_policy,
+        )
         approval_policy = _approval_policy_for_send(args.get("approval_policy"), thread_row, self.config.default_approval_policy)
         sandbox_policy = _sandbox_policy_for_send(args.get("sandbox"), thread_row, self.config.default_sandbox_policy)
         collaboration_mode = _collaboration_mode(args.get("collaboration_mode"), model=None, config=self.config)
@@ -730,6 +735,7 @@ class OperationServiceMixin:
         input_item_state = args.get("_input_item_state")
         if isinstance(input_item_state, dict):
             response["inputItemState"] = dict(input_item_state)
+        response.update(_runtime_policy_public_fields(args.get("_runtime_policy")))
         response.update(self._dedup_metadata_for_result(dedup_metadata))
         return response
 
@@ -863,6 +869,11 @@ class OperationServiceMixin:
             _redacted_preview(message),
         )
         client = await self._app()
+        _apply_plan_mode_runtime_policy(
+            args,
+            default_sandbox_policy=self.config.default_sandbox_policy,
+            default_approval_policy=self.config.default_approval_policy,
+        )
         sandbox_policy = _sandbox_policy(args.get("sandbox")) or self.config.default_sandbox_policy
         approval_policy = _approval_policy_for_start(args.get("approval_policy"), self.config.default_approval_policy)
         model = str(args.get("model")) if args.get("model") not in (None, "") else None
@@ -999,6 +1010,7 @@ class OperationServiceMixin:
         input_item_state = args.get("_input_item_state")
         if isinstance(input_item_state, dict):
             response["inputItemState"] = dict(input_item_state)
+        response.update(_runtime_policy_public_fields(args.get("_runtime_policy")))
         response.update(self._dedup_metadata_for_result(dedup_metadata))
         return response
 
@@ -1195,6 +1207,11 @@ class OperationServiceMixin:
         actual_args.setdefault("sandbox", _sandbox_value_from_policy(self.config.default_sandbox_policy))
         if actual_args.get("sandbox") in (None, ""):
             actual_args["sandbox"] = _sandbox_value_from_policy(self.config.default_sandbox_policy)
+        _apply_plan_mode_runtime_policy(
+            actual_args,
+            default_sandbox_policy=self.config.default_sandbox_policy,
+            default_approval_policy=self.config.default_approval_policy,
+        )
         workflow: dict[str, Any] | None = None
         initial_chat_id: str | None = _optional_string(args.get("chat_id"))
         initial_thread_id: str | None = None
@@ -1365,6 +1382,8 @@ class OperationServiceMixin:
         if operation_type == "execute_plan":
             request_payload["_prompt_dedup_operation_type"] = "execute_plan"
             request_payload["_prompt_dedup_basis"] = dedup_basis
+        if isinstance(actual_args.get("_runtime_policy"), dict):
+            request_payload["_runtime_policy"] = actual_args["_runtime_policy"]
         request_payload["_operation_id"] = operation_id
         client_request_id = explicit_client_request_id or f"{_operation_client_request_id(request_payload)}:{uuid.uuid4().hex[:8]}"
         row = {

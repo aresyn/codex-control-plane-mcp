@@ -548,7 +548,7 @@ Start:
     "project_id": "PROJECT_ID",
     "message": "Prepare an implementation plan. Do not change files yet.",
     "client_request_id": "openclaw:issue-123:plan:v1",
-    "sandbox": "read-only",
+    "sandbox": "workspace-write",
     "approval_policy": "on-request",
     "goal": "Prepare a safe implementation plan for issue 123",
     "goal_completion_action": "clear"
@@ -576,11 +576,16 @@ Approve:
     "workflow_id": "WORKFLOW_ID",
     "client_request_id": "openclaw:issue-123:approve-plan:v1",
     "message": "Implement the approved plan.",
-    "sandbox": "read-only",
+    "sandbox": "workspace-write",
     "approval_policy": "on-request"
   }
 }
 ```
+
+Plan Mode has a sandbox floor. Do not intentionally request `read-only` for
+Plan Mode. If a caller does, MCP raises the effective sandbox to
+`workspace-write` and returns `runtimePolicyAdjusted=true`,
+`requestedSandbox`, and `effectiveSandbox` in workflow status.
 
 Repeated approve for the same workflow must not create a second execution turn.
 OpenClaw should store `executionOperationId` and keep polling the workflow.
@@ -973,6 +978,28 @@ Example:
 `refresh_catalog_and_kb` is a legacy alias. Prefer
 `refresh_catalog_and_history`.
 
+For a failed Plan Mode workflow caused by a bad sandbox or approval policy, use
+`retry_workflow_with_runtime_policy`. It creates a new workflow and links it to
+the old one through `workflowRetryState`.
+
+```json
+{
+  "tool": "codex_repair_issue",
+  "arguments": {
+    "action": "retry_workflow_with_runtime_policy",
+    "workflow_id": "OLD_WORKFLOW_ID",
+    "sandbox": "workspace-write",
+    "approval_policy": "on-request",
+    "client_request_id": "openclaw:issue-123:retry-plan:v1",
+    "reason": "Retry with a writable Plan Mode sandbox.",
+    "dry_run": true
+  }
+}
+```
+
+After a successful dry run, repeat with `dry_run=false`, save `newWorkflowId`,
+and poll the new workflow. Do not try to revive the old terminal turn.
+
 ## App-server status and restart
 
 Check app-server:
@@ -1108,6 +1135,7 @@ Recommendations:
 
 - read-only analysis: `read-only` and `on-request`;
 - untrusted repository: `read-only`;
+- Plan Mode planning: at least `workspace-write`;
 - tasks that may edit files: require explicit user or policy approval;
 - do not change server defaults for one task. Pass per-call overrides.
 

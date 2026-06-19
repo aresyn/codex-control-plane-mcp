@@ -5,6 +5,25 @@ from . import tools as _tools
 globals().update(_tools.__dict__)
 
 
+def _workflow_metadata(workflow: dict[str, Any]) -> dict[str, Any]:
+    try:
+        payload = json.loads(str(workflow.get("metadata_json") or "{}"))
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _workflow_retry_state(workflow: dict[str, Any], metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+    metadata = metadata if isinstance(metadata, dict) else _workflow_metadata(workflow)
+    return {
+        "replacesWorkflowId": metadata.get("replacesWorkflowId"),
+        "replacedByWorkflowId": metadata.get("replacedByWorkflowId"),
+        "retryOfWorkflowId": metadata.get("retryOfWorkflowId"),
+        "retryReason": metadata.get("retryReason"),
+        "retryCreatedAt": metadata.get("retryCreatedAt"),
+    }
+
+
 class WorkflowServiceMixin:
     async def codex_start_plan_workflow(self, args: dict[str, Any]) -> dict[str, Any]:
         client_request_id = _optional_string(args.get("client_request_id"))
@@ -93,6 +112,7 @@ class WorkflowServiceMixin:
                         "title": args.get("title"),
                         "startClientRequestId": client_request_id,
                         "goalConfigured": bool(goal_objective),
+                        "runtimePolicy": start_operation.get("runtimePolicy"),
                     },
                     ensure_ascii=False,
                 ),
@@ -686,6 +706,7 @@ class WorkflowServiceMixin:
                 include_events=include_events,
             )
         workflow = self._sync_workflow_state(workflow, last_messages=last_messages, message_max_chars=message_max_chars)
+        metadata = _workflow_metadata(workflow)
         thread_id = _optional_string(workflow.get("thread_id"))
         thread_refresh = self._refresh_workflow_thread_tracking(workflow, thread_id=thread_id)
         plan_turn_id = _optional_string(workflow.get("plan_turn_id"))
@@ -831,6 +852,10 @@ class WorkflowServiceMixin:
                 (execution_operation or {}).get("updatedAt") if execution_operation else None,
             ]
         )
+        runtime_policy = metadata.get("runtimePolicy")
+        if not isinstance(runtime_policy, dict) and isinstance(plan_operation, dict):
+            runtime_policy = plan_operation.get("runtimePolicy")
+        runtime_policy_fields = _runtime_policy_public_fields(runtime_policy)
         result = {
             "ok": True,
             "workflow_id": workflow_id,
@@ -862,6 +887,7 @@ class WorkflowServiceMixin:
             "latestPlanItemId": workflow.get("latest_plan_item_id"),
             "latestPlanHash": workflow.get("latest_plan_hash"),
             "latestReportHash": workflow.get("latest_report_hash"),
+            "workflowRetryState": _workflow_retry_state(workflow, metadata),
             "planOperation": plan_operation,
             "executionOperation": execution_operation,
             "planTurn": plan_turn,
@@ -881,6 +907,7 @@ class WorkflowServiceMixin:
             "source": source,
             "stalenessSeconds": staleness,
         }
+        result.update(runtime_policy_fields)
         if include_events:
             result["events"] = [_workflow_event_to_tool(row) for row in self.storage.list_workflow_events(workflow_id, limit=20)]
         return result

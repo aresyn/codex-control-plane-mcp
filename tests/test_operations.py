@@ -21,6 +21,57 @@ class PromptDedupTests(unittest.TestCase):
 
 
 class McpDefinitionTests(unittest.TestCase):
+    def test_submit_task_plan_mode_runtime_policy_floor_only_for_plan(self) -> None:
+        async def scenario() -> tuple[dict, dict, list[dict]]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                service = ToolService(_search_service_config(root, root / ".codex" / "state_5.sqlite"))
+                fake = FakeAppServer(service.storage, first_message=None)
+                service._app_server = fake  # type: ignore[assignment]
+                project_id = project_id_for_path(str(project))
+                try:
+                    plan = await service.call(
+                        "codex_submit_task",
+                        {
+                            "operation_type": "start_chat",
+                            "project_id": project_id,
+                            "message": "Prepare a plan through submit task",
+                            "collaboration_mode": "plan",
+                            "sandbox": "read-only",
+                            "client_request_id": "submit-plan-runtime-floor",
+                        },
+                    )
+                    normal = await service.call(
+                        "codex_submit_task",
+                        {
+                            "operation_type": "start_chat",
+                            "project_id": project_id,
+                            "message": "Run a normal read-only task",
+                            "sandbox": "read-only",
+                            "client_request_id": "submit-normal-read-only",
+                        },
+                    )
+                    for _ in range(50):
+                        plan_status = service.codex_get_operation_status({"operation_id": plan["operationId"]})
+                        normal_status = service.codex_get_operation_status({"operation_id": normal["operationId"]})
+                        if plan_status.get("turnId") and normal_status.get("turnId"):
+                            break
+                        await asyncio.sleep(0.01)
+                    return plan, normal, fake.turn_start_calls
+                finally:
+                    await service.close()
+
+        plan, normal, turn_start_calls = asyncio.run(scenario())
+
+        self.assertEqual("workspace-write", plan["effectiveSandbox"])
+        self.assertEqual("read-only", plan["requestedSandbox"])
+        self.assertTrue(plan["runtimePolicyAdjusted"])
+        self.assertNotIn("effectiveSandbox", normal)
+        self.assertEqual({"type": "workspaceWrite"}, turn_start_calls[0]["sandbox_policy"])
+        self.assertEqual({"type": "readOnly"}, turn_start_calls[1]["sandbox_policy"])
+
     def test_operation_status_corrects_premature_completed_when_turn_is_active(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
