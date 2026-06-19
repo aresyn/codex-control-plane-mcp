@@ -435,6 +435,25 @@ class OperationStoreMixin:
                         (now, operation_id),
                     )
                     continue
+                if row["operation_type"] == "fork_thread" and payload.get("_fork_start_attempted") and not row["thread_id"]:
+                    unknown_ids.append(operation_id)
+                    self.connection.execute(
+                        """
+                        UPDATE codex_operations
+                        SET status = 'unknown_after_app_server_exit',
+                            phase = 'unknown_after_app_server_exit',
+                            lease_owner = NULL,
+                            lease_expires_at = NULL,
+                            last_heartbeat_at = NULL,
+                            next_attempt_at = NULL,
+                            last_error = COALESCE(last_error, 'MCP server restarted after thread/fork attempt before forked thread id was persisted.'),
+                            completed_at = ?,
+                            updated_at = ?
+                        WHERE operation_id = ?
+                        """,
+                        (now, now, operation_id),
+                    )
+                    continue
                 if row["operation_type"] == "review_start" and payload.get("_review_start_attempted"):
                     unknown_ids.append(operation_id)
                     self.connection.execute(

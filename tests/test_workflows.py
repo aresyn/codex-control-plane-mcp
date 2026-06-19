@@ -109,7 +109,7 @@ class McpDefinitionTests(unittest.TestCase):
                     }
                 )
 
-                status = service.codex_get_workflow_status({"workflow_id": workflow_id})
+                status = service.codex_get_workflow_status({"workflow_id": workflow_id, "refresh_live": True})
                 observation = status["workflowObservation"]
                 self.assertEqual("plan_candidate_found", status["phase"])
                 self.assertEqual("adopt_candidate_plan", status["nextRecommendedAction"])
@@ -252,6 +252,11 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertEqual("executing", executing["phase"])
         self.assertEqual("wait_execution", executing["nextRecommendedAction"])
         self.assertTrue(repeated_execute["idempotent"])
+        self.assertEqual("2026-05-25T00:00:01+00:00", repeated_execute["latestPlan"]["completedAt"])
+        self.assertFalse(str(repeated_execute["latestPlan"]["completedAt"]).startswith("1970-"))
+        self.assertFalse(repeated_execute["latestPlan"].get("timestampCorrected"))
+        self.assertTrue(repeated_execute["planTurn"]["terminalEvidence"]["trusted"])
+        self.assertEqual("2026-05-25T00:00:02+00:00", repeated_execute["planTurn"]["terminalEvidence"]["observedAt"])
         self.assertTrue(compat_execute["idempotent"])
         self.assertEqual("completed", completed["phase"])
         self.assertEqual("read_final_report", completed["nextRecommendedAction"])
@@ -526,7 +531,7 @@ class McpDefinitionTests(unittest.TestCase):
                         completed_at="2026-05-25T00:00:02+00:00",
                         final_message="Plain assistant plan fallback",
                     )
-                    return service.codex_get_workflow_status({"workflow_id": started["workflowId"]})
+                    return service.codex_get_workflow_status({"workflow_id": started["workflowId"], "refresh_live": True})
                 finally:
                     await service.close()
 

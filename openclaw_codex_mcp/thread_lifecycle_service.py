@@ -110,7 +110,7 @@ class ThreadLifecycleServiceMixin:
                     str(operation_id),
                     status="interrupted",
                     phase="interrupted",
-                    last_error="Interrupted by OpenClaw.",
+                    last_error="Interrupted by MCP client request",
                     updated_at=now,
                     completed_at=now,
                 )
@@ -121,7 +121,7 @@ class ThreadLifecycleServiceMixin:
                     str(workflow_id),
                     phase="failed",
                     status="interrupted",
-                    last_error="Interrupted by OpenClaw.",
+                    last_error="Interrupted by MCP client request",
                     updated_at=now,
                     completed_at=now,
                 )

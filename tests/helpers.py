@@ -259,6 +259,7 @@ class FakeAppServer:
         self._turn_counter = 0
         self._fork_counter = 0
         self._review_counter = 0
+        self.thread_fork_failure: Exception | None = None
         self.review_start_failure: Exception | None = None
 
     async def start(self) -> None:
@@ -266,6 +267,16 @@ class FakeAppServer:
 
     async def stop(self) -> None:
         return None
+
+    def status_snapshot(self, include_recent_events: bool = False) -> dict:
+        return {
+            "running": True,
+            "started": True,
+            "pid": 12345,
+            "processGeneration": self.process_generation,
+            "pendingRequests": 0,
+            "activeTurns": [],
+        }
 
     async def thread_resume(self, thread_id: str, cwd: str, timeout_seconds: float | None = 60) -> dict:
         return {"threadId": thread_id}
@@ -278,6 +289,8 @@ class FakeAppServer:
         self._fork_counter += 1
         thread_id = "thread-fork" if self._fork_counter == 1 else f"thread-fork-{self._fork_counter}"
         self.thread_fork_calls.append(dict(kwargs))
+        if self.thread_fork_failure is not None:
+            raise self.thread_fork_failure
         return {
             "thread": {"id": thread_id},
             "cwd": kwargs.get("cwd"),

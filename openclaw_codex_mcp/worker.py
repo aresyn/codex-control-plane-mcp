@@ -104,7 +104,8 @@ class CentralWorker:
                 updated_at=_now_iso(),
             )
             try:
-                result = await self.service.call(command_type, args)
+                timeout_seconds = _worker_command_timeout_seconds(args)
+                result = await asyncio.wait_for(self.service.call(command_type, args), timeout=timeout_seconds)
                 status = "completed" if result.get("ok", True) and not result.get("error") else "failed"
                 self.service.storage.update_worker_command(
                     command_id,
@@ -114,6 +115,29 @@ class CentralWorker:
                     updated_at=_now_iso(),
                     completed_at=_now_iso(),
                     last_error=None if status == "completed" else str((result.get("error") or {}).get("message") or "Worker command failed."),
+                )
+            except asyncio.TimeoutError:
+                LOG.warning("worker command timed out command_id=%s type=%s", command_id, command_type)
+                self.service.storage.update_worker_command(
+                    command_id,
+                    status="running",
+                    result_json=json.dumps(
+                        {
+                            "ok": True,
+                            "commandId": command_id,
+                            "commandType": command_type,
+                            "status": "running",
+                            "commandTimedOut": True,
+                            "nextRecommendedAction": "poll_worker_command",
+                            "recommendedPollAfterSeconds": 5,
+                            "pollRecommended": True,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    worker_id=self.worker_id,
+                    updated_at=_now_iso(),
+                    completed_at=None,
+                    last_error="Worker command timed out before completion.",
                 )
             except Exception as exc:
                 LOG.exception("worker command failed command_id=%s type=%s", command_id, command_type)
@@ -447,6 +471,14 @@ def _operation_consumes_turn_slot(operation: dict[str, Any], request: dict[str, 
     if operation_type == "fork_thread" and not _optional_string(request.get("message")):
         return False
     return True
+
+
+def _worker_command_timeout_seconds(args: dict[str, Any]) -> int:
+    try:
+        value = int(args.get("timeout_seconds"))
+    except (TypeError, ValueError):
+        value = 30
+    return max(1, min(value, 7200))
 
 
 def _count_by(rows: list[dict[str, Any]], predicate: Any) -> int:

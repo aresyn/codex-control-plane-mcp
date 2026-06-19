@@ -159,7 +159,7 @@ class HookHistoryTests(unittest.TestCase):
             )
             service = ToolService(config)
             try:
-                projects = service.codex_list_projects()["projects"]
+                projects = service.codex_list_projects({"include_private_details": True})["projects"]
                 search = service.codex_search_chats({"query": "needle", "limit": 10})
                 status = service.codex_get_chat_status({"chat_id": "hook-thread"})
                 chat = service.codex_get_chat({"chat_id": "hook-thread", "range": {"mode": "all"}, "format": "structured"})

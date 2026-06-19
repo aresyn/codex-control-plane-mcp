@@ -33,6 +33,13 @@ PROGRESS_EVENT_METHODS = {
     "configWarning",
     "guardianWarning",
 }
+ITEM_STATUS_PROGRESS_METHODS = {
+    "item/created",
+    "item/updated",
+    "item/completed",
+    "item/failed",
+    "item/status/updated",
+}
 _SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_\-]{12,}\b"),
     re.compile(r"\bBearer\s+[A-Za-z0-9._\-]{12,}\b", re.IGNORECASE),
@@ -355,6 +362,9 @@ class TurnTracker:
         ]
         plans = [_plan_to_tool(row, message_max_chars) for row in self.storage.get_tracked_turn_plans(turn_id)]
         latest_plan = plans[-1] if plans else None
+        completed_at, completed_corrected = _safe_turn_timestamp(turn.get("completed_at"))
+        updated_at, updated_corrected = _safe_turn_timestamp(turn.get("updated_at"))
+        started_at, started_corrected = _safe_turn_timestamp(turn.get("started_at"))
         result = {
             "ok": True,
             "thread_id": turn["thread_id"],
@@ -369,12 +379,13 @@ class TurnTracker:
             "completion_observed": completion_observed,
             "completionObserved": completion_observed,
             "terminalEvidence": terminal_evidence,
-            "started_at": turn.get("started_at"),
-            "startedAt": turn.get("started_at"),
-            "updated_at": turn.get("updated_at"),
-            "updatedAt": turn.get("updated_at"),
-            "completed_at": turn.get("completed_at"),
-            "completedAt": turn.get("completed_at"),
+            "started_at": started_at,
+            "startedAt": started_at,
+            "updated_at": updated_at,
+            "updatedAt": updated_at,
+            "completed_at": completed_at,
+            "completedAt": completed_at,
+            "timestampCorrected": bool(completed_corrected or updated_corrected or started_corrected),
             "last_messages": messages,
             "latestMessages": messages,
             "hasMore": message_count > len(messages),
@@ -711,8 +722,9 @@ def _payload_params(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _extract_thread_id(payload: dict[str, Any]) -> str | None:
     params = _payload_params(payload)
-    if params.get("threadId"):
-        return str(params["threadId"])
+    for key in ("threadId", "reviewThreadId", "sourceThreadId"):
+        if params.get(key):
+            return str(params[key])
     thread = params.get("thread")
     if isinstance(thread, dict) and thread.get("id"):
         return str(thread["id"])
@@ -721,8 +733,9 @@ def _extract_thread_id(payload: dict[str, Any]) -> str | None:
 
 def _extract_turn_id(payload: dict[str, Any]) -> str | None:
     params = _payload_params(payload)
-    if params.get("turnId"):
-        return str(params["turnId"])
+    for key in ("turnId", "reviewTurnId"):
+        if params.get(key):
+            return str(params[key])
     turn = params.get("turn")
     if isinstance(turn, dict) and turn.get("id"):
         return str(turn["id"])
@@ -804,14 +817,57 @@ def _status_with_final_message(status: Any, final_message: str | None) -> str:
 
 
 def _terminal_evidence(turn: dict[str, Any], status: str) -> dict[str, Any]:
-    completed_at = turn.get("completed_at")
+    completed_at, corrected = _safe_turn_timestamp(turn.get("completed_at"))
     trusted = status in TERMINAL_STATUSES and bool(completed_at)
     return {
         "trusted": trusted,
         "source": "app_server" if trusted else None,
         "method": "turn_lifecycle_event" if trusted else None,
         "observedAt": completed_at if trusted else None,
+        "timestampCorrected": corrected,
     }
+
+
+def _safe_turn_timestamp(value: Any) -> tuple[str | None, bool]:
+    if value in (None, ""):
+        return None, False
+    parsed: datetime | None = None
+    corrected = False
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+        if numeric <= 0:
+            return None, True
+        if numeric > 1e17:
+            seconds = numeric / 1_000_000_000
+        elif numeric > 1e14:
+            seconds = numeric / 1_000_000
+        elif numeric > 1e11:
+            seconds = numeric / 1_000
+        else:
+            seconds = numeric
+        try:
+            parsed = datetime.fromtimestamp(seconds, timezone.utc)
+            corrected = True
+        except (OverflowError, OSError, ValueError):
+            return None, True
+    else:
+        text = str(value).strip()
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            try:
+                return _safe_turn_timestamp(float(text))
+            except ValueError:
+                return None, True
+    if parsed is None:
+        return None, corrected
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+        corrected = True
+    parsed = parsed.astimezone(timezone.utc)
+    if parsed.year < 2020:
+        return None, True
+    return parsed.isoformat(), corrected
 
 
 def _event_error(payload: dict[str, Any]) -> str | None:
@@ -845,7 +901,7 @@ def _progress_event(
     max_chars: int,
 ) -> dict[str, Any] | None:
     method = str(payload.get("method") or "")
-    if method not in PROGRESS_EVENT_METHODS:
+    if not _is_progress_event_method(method):
         return None
     params = _payload_params(payload)
     category = method.replace("/", "_")
@@ -909,6 +965,29 @@ def _progress_event(
             "path": _clean_metadata_string(params.get("path"), max_chars=1000),
             "range": _safe_metadata(params.get("range")),
         }
+    elif _is_command_progress_method(method):
+        category = "command_status"
+        severity = "warning" if "failed" in method.casefold() or "requestapproval" in method.casefold() else "info"
+        text, truncated = _clean_progress_text(_command_progress_text(method, params), max_chars)
+        metadata = _command_progress_metadata(params)
+    elif method.startswith("review/") or method.startswith("item/review"):
+        category = "review_status"
+        status = _optional_str(params.get("status")) or method.rsplit("/", 1)[-1]
+        text, truncated = _clean_progress_text(f"Review event: {status}.", max_chars)
+        metadata = {
+            "itemId": item_id,
+            "status": status,
+            "reviewThreadId": _optional_str(params.get("reviewThreadId")),
+            "reviewTurnId": _optional_str(params.get("reviewTurnId")),
+        }
+    elif method in ITEM_STATUS_PROGRESS_METHODS:
+        item = params.get("item") if isinstance(params.get("item"), dict) else {}
+        item_type = _optional_str(item.get("type")) or _optional_str(params.get("type"))
+        status = _optional_str(params.get("status")) or method.rsplit("/", 1)[-1]
+        category = "item_status"
+        severity = "warning" if status in {"failed", "error"} else "info"
+        text, truncated = _clean_progress_text(f"Item {item_type or 'event'} {status}.", max_chars)
+        metadata = {"itemId": item_id, "itemType": item_type, "status": status}
     else:
         return None
 
@@ -930,6 +1009,47 @@ def _progress_event(
     }
 
 
+def _is_progress_event_method(method: str) -> bool:
+    return (
+        method in PROGRESS_EVENT_METHODS
+        or method in ITEM_STATUS_PROGRESS_METHODS
+        or _is_command_progress_method(method)
+        or method.startswith("review/")
+        or method.startswith("item/review")
+    )
+
+
+def _is_command_progress_method(method: str) -> bool:
+    normalized = method.casefold()
+    return normalized.startswith("item/command") or "commandexecution" in normalized
+
+
+def _command_progress_text(method: str, params: dict[str, Any]) -> str:
+    normalized = method.casefold()
+    if "requestapproval" in normalized:
+        return "Command requested approval."
+    if "failed" in normalized or str(params.get("status") or "").casefold() in {"failed", "error"}:
+        return "Command failed."
+    if "completed" in normalized or str(params.get("status") or "").casefold() in {"completed", "done"}:
+        return "Command completed."
+    if "started" in normalized or "created" in normalized:
+        return "Command started."
+    return "Command status updated."
+
+
+def _command_progress_metadata(params: dict[str, Any]) -> dict[str, Any]:
+    output = params.get("output")
+    output_size = len(output) if isinstance(output, str) else None
+    item = params.get("item") if isinstance(params.get("item"), dict) else {}
+    return {
+        "itemId": _optional_str(params.get("itemId")) or _optional_str(item.get("id")),
+        "status": _optional_str(params.get("status")),
+        "exitCode": _safe_int(params.get("exitCode"), 0) if params.get("exitCode") is not None else None,
+        "durationMs": _safe_int(params.get("durationMs"), 0) if params.get("durationMs") is not None else None,
+        "outputBytes": output_size,
+    }
+
+
 def turn_progress_status_fields(
     storage: McpStorage,
     turn_id: str,
@@ -947,10 +1067,70 @@ def turn_progress_status_fields(
         "progressEvents": [_progress_event_to_tool(row, progress_max_chars) for row in rows],
         "progressEventCount": summary.get("eventCount", 0),
         "latestProgressAt": summary.get("latestProgressAt"),
-        "tokenUsage": token_metadata.get("tokenUsage") if token_metadata else None,
+        "tokenUsage": _compact_token_usage(token_metadata.get("tokenUsage")) if token_metadata else None,
         "modelReroutes": [_model_reroute_to_tool(row, progress_max_chars) for row in summary.get("modelReroutes") or []],
         "warnings": [_progress_event_to_tool(row, progress_max_chars) for row in summary.get("warnings") or []],
     }
+
+
+def _compact_token_usage(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    totals = _collect_token_counts(value)
+    return {
+        "available": bool(totals),
+        "precision": "coarse",
+        "totalTokensBand": _token_count_band(totals.get("totalTokens")),
+        "inputTokensBand": _token_count_band(totals.get("inputTokens")),
+        "outputTokensBand": _token_count_band(totals.get("outputTokens")),
+        "bucketCount": _count_usage_buckets(value),
+        "identityRedacted": True,
+    }
+
+
+def _collect_token_counts(value: Any) -> dict[str, int]:
+    result: dict[str, int] = {}
+    if isinstance(value, dict):
+        for key, raw in value.items():
+            if key in {"totalTokens", "inputTokens", "outputTokens"}:
+                try:
+                    result[key] = max(result.get(key, 0), int(raw))
+                except (TypeError, ValueError):
+                    pass
+            nested = _collect_token_counts(raw)
+            for nested_key, nested_value in nested.items():
+                result[nested_key] = max(result.get(nested_key, 0), nested_value)
+    elif isinstance(value, list):
+        for item in value:
+            nested = _collect_token_counts(item)
+            for nested_key, nested_value in nested.items():
+                result[nested_key] = max(result.get(nested_key, 0), nested_value)
+    return result
+
+
+def _count_usage_buckets(value: Any) -> int:
+    if isinstance(value, dict):
+        count = 1 if any(key in value for key in {"totalTokens", "inputTokens", "outputTokens"}) else 0
+        return count + sum(_count_usage_buckets(item) for item in value.values())
+    if isinstance(value, list):
+        return sum(_count_usage_buckets(item) for item in value)
+    return 0
+
+
+def _token_count_band(value: int | None) -> str | None:
+    if value is None:
+        return None
+    if value <= 0:
+        return "0"
+    if value < 1_000:
+        return "<1k"
+    if value < 10_000:
+        return "1k-10k"
+    if value < 100_000:
+        return "10k-100k"
+    if value < 1_000_000:
+        return "100k-1m"
+    return "1m+"
 
 
 def progress_event_to_tool(row: dict[str, Any], max_chars: int = 2000) -> dict[str, Any]:

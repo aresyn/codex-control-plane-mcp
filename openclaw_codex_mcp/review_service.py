@@ -5,6 +5,35 @@ from . import tools as _tools
 globals().update(_tools.__dict__)
 
 
+def _workflow_operation_queue_state(operation: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(operation, dict):
+        return {"available": False}
+    queue_state = operation.get("queueState") if isinstance(operation.get("queueState"), dict) else {}
+    return {
+        "available": bool(queue_state),
+        "operationId": operation.get("operationId") or operation.get("operation_id"),
+        "operationStatus": operation.get("status"),
+        "queueStatus": queue_state.get("queueStatus"),
+        "queuedReason": queue_state.get("queuedReason"),
+        "workerId": queue_state.get("workerId"),
+        "slotState": operation.get("slotState"),
+        "resourceLockState": operation.get("resourceLockState"),
+    }
+
+
+def _workflow_action_with_queue_pressure(default_action: str, queue_state: dict[str, Any]) -> str:
+    if not queue_state.get("available"):
+        return default_action
+    reason = str(queue_state.get("queuedReason") or "")
+    queue_status = str(queue_state.get("queueStatus") or "")
+    if queue_status == "queued":
+        if reason in {"resource_lock_conflict", "write_project_slot_limit"}:
+            return "wait_for_resource_lock"
+        if reason in {"global_slot_limit", "project_slot_limit", "agent_slot_limit", "thread_slot_limit"}:
+            return "wait_for_worker_slot"
+    return default_action
+
+
 class ReviewServiceMixin:
     def _assert_review_source_ready(self, thread_id: str) -> None:
         active_turn = self._active_turn_for_thread(thread_id)
@@ -487,8 +516,10 @@ class ReviewServiceMixin:
         last_messages: int,
         message_max_chars: int,
         include_events: bool,
+        read_only: bool = False,
     ) -> dict[str, Any]:
-        workflow = self._sync_review_workflow_state(workflow)
+        if not read_only:
+            workflow = self._sync_review_workflow_state(workflow)
         workflow_id = str(workflow["workflow_id"])
         review_operation_id = _optional_string(workflow.get("review_operation_id")) or _optional_string(workflow.get("current_operation_id"))
         review_source_thread_id = _optional_string(workflow.get("review_source_thread_id"))
@@ -500,9 +531,14 @@ class ReviewServiceMixin:
             if review_operation_row is not None
             else None
         )
-        workflow = self._sync_review_workflow_state(self.storage.get_workflow(workflow_id) or workflow)
+        workflow = self.storage.get_workflow(workflow_id) or workflow
         review_source_thread_id = _optional_string(workflow.get("review_source_thread_id")) or review_source_thread_id
-        review_thread_id = _optional_string(workflow.get("review_thread_id")) or _optional_string(workflow.get("thread_id")) or review_thread_id
+        review_thread_id = (
+            _optional_string(workflow.get("review_thread_id"))
+            or _optional_string(workflow.get("thread_id"))
+            or _optional_string((review_operation or {}).get("threadId"))
+            or review_thread_id
+        )
         review_turn_id = _optional_string(workflow.get("review_turn_id")) or _optional_string((review_operation or {}).get("turnId")) or review_turn_id
         review_turn = (
             self._turn_status_or_none(review_turn_id, review_thread_id, last_messages=last_messages, message_max_chars=message_max_chars)
@@ -515,8 +551,14 @@ class ReviewServiceMixin:
             if pending_thread_id
             else []
         )
+        workflow_for_report = dict(workflow)
+        if review_thread_id:
+            workflow_for_report["review_thread_id"] = review_thread_id
+            workflow_for_report["thread_id"] = review_thread_id
+        if review_turn_id:
+            workflow_for_report["review_turn_id"] = review_turn_id
         final_report = self._review_workflow_final_report(
-            workflow,
+            workflow_for_report,
             review_turn=review_turn,
             message_max_chars=message_max_chars,
         )
@@ -531,12 +573,13 @@ class ReviewServiceMixin:
                 last_messages=last_messages,
                 message_max_chars=message_max_chars,
             )
-        review_operation_row = self.storage.get_operation(review_operation_id) if review_operation_id else None
-        review_operation = (
-            self._operation_status_payload(review_operation_row, last_messages=last_messages, message_max_chars=message_max_chars)
-            if review_operation_row is not None
-            else review_operation
-        )
+        if review_operation_id:
+            review_operation_row = self.storage.get_operation(review_operation_id)
+            review_operation = (
+                self._operation_status_payload(review_operation_row, last_messages=last_messages, message_max_chars=message_max_chars)
+                if review_operation_row is not None
+                else None
+            )
         phase, status, last_error = _derive_review_workflow_phase(
             workflow,
             review_turn=review_turn,
@@ -547,7 +590,7 @@ class ReviewServiceMixin:
         completed_at = workflow.get("completed_at")
         if status in {"completed", "failed", "unknown_after_app_server_exit", "interrupted", "cancelled", "canceled"} and not completed_at:
             completed_at = now
-        if phase != workflow.get("phase") or status != workflow.get("status") or last_error != workflow.get("last_error"):
+        if not read_only and (phase != workflow.get("phase") or status != workflow.get("status") or last_error != workflow.get("last_error")):
             self.storage.update_workflow(
                 workflow_id,
                 phase=phase,
@@ -575,6 +618,11 @@ class ReviewServiceMixin:
                 (review_turn or {}).get("updatedAt") or (review_turn or {}).get("updated_at") if review_turn else None,
                 (review_operation or {}).get("updatedAt") if review_operation else None,
             ]
+        )
+        workflow_operation_queue_state = _workflow_operation_queue_state(review_operation)
+        next_recommended_action = _workflow_action_with_queue_pressure(
+            _next_review_workflow_action(phase, status),
+            workflow_operation_queue_state,
         )
         result = {
             "ok": True,
@@ -611,6 +659,7 @@ class ReviewServiceMixin:
             "reviewTarget": review_target,
             "reviewDelivery": workflow.get("review_delivery"),
             "reviewOperation": review_operation,
+            "workflowOperationQueueState": workflow_operation_queue_state,
             "reviewTurn": review_turn,
             "planOperation": None,
             "executionOperation": None,
@@ -621,7 +670,7 @@ class ReviewServiceMixin:
             "finalReport": final_report,
             "threadGoal": self._workflow_goal_status(workflow),
             "pendingInteractions": pending_interactions,
-            "nextRecommendedAction": _next_review_workflow_action(phase, status),
+            "nextRecommendedAction": next_recommended_action,
             "recommendedPollAfterSeconds": _review_workflow_poll_seconds(phase, status),
             "pollRecommended": status not in {"completed", "failed", "unknown_after_app_server_exit", "interrupted", "cancelled", "canceled"},
             "appServerGeneration": self._app_server.process_generation if self._app_server is not None else workflow.get("app_server_generation"),

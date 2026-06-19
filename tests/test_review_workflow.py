@@ -326,3 +326,57 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertEqual([operation_id], recovered["unknownOperationIds"])
         self.assertEqual("unknown_after_app_server_exit", stored["status"])
         self.assertIn("review/start attempt", stored["last_error"])
+
+    def test_review_command_events_surface_as_redacted_progress(self) -> None:
+        async def scenario() -> tuple[dict, dict]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                service = ToolService(_search_service_config(root, root / ".codex" / "state_5.sqlite"))
+                fake = FakeAppServer(service.storage, first_message=None)
+                service._app_server = fake  # type: ignore[assignment]
+                try:
+                    started = await service.call(
+                        "codex_start_review_workflow",
+                        {
+                            "project_id": project_id_for_path(str(project)),
+                            "target_type": "uncommitted_changes",
+                            "client_request_id": "review-progress-1",
+                        },
+                    )
+                    active = started
+                    for _ in range(50):
+                        active = await service.call("codex_get_workflow_status", {"workflow_id": started["workflowId"]})
+                        if active.get("reviewTurnId"):
+                            break
+                        await asyncio.sleep(0.01)
+                    fake.tracker.record_event(
+                        {
+                            "method": "item/commandExecution/completed",
+                            "params": {
+                                "reviewThreadId": active["reviewThreadId"],
+                                "reviewTurnId": active["reviewTurnId"],
+                                "itemId": "cmd-1",
+                                "status": "completed",
+                                "exitCode": 0,
+                                "output": "SECRET DIRECTORY LISTING SHOULD NOT LEAK",
+                            },
+                        },
+                        received_at="2026-05-25T00:00:03+00:00",
+                    )
+                    operation = service.codex_get_operation_status({"operation_id": active["reviewOperationId"]})
+                    turn = service.codex_get_turn_status({"turn_id": active["reviewTurnId"], "thread_id": active["reviewThreadId"]})
+                    return operation, turn
+                finally:
+                    await service.close()
+
+        operation, turn = asyncio.run(scenario())
+
+        self.assertTrue(operation["progressEvents"])
+        self.assertTrue(turn["progressEvents"])
+        event = turn["progressEvents"][0]
+        self.assertEqual("command_status", event["category"])
+        self.assertIn("Command completed", event["text"])
+        serialized = json.dumps(turn, ensure_ascii=False)
+        self.assertNotIn("SECRET DIRECTORY LISTING", serialized)

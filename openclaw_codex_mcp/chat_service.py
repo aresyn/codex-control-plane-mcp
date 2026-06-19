@@ -6,10 +6,48 @@ globals().update(_tools.__dict__)
 
 
 class ChatServiceMixin:
-    def codex_list_projects(self) -> dict[str, Any]:
-        projects = [project.to_tool() for project in self.catalog.list_projects()]
-        LOG.info("list_projects count=%d", len(projects))
-        return _with_budget({"projects": projects}, tool_name="codex_list_projects")
+    def codex_list_projects(self, args: dict[str, Any] | None = None) -> dict[str, Any]:
+        args = args or {}
+        compact = bool(args.get("compact", True))
+        limit = _bounded_int(args.get("limit", 200), 1, 1000)
+        refresh = bool(args.get("refresh", False))
+        include_private_details = bool(args.get("include_private_details", False))
+        root_filters = [path_key(item) for item in (args.get("roots") or []) if str(item or "").strip()]
+        cache_hit = False
+        if refresh:
+            self.catalog.refresh()
+            projects_raw = self.catalog.list_projects()
+        else:
+            projects_raw = self.catalog.load_cached_projects()
+            cache_hit = bool(projects_raw)
+            if not projects_raw:
+                projects_raw = self.catalog.list_projects()
+        if root_filters:
+            projects_raw = [
+                project
+                for project in projects_raw
+                if any(project.normalized_path_key.startswith(root_filter) or path_key(project.path).startswith(root_filter) for root_filter in root_filters)
+            ]
+        total = len(projects_raw)
+        page = projects_raw[:limit]
+        projects = [
+            _project_to_tool(project, compact=compact, include_private_details=include_private_details)
+            for project in page
+        ]
+        LOG.info("list_projects count=%d returned=%d compact=%s cache_hit=%s", total, len(projects), compact, cache_hit)
+        result = {
+            "projects": projects,
+            "totalCount": total,
+            "returnedCount": len(projects),
+            "truncated": total > len(projects),
+            "compact": compact,
+            "cacheState": {
+                "hit": cache_hit,
+                "source": "storage_cache" if cache_hit else "catalog_refresh",
+                "refreshRequested": refresh,
+            },
+        }
+        return _with_budget(result, tool_name="codex_list_projects")
 
     def codex_list_project_chats(self, args: dict[str, Any]) -> dict[str, Any]:
         project_id = _required_string(args, "project_id")
@@ -164,6 +202,10 @@ class ChatServiceMixin:
             },
             "source": "chat_search_fts_index",
         }
+        exhausted = bool((result["index_status"] or {}).get("time_budget_exhausted"))
+        result["nextRecommendedAction"] = "retry_without_refresh_or_increase_budget" if exhausted else "none"
+        result["recommendedPollAfterSeconds"] = 0
+        result["pollRecommended"] = False
         return _with_budget(result, tool_name="codex_search_chats", truncated_fields=["snippets", "title", "last_message_preview"])
 
     def codex_get_chat_status(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -575,4 +617,21 @@ class ChatServiceMixin:
         except Exception:
             LOG.exception("budget audit failed tool=%s", tool_name)
         return result
+
+
+def _project_to_tool(project: Project, *, compact: bool, include_private_details: bool) -> dict[str, Any]:
+    payload = {
+        "project_id": project.project_id,
+        "projectId": project.project_id,
+        "name": project.name,
+        "last_activity_at": project.last_activity_at,
+        "lastActivityAt": project.last_activity_at,
+        "source": project.source
+        if project.source in {"app_server", "sqlite", "transcript_index", "registry", "disk_scan", "hook_history", "kb_history", "mixed"}
+        else "mixed",
+    }
+    if include_private_details or not compact:
+        payload["path"] = project.path
+        payload["normalizedPathKey"] = project.normalized_path_key
+    return payload
 

@@ -54,7 +54,7 @@ from .errors import (
 from .hook_history import HOOK_HISTORY_PREFIX
 from .hook_installer import hook_status as installed_hook_status
 from .logging_utils import get_logger
-from .models import Chat, TranscriptMessage, TranscriptSummary, TranscriptTurn
+from .models import Chat, Project, TranscriptMessage, TranscriptSummary, TranscriptTurn
 from .pending_interactions import PendingInteractionManager, interaction_row_to_tool
 from .plan_quality import classify_plan_artifact, classify_plan_text, plan_candidate_payload, plan_hash_for_text, plan_quality_payload
 from .prompt_dedup import DEFAULT_PROMPT_SIMILARITY_THRESHOLD, normalize_prompt, prompt_hash, prompt_similarity
@@ -112,6 +112,7 @@ WORKER_COMMAND_TOOLS = {
     "codex_unarchive_thread",
     "codex_start_thread_compaction",
     "codex_restart_app_server",
+    "codex_get_runtime_capabilities",
 }
 
 STABLE_OPENCLAW_TOOLS = {
@@ -157,12 +158,28 @@ COMPATIBILITY_TOOLS = {
     "codex_analyze_issue",
 }
 
+CLIENT_MODE_COMPATIBILITY_WRITE_TOOLS = {
+    "codex_start_chat",
+    "codex_send_message",
+    "codex_execute_plan",
+}
+
 
 TOOLS: list[dict[str, Any]] = [
     {
         "name": "codex_list_projects",
         "description": "List known Codex projects from the project registry, MCP hook history, transcript index, and read-only Codex state.",
-        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "compact": {"type": "boolean", "default": True},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 200},
+                "refresh": {"type": "boolean", "default": False},
+                "include_private_details": {"type": "boolean", "default": False},
+                "roots": {"type": "array", "items": {"type": "string"}, "default": []},
+            },
+            "additionalProperties": False,
+        },
     },
     {
         "name": "codex_list_project_chats",
@@ -427,6 +444,11 @@ TOOLS: list[dict[str, Any]] = [
                 "last_messages": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
                 "message_max_chars": {"type": "integer", "minimum": 500, "maximum": 200000, "default": 8000},
                 "include_events": {"type": "boolean", "default": True},
+                "refresh_live": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Reserved explicit live refresh flag. Default polling is passive.",
+                },
                 "refresh_live_goal": {
                     "type": "boolean",
                     "default": False,
@@ -1070,6 +1092,46 @@ class ToolService:
     def _delegates_control_to_worker(self) -> bool:
         return self.config.execution_mode == "client"
 
+    def _should_delegate_compatibility_write(self, name: str, args: dict[str, Any]) -> bool:
+        if name not in CLIENT_MODE_COMPATIBILITY_WRITE_TOOLS:
+            return False
+        if not self._delegates_control_to_worker():
+            return False
+        if bool(args.get("_worker_internal_call")):
+            return False
+        if _optional_string(args.get("_operation_id")) and bool(args.get("_skip_prompt_dedup")):
+            return False
+        return True
+
+    def _delegated_compatibility_write_payload(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(args)
+        if name == "codex_start_chat":
+            payload["operation_type"] = "start_chat"
+        elif name == "codex_send_message":
+            payload["operation_type"] = "send_message"
+        elif name == "codex_execute_plan":
+            if _optional_string(payload.get("workflow_id")) and not bool(payload.get("force", False)):
+                result = self.codex_approve_plan(payload)
+                result["compatibilityDelegated"] = True
+                result["operationSource"] = "compatibility_delegated_to_durable_queue"
+                result.setdefault(
+                    "compatibilityWarning",
+                    "This compatibility workflow write was delegated to the durable approval path because this MCP process runs in client mode.",
+                )
+                return result
+            payload["operation_type"] = "execute_plan"
+            payload.setdefault("message", "Implement the plan.")
+        else:
+            raise invalid_argument(f"Unsupported compatibility write tool: {name}")
+        result = self.codex_submit_task(payload)
+        result["compatibilityDelegated"] = True
+        result["operationSource"] = "compatibility_delegated_to_durable_queue"
+        result.setdefault(
+            "compatibilityWarning",
+            "This compatibility write tool was delegated to the durable worker queue because this MCP process runs in client mode.",
+        )
+        return result
+
     def _enqueue_worker_command(self, tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
         command_id = "cmd_" + uuid.uuid4().hex
         now = _now_iso()
@@ -1082,7 +1144,7 @@ class ToolService:
             created_at=now,
             updated_at=now,
         )
-        return {
+        payload = {
             "ok": True,
             "commandId": command_id,
             "commandType": tool_name,
@@ -1121,6 +1183,15 @@ class ToolService:
                 "Опроси codex_get_worker_command_status по commandId и продолжай только после completed."
             ),
         }
+        if tool_name == "codex_get_runtime_capabilities":
+            payload["refreshCommandId"] = command_id
+            payload["runtimeCapabilities"] = {
+                "status": "refresh_queued",
+                "cacheSource": "worker_command",
+                "workerRuntimeSnapshot": self._worker_runtime_snapshot_for_client(),
+            }
+            payload["cacheState"] = {"hit": False, "source": "worker_command", "refreshQueued": True}
+        return payload
 
     async def close(self) -> None:
         for task in list(self._operation_tasks.values()):
@@ -1215,12 +1286,28 @@ class ToolService:
         if self._can_schedule_inline():
             self._schedule_recoverable_operations()
         try:
-            if self._delegates_control_to_worker() and name in WORKER_COMMAND_TOOLS:
+            if self._should_delegate_compatibility_write(name, args):
+                result = self._delegated_compatibility_write_payload(name, args)
+                LOG.info("call delegated compatibility write name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
+                return result
+            if (
+                self._delegates_control_to_worker()
+                and name == "codex_get_runtime_capabilities"
+                and bool(args.get("refresh", False))
+            ):
+                result = self._enqueue_worker_command(name, args)
+                LOG.info("call delegated name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
+                return result
+            if (
+                self._delegates_control_to_worker()
+                and name in WORKER_COMMAND_TOOLS
+                and name != "codex_get_runtime_capabilities"
+            ):
                 result = self._enqueue_worker_command(name, args)
                 LOG.info("call delegated name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
                 return result
             if name == "codex_list_projects":
-                result = self.codex_list_projects()
+                result = self.codex_list_projects(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
                 return result
             if name == "codex_list_project_chats":
@@ -2232,6 +2319,10 @@ def _operation_row_to_tool(row: dict[str, Any]) -> dict[str, Any]:
             "model": result_fork_state.get("model") or request_payload.get("model"),
             "ephemeral": bool(result_fork_state.get("ephemeral")) or bool(request_payload.get("ephemeral", False)),
             "turnId": result_fork_state.get("turnId") or row.get("turn_id"),
+            "startAttempted": bool(result_fork_state.get("startAttempted")) or bool(request_payload.get("_fork_start_attempted")),
+            "startAttemptedAt": result_fork_state.get("startAttemptedAt") or request_payload.get("_fork_start_attempted_at"),
+            "ambiguous": bool(result_fork_state.get("ambiguous"))
+            or (bool(request_payload.get("_fork_start_attempted")) and not row.get("thread_id") and row.get("status") == "unknown_after_app_server_exit"),
         }
     if row.get("operation_type") == "review_start":
         result_review_state = result_payload.get("reviewState") if isinstance(result_payload.get("reviewState"), dict) else {}
@@ -2592,6 +2683,48 @@ def _future_iso(seconds: int) -> str:
     return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
 
 
+def _safe_codex_timestamp(value: Any) -> tuple[str | None, bool]:
+    if value in (None, ""):
+        return None, False
+    parsed: datetime | None = None
+    corrected = False
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+        if numeric <= 0:
+            return None, True
+        if numeric > 1e17:
+            seconds = numeric / 1_000_000_000
+        elif numeric > 1e14:
+            seconds = numeric / 1_000_000
+        elif numeric > 1e11:
+            seconds = numeric / 1_000
+        else:
+            seconds = numeric
+        try:
+            parsed = datetime.fromtimestamp(seconds, timezone.utc)
+            corrected = True
+        except (OverflowError, OSError, ValueError):
+            return None, True
+    else:
+        text = str(value).strip()
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            try:
+                return _safe_codex_timestamp(float(text))
+            except ValueError:
+                return None, True
+    if parsed is None:
+        return None, corrected
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+        corrected = True
+    parsed = parsed.astimezone(timezone.utc)
+    if parsed.year < 2020:
+        return None, True
+    return parsed.isoformat(), corrected
+
+
 def _chat_to_tool(chat: Chat, *, include_preview: bool, title_max_chars: int, preview_max_chars: int) -> dict[str, Any]:
     payload = chat.to_tool()
     title, title_meta = _truncate_text(payload.get("title"), title_max_chars)
@@ -2615,6 +2748,9 @@ def _pending_interaction_summary(row: dict[str, Any]) -> dict[str, Any]:
 def _plan_row_to_tool(row: dict[str, Any], max_chars: int) -> dict[str, Any]:
     raw_text = str(row.get("text") or "")
     text, meta = _truncate_text(raw_text, max_chars)
+    created_at, created_corrected = _safe_codex_timestamp(row.get("created_at"))
+    updated_at, updated_corrected = _safe_codex_timestamp(row.get("updated_at"))
+    completed_at, completed_corrected = _safe_codex_timestamp(row.get("completed_at"))
     return {
         "item_id": row.get("item_id"),
         "itemId": row.get("item_id"),
@@ -2625,12 +2761,13 @@ def _plan_row_to_tool(row: dict[str, Any], max_chars: int) -> dict[str, Any]:
         "status": row.get("status"),
         "markdown": text,
         "text": text,
-        "created_at": row.get("created_at"),
-        "createdAt": row.get("created_at"),
-        "updated_at": row.get("updated_at"),
-        "updatedAt": row.get("updated_at"),
-        "completed_at": row.get("completed_at"),
-        "completedAt": row.get("completed_at"),
+        "created_at": created_at,
+        "createdAt": created_at,
+        "updated_at": updated_at,
+        "updatedAt": updated_at,
+        "completed_at": completed_at,
+        "completedAt": completed_at,
+        "timestampCorrected": bool(created_corrected or updated_corrected or completed_corrected),
         "truncated": bool(meta.get("truncated")),
         "originalChars": meta.get("original_chars"),
         "planQuality": classify_plan_artifact(raw_text, row.get("payload_json")),

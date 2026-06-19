@@ -47,10 +47,25 @@ class WorkerServiceMixin:
         for entry in entries:
             reason = str(entry.get("queuedReason") or "none")
             reasons[reason] = reasons.get(reason, 0) + 1
+        queued = [entry for entry in entries if entry.get("queueStatus") == "queued"]
+        running = [entry for entry in entries if entry.get("queueStatus") in {"scheduled", "running"} and _queue_entry_consumes_turn_slot(entry)]
+        auxiliary = [entry for entry in entries if entry.get("queueStatus") in {"scheduled", "running"} and not _queue_entry_consumes_turn_slot(entry)]
+        blocked_by_locks = [entry for entry in queued if entry.get("queuedReason") in {"resource_lock_conflict", "write_project_slot_limit"}]
         return {
             "ok": True,
             "executionMode": self.config.execution_mode,
             "count": len(entries),
+            "queueSummary": {
+                "queued": len(queued),
+                "runningTurnOperations": len(running),
+                "auxiliaryOperations": len(auxiliary),
+                "activeTurnSlots": len(running),
+                "blockedByLocks": len(blocked_by_locks),
+            },
+            "queuedOperations": queued,
+            "runningOperations": running,
+            "auxiliaryOperations": auxiliary,
+            "blockedByLocks": blocked_by_locks,
             "queueReasons": reasons,
             "operations": entries,
             "nextRecommendedAction": "wait_for_worker_slot" if entries else "none",
@@ -166,6 +181,16 @@ def _worker_command_row_to_tool(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def _operation_scheduling_row_to_tool(row: dict[str, Any]) -> dict[str, Any]:
+    slot_claim = _json_dict(row.get("slot_claim_json"))
+    if not slot_claim and row.get("queue_status") in {"scheduled", "running"} and _operation_consumes_turn_slot(row, _json_dict(row.get("request_json"))):
+        slot_claim = {
+            "claimed": True,
+            "workerId": row.get("worker_id"),
+            "threadId": row.get("thread_id"),
+            "turnId": row.get("turn_id"),
+            "claimedAt": row.get("scheduled_at"),
+            "source": "derived_from_running_operation",
+        }
     return {
         "operationId": row.get("operation_id"),
         "operationType": row.get("operation_type"),
@@ -176,7 +201,7 @@ def _operation_scheduling_row_to_tool(row: dict[str, Any]) -> dict[str, Any]:
         "estimatedCostClass": row.get("estimated_cost_class"),
         "agentId": row.get("agent_id"),
         "resourceKeys": _json_list(row.get("resource_keys_json")),
-        "slotClaim": _json_dict(row.get("slot_claim_json")),
+        "slotClaim": slot_claim,
         "workerId": row.get("worker_id"),
         "scheduledAt": row.get("scheduled_at"),
         "threadId": row.get("thread_id"),
@@ -185,6 +210,15 @@ def _operation_scheduling_row_to_tool(row: dict[str, Any]) -> dict[str, Any]:
         "cwdKey": path_key(row.get("cwd")) if row.get("cwd") else None,
         "updatedAt": row.get("updated_at"),
     }
+
+
+def _queue_entry_consumes_turn_slot(entry: dict[str, Any]) -> bool:
+    operation_type = str(entry.get("operationType") or "")
+    if operation_type == "steer_turn":
+        return False
+    if operation_type == "fork_thread" and not entry.get("turnId") and not entry.get("slotClaim", {}).get("claimed"):
+        return False
+    return True
 
 
 def _resource_lock_row_to_tool(row: dict[str, Any]) -> dict[str, Any]:

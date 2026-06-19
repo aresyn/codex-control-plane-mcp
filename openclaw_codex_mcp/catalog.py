@@ -173,7 +173,8 @@ class ProjectChatCatalog:
             project_path = canonical_existing_path(record.project_path)
             existing = chats.get(record.thread_id)
             if existing:
-                existing.transcript_path = record.thread_dir
+                if not _chat_has_preferred_history(existing):
+                    existing.transcript_path = record.thread_dir
                 existing.project_id = existing.project_id or (project.project_id if project else None)
                 existing.project_path = existing.project_path or project_path or record.project_path
                 existing.title = existing.title or record.title or record.thread_id[:16]
@@ -221,6 +222,59 @@ class ProjectChatCatalog:
         self._ensure_refreshed()
         return sorted(self.projects.values(), key=lambda item: item.name.casefold())
 
+    def load_cached_projects(self) -> list[Project]:
+        rows = self.storage.connection.execute(
+            """
+            SELECT project_id, name, path, normalized_path_key, created_at,
+                   last_activity_at, source
+              FROM projects
+             ORDER BY lower(name)
+            """
+        ).fetchall()
+        return [
+            Project(
+                project_id=str(row["project_id"]),
+                name=str(row["name"]),
+                path=str(row["path"]),
+                normalized_path_key=str(row["normalized_path_key"]),
+                created_at=row["created_at"],
+                last_activity_at=row["last_activity_at"],
+                source=row["source"],
+            )
+            for row in rows
+        ]
+
+    def load_cached_chats(self) -> None:
+        if self.chats:
+            return
+        rows = self.storage.connection.execute(
+            """
+            SELECT chat_id, thread_id, project_id, project_path, title, transcript_path,
+                   created_at, updated_at, archived, last_message_preview, status,
+                   status_confidence, source
+              FROM chats
+             ORDER BY updated_at DESC
+            """
+        ).fetchall()
+        self.chats = {
+            str(row["chat_id"]): Chat(
+                chat_id=str(row["chat_id"]),
+                thread_id=str(row["thread_id"]),
+                project_id=row["project_id"],
+                project_path=row["project_path"],
+                title=row["title"],
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+                transcript_path=row["transcript_path"],
+                archived=bool(row["archived"]),
+                last_message_preview=row["last_message_preview"],
+                status=row["status"],
+                status_confidence=row["status_confidence"],
+                source=row["source"],
+            )
+            for row in rows
+        }
+
     def get_project(self, project_id: str) -> Project | None:
         self._ensure_refreshed()
         return self.projects.get(project_id)
@@ -251,12 +305,12 @@ class ProjectChatCatalog:
         return self._state_rows_by_thread.get(thread_id)
 
     def locate_transcript(self, chat: Chat) -> str | None:
+        if chat.transcript_path and Path(chat.transcript_path).exists():
+            return chat.transcript_path
         if chat.transcript_path and (
             str(chat.transcript_path).startswith(HOOK_HISTORY_PREFIX)
             or str(chat.transcript_path).startswith("tracked_turn:")
         ):
-            return chat.transcript_path
-        if chat.transcript_path and Path(chat.transcript_path).exists():
             return chat.transcript_path
         hook_thread = self.hook_history.locate_thread(chat.thread_id)
         if hook_thread is not None:
@@ -481,3 +535,8 @@ def _project_source_priority(source: str) -> int:
         "app_server": 60,
         "mixed": 70,
     }.get(source, 0)
+
+
+def _chat_has_preferred_history(chat: Chat) -> bool:
+    transcript = str(chat.transcript_path or "")
+    return transcript.startswith(HOOK_HISTORY_PREFIX) or transcript.startswith("tracked_turn:") or chat.source == "hook_history"

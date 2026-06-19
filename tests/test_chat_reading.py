@@ -138,7 +138,7 @@ class McpDefinitionTests(unittest.TestCase):
             config.allowed_roots = [project]
             service = ToolService(config)
             try:
-                projects = service.codex_list_projects()["projects"]
+                projects = service.codex_list_projects({"include_private_details": True})["projects"]
                 chats = service.codex_list_project_chats({"project_id": "registry-vibe-id", "include_archived": True})["chats"]
                 vibe_project = next(item for item in projects if item["project_id"] == "registry-vibe-id")
                 self.assertEqual("Vibecoding1c", vibe_project["name"])
@@ -261,7 +261,7 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertTrue(repeated["idempotent"])
         self.assertEqual(submitted["operationId"], repeated["operationId"])
         self.assertEqual(1, len(calls))
-        self.assertEqual(6, completed["tokenUsage"]["total"]["totalTokens"])
+        self.assertEqual("<1k", completed["tokenUsage"]["totalTokensBand"])
         self.assertTrue(any(item["category"] == "token_usage" for item in completed["progressEvents"]))
         self.assertEqual("completed", completed["status"])
         self.assertEqual("completed", completed["phase"])
@@ -426,7 +426,7 @@ class McpDefinitionTests(unittest.TestCase):
             config = _search_service_config(root, root / ".codex" / "state_5.sqlite")
             service = ToolService(config)
             try:
-                projects = service.codex_list_projects()["projects"]
+                projects = service.codex_list_projects({"include_private_details": True})["projects"]
                 search = service.codex_search_chats({"query": "needle", "limit": 10})
                 status = service.codex_get_chat_status({"chat_id": "kb-thread"})
                 chat = service.codex_get_chat({"chat_id": "kb-thread", "range": {"mode": "all"}, "format": "structured"})

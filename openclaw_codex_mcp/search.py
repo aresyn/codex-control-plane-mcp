@@ -71,8 +71,14 @@ class SearchIndex:
     def refresh(self, *, include_archived: bool, time_budget_seconds: int) -> SearchIndexStatus:
         started = time.monotonic()
         status = SearchIndexStatus(refreshed=True)
-        if time_budget_seconds > 3 or getattr(self.catalog, "_last_refresh_at", None) is None:
+        if time_budget_seconds > 3:
             self.catalog.refresh()
+        elif getattr(self.catalog, "_last_refresh_at", None) is None:
+            self.catalog.load_cached_chats()
+            if not self.catalog.chats:
+                status.time_budget_exhausted = True
+                status.pending_files = 1
+                return status
         chats = list(self.catalog.chats.values())
         for chat in chats:
             if chat.archived and not include_archived:
@@ -82,6 +88,10 @@ class SearchIndex:
         deadline = time.monotonic() + max(1, time_budget_seconds)
         candidates = [chat for chat in chats if include_archived or not chat.archived]
         for chat in candidates:
+            if time.monotonic() >= deadline:
+                status.time_budget_exhausted = True
+                status.pending_files += 1
+                continue
             transcript = self.catalog.locate_transcript(chat)
             if not transcript:
                 continue
@@ -113,32 +123,6 @@ class SearchIndex:
             self._index_transcript(chat, transcript, size, mtime_ns)
             status.indexed_files += 1
 
-        if status.time_budget_exhausted:
-            for chat in candidates:
-                transcript = self.catalog.locate_transcript(chat)
-                if not transcript:
-                    continue
-                path = Path(transcript) if not transcript.startswith(HOOK_HISTORY_PREFIX) else None
-                try:
-                    if transcript.startswith(HOOK_HISTORY_PREFIX):
-                        thread_id = self.catalog.hook_history.thread_id_from_uri(transcript) or chat.thread_id
-                        fingerprint = self.catalog.hook_history.fingerprint(thread_id)
-                        size = fingerprint.total_size
-                        mtime_ns = fingerprint.max_mtime_ns
-                    elif path is not None and path.is_dir():
-                        fingerprint = self.catalog.kb_history.fingerprint(path)
-                        size = fingerprint.total_size
-                        mtime_ns = fingerprint.max_mtime_ns
-                    elif path is not None:
-                        stat = path.stat()
-                        size = stat.st_size
-                        mtime_ns = stat.st_mtime_ns
-                    else:
-                        continue
-                except OSError:
-                    continue
-                if not self._transcript_checkpoint_is_current(transcript, chat.thread_id, size, mtime_ns):
-                    status.pending_files += 1
         self.storage.commit()
         LOG.info(
             "search refresh done indexed=%d skipped=%d pending=%d exhausted=%s elapsed_ms=%d",

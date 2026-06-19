@@ -396,7 +396,7 @@ class CodexAppServerClient:
 
     async def turn_interrupt(self, *, thread_id: str, turn_id: str, timeout_seconds: float | None = 30) -> dict[str, Any]:
         result = await self.request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id}, timeout_seconds=timeout_seconds)
-        self.tracker.mark_turn_interrupted(turn_id, reason="Interrupted by MCP client.")
+        self.tracker.mark_turn_interrupted(turn_id, reason="Interrupted by MCP client request")
         return result if isinstance(result, dict) else {"result": result}
 
     async def turn_steer(

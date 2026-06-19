@@ -10,9 +10,29 @@ from pathlib import Path
 _CONFIGURED = False
 
 
+class SafeRotatingFileHandler(RotatingFileHandler):
+    """RotatingFileHandler that does not poison MCP stderr on Windows rollover races."""
+
+    def doRollover(self) -> None:  # noqa: N802 - stdlib override
+        try:
+            super().doRollover()
+        except OSError:
+            if self.stream:
+                try:
+                    self.stream.close()
+                except OSError:
+                    pass
+                self.stream = None
+            path = Path(self.baseFilename)
+            self.baseFilename = str(path.with_name(f"{path.stem}-{os.getpid()}{path.suffix}"))
+            if not self.delay:
+                self.stream = self._open()
+
+
 def configure_logging(base_dir: Path | None = None) -> Path:
     """Configure file-only diagnostics without writing anything to MCP stdout."""
     global _CONFIGURED
+    logging.raiseExceptions = False
     base_dir = base_dir or Path.cwd()
     log_path = Path(os.environ.get("CODEX_CONTROL_PLANE_MCP_LOG") or os.environ.get("OPENCLAW_CODEX_MCP_LOG") or (base_dir / "logs" / "server.log"))
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -22,7 +42,7 @@ def configure_logging(base_dir: Path | None = None) -> Path:
     root.propagate = False
 
     if not _CONFIGURED:
-        handler = RotatingFileHandler(log_path, maxBytes=5_000_000, backupCount=5, encoding="utf-8")
+        handler = SafeRotatingFileHandler(log_path, maxBytes=5_000_000, backupCount=5, encoding="utf-8")
         handler.setFormatter(
             logging.Formatter("%(asctime)s %(levelname)s pid=%(process)d %(name)s: %(message)s")
         )

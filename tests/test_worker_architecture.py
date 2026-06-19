@@ -44,6 +44,39 @@ class CentralWorkerArchitectureTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("queued", status["status"])
             self.assertEqual([], fake.turn_start_calls)
 
+    async def test_client_mode_compatibility_start_chat_delegates_to_durable_queue(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "Project"
+            project.mkdir()
+            config = _search_service_config(root, root / ".codex" / "state_5.sqlite")
+            config.execution_mode = "client"
+            service = ToolService(config)
+            fake = FakeAppServer(service.storage, first_message=None)
+            service._app_server = fake  # type: ignore[assignment]
+            try:
+                result = await service.call(
+                    "codex_start_chat",
+                    {
+                        "project_id": project_id_for_path(str(project)),
+                        "message": "compatibility client mode should not start app-server",
+                        "client_request_id": "compat-client-start-chat",
+                    },
+                )
+                app_status = service.codex_get_app_server_status({})
+            finally:
+                await service.close()
+
+            self.assertTrue(result["compatibilityDelegated"])
+            self.assertEqual("compatibility_delegated_to_durable_queue", result["operationSource"])
+            self.assertEqual("queued", result["status"])
+            self.assertEqual("waiting_for_worker", result["queueState"]["queuedReason"])
+            self.assertEqual([], fake.thread_start_calls)
+            self.assertEqual([], fake.turn_start_calls)
+            self.assertEqual("worker_managed", app_status["scope"])
+            self.assertFalse(app_status["running"])
+            self.assertIn("ignoredLocalProcess", app_status)
+
     async def test_worker_respects_global_active_turn_limit(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

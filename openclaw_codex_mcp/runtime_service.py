@@ -48,24 +48,68 @@ class RuntimeServiceMixin:
 
     def codex_get_app_server_status(self, args: dict[str, Any]) -> dict[str, Any]:
         include_recent_events = bool(args.get("include_recent_events", False))
-        if self._app_server is None:
-            if self.config.execution_mode in {"client", "observe"}:
-                worker = _runtime_live_worker_snapshot(self.storage)
-                if worker is not None:
-                    return {
-                        "ok": True,
-                        "running": True,
-                        "started": False,
-                        "scope": "worker_managed",
-                        "workerManaged": True,
-                        "pid": worker.get("pid"),
-                        "workerId": worker.get("worker_id"),
-                        "processGeneration": worker.get("app_server_generation") or 0,
-                        "pendingRequests": 0,
-                        "activeTurns": [],
-                        "codexBinaryPath": str(self.config.codex_binary_path),
-                        "codexBinaryExists": self.config.codex_binary_path.exists(),
+        if self.config.execution_mode in {"client", "observe"}:
+            worker = _runtime_live_worker_snapshot(self.storage)
+            if worker is not None:
+                local_status = (
+                    self._app_server.status_snapshot(include_recent_events=False)
+                    if self._app_server is not None
+                    else None
+                )
+                worker_active_turns = _runtime_worker_active_turns(self.storage)
+                result = {
+                    "ok": True,
+                    "running": True,
+                    "started": False,
+                    "scope": "worker_managed",
+                    "workerManaged": True,
+                    "pid": worker.get("pid"),
+                    "workerId": worker.get("worker_id"),
+                    "processGeneration": worker.get("app_server_generation") or 0,
+                    "pendingRequests": 0,
+                    "activeTurns": worker_active_turns,
+                    "activeTurnCount": len(worker_active_turns),
+                    "appServerReportedActiveTurns": [],
+                    "codexBinaryPath": str(self.config.codex_binary_path),
+                    "codexBinaryExists": self.config.codex_binary_path.exists(),
+                }
+                if local_status is not None:
+                    result["ignoredLocalProcess"] = {
+                        "running": local_status.get("running"),
+                        "pid": local_status.get("pid"),
+                        "processGeneration": local_status.get("processGeneration"),
                     }
+                return result
+            local_status = (
+                self._app_server.status_snapshot(include_recent_events=False)
+                if self._app_server is not None
+                else None
+            )
+            result = {
+                "ok": True,
+                "running": False,
+                "started": False,
+                "scope": "worker_managed",
+                "workerManaged": True,
+                "workerId": None,
+                "pid": None,
+                "processGeneration": 0,
+                "pendingRequests": 0,
+                "activeTurns": [],
+                "activeTurnCount": 0,
+                "appServerReportedActiveTurns": [],
+                "codexBinaryPath": str(self.config.codex_binary_path),
+                "codexBinaryExists": self.config.codex_binary_path.exists(),
+                "warning": "No live worker is registered for this client-mode MCP process.",
+            }
+            if local_status is not None:
+                result["ignoredLocalProcess"] = {
+                    "running": local_status.get("running"),
+                    "pid": local_status.get("pid"),
+                    "processGeneration": local_status.get("processGeneration"),
+                }
+            return result
+        if self._app_server is None:
             return {
                 "ok": True,
                 "running": False,
@@ -126,6 +170,7 @@ class RuntimeServiceMixin:
         app_status_before = self.codex_get_app_server_status({"include_recent_events": False})
         if self.config.execution_mode in {"client", "observe"} and self._app_server is None:
             reason = f"execution_mode={self.config.execution_mode}; live inventory is owned by the worker process"
+            worker_snapshot = self._worker_runtime_snapshot_for_client()
 
             def skip_live_inventory(method: str) -> None:
                 method_results[method] = {"status": "skipped", "reason": reason, "elapsedMs": 0}
@@ -153,6 +198,8 @@ class RuntimeServiceMixin:
             )
             runtime_capabilities = {
                 "status": "passive",
+                "cacheSource": "worker_registry" if worker_snapshot else "none",
+                "workerRuntimeSnapshot": worker_snapshot,
                 "generatedAt": generated_at,
                 "appServer": {
                     "running": app_status_before.get("running"),
@@ -178,6 +225,7 @@ class RuntimeServiceMixin:
                 "runtimeCapabilities": runtime_capabilities,
                 "cacheState": {
                     "hit": False,
+                    "source": "worker_registry" if worker_snapshot else "none",
                     "ageSeconds": 0,
                     "ttlSeconds": RUNTIME_CAPABILITIES_CACHE_TTL_SECONDS,
                     "cacheKey": hashlib.sha256(cache_key.encode("utf-8")).hexdigest(),
@@ -452,10 +500,10 @@ class RuntimeServiceMixin:
             "ok" if (self.config.codex_home / "auth.json").exists() else "warning",
             "Codex auth.json is present." if (self.config.codex_home / "auth.json").exists() else "Codex auth.json was not found.",
         )
-        hook_status = installed_hook_status(codex_home=self.config.codex_home)
+        hook_status = self._hook_history_snapshot()
         add_check(
             "hooks",
-            "ok" if hook_status.get("installed") else "warning",
+            "ok" if hook_status.get("installed") and hook_status.get("dbWritable") else "warning",
             "Codex MCP hooks are installed." if hook_status.get("installed") else "Codex MCP hooks are not installed.",
             hookStatus=hook_status,
         )
@@ -473,10 +521,22 @@ class RuntimeServiceMixin:
         )
         runtime = capabilities.get("runtimeCapabilities") or {}
         account = runtime.get("accountStatus") if isinstance(runtime.get("accountStatus"), dict) else {}
+        auth_file_present = (self.config.codex_home / "auth.json").exists()
+        worker_managed_passive = self.config.execution_mode in {"client", "observe"} and runtime.get("status") in {"passive", "not_collected"}
+        if account.get("authenticated"):
+            account_status = "ok"
+            account_message = "Codex account is authenticated."
+        elif worker_managed_passive and auth_file_present:
+            account_status = "skipped"
+            account_message = "Codex account inventory is worker-managed; auth.json is present, so authentication is unknown from this client process."
+            account = {"authenticated": None, "status": "unknown", "skippedReason": "worker_managed_passive_inventory"}
+        else:
+            account_status = "error"
+            account_message = "Codex account is not authenticated."
         add_check(
             "account",
-            "ok" if account.get("authenticated") else "error",
-            "Codex account is authenticated." if account.get("authenticated") else "Codex account is not authenticated.",
+            account_status,
+            account_message,
             accountStatus=account,
         )
 
@@ -536,6 +596,31 @@ class RuntimeServiceMixin:
         }
         return self._attach_agent_guidance(result, surface="preflight_project_run")
 
+    def _worker_runtime_snapshot_for_client(self) -> dict[str, Any] | None:
+        worker = _runtime_live_worker_snapshot(self.storage)
+        if worker is None:
+            return None
+        heartbeat_age: int | None = None
+        try:
+            heartbeat = datetime.fromisoformat(str(worker.get("last_heartbeat_at") or "").replace("Z", "+00:00"))
+            if heartbeat.tzinfo is None:
+                heartbeat = heartbeat.replace(tzinfo=timezone.utc)
+            heartbeat_age = int((datetime.now(timezone.utc) - heartbeat.astimezone(timezone.utc)).total_seconds())
+        except ValueError:
+            heartbeat_age = None
+        return {
+            "workerId": worker.get("worker_id"),
+            "role": worker.get("role"),
+            "status": worker.get("status"),
+            "pid": worker.get("pid"),
+            "hostname": worker.get("hostname"),
+            "lastHeartbeatAt": worker.get("last_heartbeat_at"),
+            "heartbeatAgeSeconds": heartbeat_age,
+            "activeOperationCount": worker.get("active_operation_count"),
+            "activeTurnCount": worker.get("active_turn_count"),
+            "appServerGeneration": worker.get("app_server_generation"),
+        }
+
 
 def _runtime_live_worker_snapshot(storage: Any) -> dict[str, Any] | None:
     now = datetime.now(timezone.utc)
@@ -551,4 +636,43 @@ def _runtime_live_worker_snapshot(storage: Any) -> dict[str, Any] | None:
         if int((now - heartbeat.astimezone(timezone.utc)).total_seconds()) < 120:
             return row
     return None
+
+
+def _runtime_worker_active_turns(storage: Any) -> list[dict[str, Any]]:
+    rows = storage.connection.execute(
+        """
+        SELECT ops.operation_id, ops.operation_type, ops.status, ops.thread_id, ops.turn_id,
+               ops.project_id, ops.cwd, sched.agent_id, sched.worker_id, turns.status AS turn_status,
+               turns.updated_at AS turn_updated_at
+          FROM codex_operations AS ops
+          LEFT JOIN codex_operation_scheduling AS sched ON sched.operation_id = ops.operation_id
+          LEFT JOIN tracked_turns AS turns ON turns.turn_id = ops.turn_id
+         WHERE sched.queue_status IN ('scheduled', 'running')
+            OR turns.status IN ('running', 'starting', 'waiting_for_approval', 'waiting_for_user_input', 'ready')
+         ORDER BY ops.updated_at DESC
+         LIMIT 100
+        """
+    ).fetchall()
+    active: list[dict[str, Any]] = []
+    for row in rows:
+        operation_type = str(row["operation_type"] or "")
+        if operation_type == "steer_turn":
+            continue
+        if operation_type == "fork_thread" and not row["turn_id"]:
+            continue
+        active.append(
+            {
+                "operationId": row["operation_id"],
+                "operationType": operation_type,
+                "status": row["turn_status"] or row["status"],
+                "operationStatus": row["status"],
+                "threadId": row["thread_id"],
+                "turnId": row["turn_id"],
+                "projectId": row["project_id"],
+                "agentId": row["agent_id"],
+                "workerId": row["worker_id"],
+                "updatedAt": row["turn_updated_at"],
+            }
+        )
+    return active
 

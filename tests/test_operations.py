@@ -552,7 +552,7 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertIn("agent_message_delta", categories)
         self.assertIn("reasoning_summary", categories)
         self.assertIn("diff_updated", categories)
-        self.assertEqual(10, status["tokenUsage"]["total"]["totalTokens"])
+        self.assertEqual("<1k", status["tokenUsage"]["totalTokensBand"])
         self.assertEqual("gpt-5-safe", status["modelReroutes"][0]["toModel"])
         serialized = json.dumps(status, ensure_ascii=False)
         self.assertIn("token=[redacted]", serialized)
@@ -1190,6 +1190,53 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertEqual(first["operationId"], duplicate["error"]["details"]["existingOperationId"])
         self.assertLessEqual(turn_start_count, 1)
 
+    def test_submit_task_allows_active_similar_prompts_with_disjoint_resource_keys(self) -> None:
+        async def scenario() -> tuple[dict, dict]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                state_db = root / ".codex" / "state_5.sqlite"
+                config = _search_service_config(root, state_db)
+                config.execution_mode = "client"
+                service = ToolService(config)
+                project_id = project_id_for_path(str(project))
+                prompt = (
+                    "MCP LIVE TEST / SANDBOX PROJECT / OK TO MODIFY FILES. "
+                    "Create checkpoints, wait, and write final_report.json for scenario parallel template."
+                )
+                try:
+                    first = await service.call(
+                        "codex_submit_task",
+                        {
+                            "operation_type": "start_chat",
+                            "project_id": project_id,
+                            "message": prompt,
+                            "resource_keys": ["area-a"],
+                            "client_request_id": "resource-dedup-a",
+                        },
+                    )
+                    second = await service.call(
+                        "codex_submit_task",
+                        {
+                            "operation_type": "start_chat",
+                            "project_id": project_id,
+                            "message": prompt,
+                            "resource_keys": ["area-b"],
+                            "client_request_id": "resource-dedup-b",
+                        },
+                    )
+                    return first, second
+                finally:
+                    await service.close()
+
+        first, second = asyncio.run(scenario())
+
+        self.assertNotIn("error", second)
+        self.assertNotEqual(first["operationId"], second["operationId"])
+        self.assertEqual("queued", first["status"])
+        self.assertEqual("queued", second["status"])
+
     def test_submit_task_inactive_duplicate_continues_existing_thread(self) -> None:
         async def scenario() -> tuple[dict, dict, dict, list[dict], list[dict]]:
             with TemporaryDirectory() as tmp:
@@ -1555,6 +1602,53 @@ class McpDefinitionTests(unittest.TestCase):
 
         self.assertNotEqual(first["operationId"], second["operationId"])
         self.assertEqual(2, len(fork_calls))
+
+    def test_submit_task_fork_thread_timeout_after_attempt_is_ambiguous_without_retry(self) -> None:
+        async def scenario() -> tuple[dict, dict, dict, int]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                service = ToolService(_search_service_config(root, root / ".codex" / "state_5.sqlite"))
+                fake = FakeAppServer(service.storage, first_message=None)
+                fake.thread_fork_failure = TimeoutError("thread/fork timed out after send")
+                service._app_server = fake  # type: ignore[assignment]
+                try:
+                    fake.tracker.register_turn(
+                        turn_id="turn-source",
+                        thread_id="thread-source",
+                        chat_id="thread-source",
+                        project_id=project_id_for_path(str(project)),
+                        project_path=str(project),
+                    )
+                    submitted = await service.call(
+                        "codex_submit_task",
+                        {
+                            "operation_type": "fork_thread",
+                            "source_thread_id": "thread-source",
+                            "client_request_id": "fork-timeout-client-1",
+                        },
+                    )
+                    ambiguous = submitted
+                    for _ in range(50):
+                        ambiguous = service.codex_get_operation_status({"operation_id": submitted["operationId"]})
+                        if ambiguous.get("status") == "unknown_after_app_server_exit":
+                            break
+                        await asyncio.sleep(0.01)
+                    repeated = service.codex_get_operation_status({"operation_id": submitted["operationId"]})
+                    return submitted, ambiguous, repeated, len(fake.thread_fork_calls)
+                finally:
+                    await service.close()
+
+        submitted, ambiguous, repeated, fork_call_count = asyncio.run(scenario())
+
+        self.assertEqual("fork_thread", submitted["operationType"])
+        self.assertEqual("unknown_after_app_server_exit", ambiguous["status"])
+        self.assertTrue(ambiguous["forkState"]["startAttempted"])
+        self.assertTrue(ambiguous["forkState"]["ambiguous"])
+        self.assertEqual("inspect_diagnostics", ambiguous["nextRecommendedAction"])
+        self.assertEqual("unknown_after_app_server_exit", repeated["status"])
+        self.assertEqual(1, fork_call_count)
 
     def test_submit_task_fork_thread_with_message_starts_turn_in_fork(self) -> None:
         async def scenario() -> tuple[dict, dict, dict, list[dict], list[dict]]:

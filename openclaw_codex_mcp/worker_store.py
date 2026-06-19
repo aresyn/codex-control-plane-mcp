@@ -193,7 +193,8 @@ class WorkerStoreMixin:
         rows = self.connection.execute(
             """
             SELECT sched.*, ops.status AS operation_status, ops.thread_id, ops.turn_id,
-                   ops.project_id, ops.cwd, ops.operation_type, ops.updated_at AS operation_updated_at
+                   ops.project_id, ops.cwd, ops.operation_type, ops.request_json,
+                   ops.updated_at AS operation_updated_at
               FROM codex_operation_scheduling AS sched
               LEFT JOIN codex_operations AS ops ON ops.operation_id = sched.operation_id
              ORDER BY sched.updated_at DESC
@@ -273,6 +274,19 @@ class WorkerStoreMixin:
         self.execute_write_with_retry(
             "DELETE FROM codex_resource_locks WHERE operation_id = ?",
             (operation_id,),
+        )
+
+    def backfill_resource_lock_thread(self, operation_id: str, *, thread_id: str | None, project_id: str | None = None) -> None:
+        if not thread_id:
+            return
+        self.execute_write_with_retry(
+            """
+            UPDATE codex_resource_locks
+               SET thread_id = COALESCE(thread_id, ?),
+                   project_id = COALESCE(project_id, ?)
+             WHERE operation_id = ?
+            """,
+            (thread_id, project_id, operation_id),
         )
 
     def create_worker_command(

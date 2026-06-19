@@ -24,6 +24,35 @@ def _workflow_retry_state(workflow: dict[str, Any], metadata: dict[str, Any] | N
     }
 
 
+def _workflow_operation_queue_state(operation: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(operation, dict):
+        return {"available": False}
+    queue_state = operation.get("queueState") if isinstance(operation.get("queueState"), dict) else {}
+    return {
+        "available": bool(queue_state),
+        "operationId": operation.get("operationId") or operation.get("operation_id"),
+        "operationStatus": operation.get("status"),
+        "queueStatus": queue_state.get("queueStatus"),
+        "queuedReason": queue_state.get("queuedReason"),
+        "workerId": queue_state.get("workerId"),
+        "slotState": operation.get("slotState"),
+        "resourceLockState": operation.get("resourceLockState"),
+    }
+
+
+def _workflow_action_with_queue_pressure(default_action: str, queue_state: dict[str, Any]) -> str:
+    if not queue_state.get("available"):
+        return default_action
+    reason = str(queue_state.get("queuedReason") or "")
+    queue_status = str(queue_state.get("queueStatus") or "")
+    if queue_status == "queued":
+        if reason in {"resource_lock_conflict", "write_project_slot_limit"}:
+            return "wait_for_resource_lock"
+        if reason in {"global_slot_limit", "project_slot_limit", "agent_slot_limit", "thread_slot_limit"}:
+            return "wait_for_worker_slot"
+    return default_action
+
+
 class WorkflowServiceMixin:
     async def codex_start_plan_workflow(self, args: dict[str, Any]) -> dict[str, Any]:
         client_request_id = _optional_string(args.get("client_request_id"))
@@ -151,6 +180,7 @@ class WorkflowServiceMixin:
             last_messages=_bounded_int(args.get("last_messages", 10), 1, 50),
             message_max_chars=_bounded_int(args.get("message_max_chars", 8000), 500, 200000),
             include_events=bool(args.get("include_events", True)),
+            read_only=not bool(args.get("refresh_live", False)),
         )
 
     async def codex_get_workflow_status_async(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -167,6 +197,7 @@ class WorkflowServiceMixin:
             last_messages=last_messages,
             message_max_chars=message_max_chars,
             include_events=include_events,
+            read_only=not bool(args.get("refresh_live", False)),
         )
         if str(workflow.get("workflow_kind") or "") == "code_review" or not refresh_live_goal:
             if isinstance(result.get("threadGoal"), dict):
@@ -609,6 +640,7 @@ class WorkflowServiceMixin:
                 last_messages=10,
                 message_max_chars=_bounded_int(args.get("first_message_max_chars", 8000), 500, 200000),
                 include_events=True,
+                read_only=True,
             )
             status["idempotent"] = True
             status["idempotencyScope"] = "approve"
@@ -619,6 +651,7 @@ class WorkflowServiceMixin:
                 last_messages=10,
                 message_max_chars=_bounded_int(args.get("first_message_max_chars", 8000), 500, 200000),
                 include_events=True,
+                read_only=True,
             )
             status["idempotent"] = True
             status["idempotencyScope"] = "approve"
@@ -703,6 +736,7 @@ class WorkflowServiceMixin:
         last_messages: int,
         message_max_chars: int,
         include_events: bool,
+        read_only: bool = False,
     ) -> dict[str, Any]:
         workflow_id = str(workflow["workflow_id"])
         workflow_kind = _optional_string(workflow.get("workflow_kind")) or "plan_then_execute"
@@ -712,18 +746,28 @@ class WorkflowServiceMixin:
                 last_messages=last_messages,
                 message_max_chars=message_max_chars,
                 include_events=include_events,
+                read_only=read_only,
             )
-        workflow = self._sync_workflow_state(workflow, last_messages=last_messages, message_max_chars=message_max_chars)
+        if not read_only:
+            workflow = self._sync_workflow_state(workflow, last_messages=last_messages, message_max_chars=message_max_chars)
         metadata = _workflow_metadata(workflow)
-        thread_id = _optional_string(workflow.get("thread_id"))
-        thread_refresh = self._refresh_workflow_thread_tracking(workflow, thread_id=thread_id)
-        plan_turn_id = _optional_string(workflow.get("plan_turn_id"))
-        execution_turn_id = _optional_string(workflow.get("execution_turn_id"))
         plan_operation_id = _optional_string(workflow.get("plan_operation_id"))
         execution_operation_id = _optional_string(workflow.get("execution_operation_id"))
         current_operation_id = _optional_string(workflow.get("current_operation_id"))
         plan_operation_row = self.storage.get_operation(plan_operation_id) if plan_operation_id else None
         execution_operation_row = self.storage.get_operation(execution_operation_id) if execution_operation_id else None
+        thread_id = (
+            _optional_string(workflow.get("thread_id"))
+            or _optional_string((execution_operation_row or {}).get("thread_id"))
+            or _optional_string((plan_operation_row or {}).get("thread_id"))
+        )
+        thread_refresh = (
+            {"imported": False, "reason": "passive_polling"}
+            if read_only
+            else self._refresh_workflow_thread_tracking(workflow, thread_id=thread_id)
+        )
+        plan_turn_id = _optional_string(workflow.get("plan_turn_id")) or _optional_string((plan_operation_row or {}).get("turn_id"))
+        execution_turn_id = _optional_string(workflow.get("execution_turn_id")) or _optional_string((execution_operation_row or {}).get("turn_id"))
         plan_operation = (
             self._operation_status_payload(plan_operation_row, last_messages=last_messages, message_max_chars=message_max_chars)
             if plan_operation_row is not None
@@ -745,7 +789,7 @@ class WorkflowServiceMixin:
             else None
         )
         plan_rows = self.storage.get_tracked_turn_plans(plan_turn_id) if plan_turn_id else []
-        if plan_turn_id and not plan_rows and str((plan_turn or {}).get("status") or "") == "completed":
+        if not read_only and plan_turn_id and not plan_rows and str((plan_turn or {}).get("status") or "") == "completed":
             fallback_plan = self._fallback_plan_text_for_completed_turn(
                 turn_id=plan_turn_id,
                 thread_id=thread_id,
@@ -771,10 +815,23 @@ class WorkflowServiceMixin:
                 plan_rows = self.storage.get_tracked_turn_plans(plan_turn_id)
         plans = [_plan_row_to_tool(row, message_max_chars) for row in plan_rows] if plan_turn_id else []
         latest_plan = _latest_plan(plans)
+        if isinstance(plan_operation, dict):
+            plan_operation.pop("finalReport", None)
+            if latest_plan is not None:
+                plan_operation["planArtifactSummary"] = {
+                    "itemId": latest_plan.get("itemId") or latest_plan.get("item_id"),
+                    "turnId": latest_plan.get("turnId") or latest_plan.get("turn_id"),
+                    "planHash": prompt_hash(normalize_prompt(str(latest_plan.get("markdown") or "")))
+                    if str(latest_plan.get("markdown") or "").strip()
+                    else None,
+                    "quality": latest_plan.get("planQuality") or latest_plan.get("quality"),
+                    "text": _truncate_text(latest_plan.get("markdown") or latest_plan.get("text"), min(message_max_chars, 4000))[0],
+                }
         workflow_observation = self._workflow_observation(
             workflow,
             thread_id=thread_id,
             official_plan_turn_id=plan_turn_id,
+            expected_execution_turn_id=execution_turn_id,
             latest_plan=latest_plan,
             thread_refresh=thread_refresh,
             message_max_chars=message_max_chars,
@@ -788,7 +845,7 @@ class WorkflowServiceMixin:
                 plan_updates["latest_plan_hash"] = latest_plan_hash
             if latest_plan_item_id and latest_plan_item_id != workflow.get("latest_plan_item_id"):
                 plan_updates["latest_plan_item_id"] = latest_plan_item_id
-        if plan_updates:
+        if plan_updates and not read_only:
             plan_updates["updated_at"] = _now_iso()
             self.storage.update_workflow(workflow_id, **plan_updates)
             workflow = self.storage.get_workflow(workflow_id) or workflow
@@ -822,7 +879,7 @@ class WorkflowServiceMixin:
         completed_at = workflow.get("completed_at")
         if status in {"completed", "failed", "orphaned_after_app_server_exit"} and not completed_at:
             completed_at = now
-        if phase != workflow.get("phase") or status != workflow.get("status") or last_error != workflow.get("last_error"):
+        if not read_only and (phase != workflow.get("phase") or status != workflow.get("status") or last_error != workflow.get("last_error")):
             self.storage.update_workflow(
                 workflow_id,
                 phase=phase,
@@ -864,6 +921,14 @@ class WorkflowServiceMixin:
         if not isinstance(runtime_policy, dict) and isinstance(plan_operation, dict):
             runtime_policy = plan_operation.get("runtimePolicy")
         runtime_policy_fields = _runtime_policy_public_fields(runtime_policy)
+        safe_completed_at, timestamp_corrected = _safe_codex_timestamp(completed_at)
+        workflow_operation_queue_state = _workflow_operation_queue_state(
+            execution_operation if execution_operation is not None else plan_operation
+        )
+        next_recommended_action = _workflow_action_with_queue_pressure(
+            _next_workflow_action(phase),
+            workflow_operation_queue_state,
+        )
         result = {
             "ok": True,
             "workflow_id": workflow_id,
@@ -889,15 +954,17 @@ class WorkflowServiceMixin:
             "lastError": last_error,
             "createdAt": workflow.get("created_at"),
             "updatedAt": workflow.get("updated_at"),
-            "completedAt": completed_at,
+            "completedAt": safe_completed_at,
+            "timestampCorrected": timestamp_corrected,
             "clientRequestId": workflow.get("client_request_id"),
             "executionClientRequestId": workflow.get("execution_client_request_id"),
-            "latestPlanItemId": workflow.get("latest_plan_item_id"),
-            "latestPlanHash": workflow.get("latest_plan_hash"),
+            "latestPlanItemId": workflow.get("latest_plan_item_id") or plan_updates.get("latest_plan_item_id"),
+            "latestPlanHash": workflow.get("latest_plan_hash") or plan_updates.get("latest_plan_hash"),
             "latestReportHash": workflow.get("latest_report_hash"),
             "workflowRetryState": _workflow_retry_state(workflow, metadata),
             "planOperation": plan_operation,
             "executionOperation": execution_operation,
+            "workflowOperationQueueState": workflow_operation_queue_state,
             "planTurn": plan_turn,
             "executionTurn": execution_turn,
             "plans": plans,
@@ -906,7 +973,7 @@ class WorkflowServiceMixin:
             "finalReport": final_report,
             "threadGoal": self._workflow_goal_status(workflow),
             "pendingInteractions": pending_interactions,
-            "nextRecommendedAction": _next_workflow_action(phase),
+            "nextRecommendedAction": next_recommended_action,
             "recommendedPollAfterSeconds": _workflow_poll_seconds(phase),
             "pollRecommended": phase not in {"plan_ready", "plan_needs_review", "plan_candidate_found", "completed", "failed", "orphaned_after_app_server_exit"},
             "appServerGeneration": self._app_server.process_generation
@@ -953,6 +1020,7 @@ class WorkflowServiceMixin:
         *,
         thread_id: str | None,
         official_plan_turn_id: str | None,
+        expected_execution_turn_id: str | None,
         latest_plan: dict[str, Any] | None,
         thread_refresh: dict[str, Any],
         message_max_chars: int,
@@ -1007,6 +1075,7 @@ class WorkflowServiceMixin:
             latest_turn_id
             and official_plan_turn_id
             and latest_turn_id != official_plan_turn_id
+            and latest_turn_id != expected_execution_turn_id
             and (not official_updated or not latest_turn_updated or latest_turn_updated >= official_updated)
         )
         warnings: list[str] = []
@@ -1026,6 +1095,7 @@ class WorkflowServiceMixin:
         return {
             "available": True,
             "officialPlanTurnId": official_plan_turn_id,
+            "expectedExecutionTurnId": expected_execution_turn_id,
             "officialPlanQuality": official_quality,
             "latestThreadTurnId": latest_turn_id,
             "latestThreadStatus": (latest_turn or {}).get("status"),

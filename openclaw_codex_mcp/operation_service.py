@@ -85,6 +85,7 @@ class OperationServiceMixin:
         ignore_submission_id: str | None = None,
         ignore_operation_id: str | None = None,
         strict_hash_only: bool = False,
+        resource_keys: list[str] | None = None,
     ) -> dict[str, Any] | None:
         candidates_by_id: dict[str, tuple[dict[str, Any], float]] = {}
         for row in self.storage.find_prompt_submissions_by_hash(project_path_key, normalized_hash, limit=50):
@@ -111,6 +112,15 @@ class OperationServiceMixin:
             enriched["similarity"] = similarity
             enriched["effective_status"] = effective_status
             enriched["active"] = effective_status in PROMPT_OPERATION_ACTIVE_STATUSES
+            existing_resource_keys = self._operation_resource_keys(_optional_string(row.get("operation_id")))
+            resource_decision = _dedup_resource_key_decision(resource_keys or [], existing_resource_keys)
+            enriched["dedupDecision"] = {
+                "reason": resource_decision["reason"],
+                "resourceKeysCompared": resource_decision["compared"],
+                "resourceKeyOverlap": resource_decision["overlap"],
+            }
+            if enriched["active"] and resource_decision["reason"] == "disjoint_resource_keys":
+                continue
             matches.append(enriched)
 
         if not matches:
@@ -156,8 +166,17 @@ class OperationServiceMixin:
             existingStatus=match.get("effective_status") or match.get("status"),
             duplicateOfSubmissionId=match.get("prompt_submission_id"),
             similarity=round(float(match.get("similarity") or 0), 4),
+            dedupDecision=match.get("dedupDecision"),
             nextRecommendedAction="poll_existing_turn",
         )
+
+    def _operation_resource_keys(self, operation_id: str | None) -> list[str]:
+        if not operation_id:
+            return []
+        scheduling = self.storage.get_operation_scheduling(operation_id)
+        if scheduling is None:
+            return []
+        return _safe_json_list(scheduling.get("resource_keys_json"))
 
     def _create_prompt_submission(
         self,
@@ -217,6 +236,7 @@ class OperationServiceMixin:
         ignore_submission_id: str | None = None,
         ignore_operation_id: str | None = None,
         strict_hash_only: bool = False,
+        resource_keys: list[str] | None = None,
     ) -> dict[str, Any]:
         normalized_prompt = normalize_prompt(dedup_basis)
         normalized_hash = prompt_hash(normalized_prompt)
@@ -227,6 +247,7 @@ class OperationServiceMixin:
             ignore_submission_id=ignore_submission_id,
             ignore_operation_id=ignore_operation_id,
             strict_hash_only=strict_hash_only,
+            resource_keys=resource_keys,
         )
         if match is not None and match.get("active"):
             raise self._duplicate_prompt_error(match)
@@ -318,6 +339,14 @@ class OperationServiceMixin:
                 resolved_chat_id = _optional_string(tracked_turn.get("chat_id")) or source_thread_id
                 resolved_project_id = _optional_string(tracked_turn.get("project_id")) or resolved_project_id
                 resolved_project_path = _optional_string(tracked_turn.get("project_path"))
+
+        if not resolved_project_path:
+            operation = self.storage.get_latest_operation_for_thread(source_thread_id)
+            if operation is not None:
+                source_known = True
+                resolved_chat_id = _optional_string(operation.get("chat_id")) or _optional_string(operation.get("thread_id")) or source_thread_id
+                resolved_project_id = _optional_string(operation.get("project_id")) or resolved_project_id
+                resolved_project_path = _optional_string(operation.get("cwd"))
 
         if not resolved_project_path:
             hook_thread = self.storage.get_hook_thread(source_thread_id)
@@ -510,28 +539,76 @@ class OperationServiceMixin:
         client = await self._app()
         fork_result: dict[str, Any] = {}
         generation: Any = client.process_generation
+        attempted_at = _optional_string(args.get("_fork_start_attempted_at"))
 
         if forked_thread_id:
             fork_result = {"thread": {"id": forked_thread_id}, "cwd": cwd, "recovered": True}
         else:
+            attempted_at = attempted_at or _now_iso()
             if operation_id:
+                request_payload = dict(args)
+                request_payload["_fork_start_attempted"] = True
+                request_payload["_fork_start_attempted_at"] = attempted_at
+                request_payload["_fork_source_thread_id"] = source_thread_id
+                request_payload["_fork_runtime_policy"] = {
+                    "approvalPolicy": approval_policy,
+                    "sandbox": sandbox_mode,
+                    "model": model,
+                    "ephemeral": ephemeral,
+                }
                 self.storage.update_operation(
                     operation_id,
                     status="starting_thread",
                     phase="starting_thread",
+                    request_json=json.dumps(request_payload, ensure_ascii=False, sort_keys=True),
+                    result_json=json.dumps(
+                        {
+                            "ok": True,
+                            "operationType": "fork_thread",
+                            "forkState": {
+                                "accepted": False,
+                                "sourceThreadId": source_thread_id,
+                                "forkedThreadId": None,
+                                "hasInitialMessage": bool(_optional_string(message)),
+                                "cwd": cwd,
+                                "model": model,
+                                "ephemeral": ephemeral,
+                                "turnId": None,
+                                "startAttempted": True,
+                                "startAttemptedAt": attempted_at,
+                                "ambiguous": False,
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
                     updated_at=_now_iso(),
                     app_server_generation=client.process_generation,
                 )
-            fork_result = await client.thread_fork(
-                thread_id=source_thread_id,
-                cwd=cwd,
-                approval_policy=approval_policy,
-                sandbox=sandbox_mode,
-                model=model,
-                config=fork_config,
-                ephemeral=ephemeral,
-                timeout_seconds=timeout_seconds,
-            )
+            try:
+                fork_result = await client.thread_fork(
+                    thread_id=source_thread_id,
+                    cwd=cwd,
+                    approval_policy=approval_policy,
+                    sandbox=sandbox_mode,
+                    model=model,
+                    config=fork_config,
+                    ephemeral=ephemeral,
+                    timeout_seconds=timeout_seconds,
+                )
+            except Exception as exc:
+                if operation_id:
+                    return self._mark_fork_start_unknown_after_attempt(
+                        operation_id=operation_id,
+                        source_thread_id=source_thread_id,
+                        cwd=cwd,
+                        model=model,
+                        ephemeral=ephemeral,
+                        has_initial_message=bool(_optional_string(message)),
+                        attempted_at=attempted_at,
+                        reason=f"Worker lost certainty after thread/fork attempt: {redact_text(str(exc), max_chars=500)}",
+                        generation=client.process_generation,
+                    )
+                raise
             forked_thread_id = _extract_thread_id(fork_result)
             if not forked_thread_id:
                 raise send_failed("thread/fork did not return thread id")
@@ -552,6 +629,9 @@ class OperationServiceMixin:
             "model": model,
             "ephemeral": ephemeral,
             "turnId": None,
+            "startAttempted": bool(attempted_at),
+            "startAttemptedAt": attempted_at,
+            "ambiguous": False,
         }
         base_result = {
             "ok": True,
@@ -635,6 +715,60 @@ class OperationServiceMixin:
                 app_server_generation=combined.get("appServerGeneration") or generation,
             )
         return combined
+
+    def _mark_fork_start_unknown_after_attempt(
+        self,
+        *,
+        operation_id: str,
+        source_thread_id: str | None,
+        cwd: str | None,
+        model: str | None,
+        ephemeral: bool,
+        has_initial_message: bool,
+        attempted_at: str | None,
+        reason: str,
+        generation: Any = None,
+    ) -> dict[str, Any]:
+        now = _now_iso()
+        fork_state = {
+            "accepted": False,
+            "sourceThreadId": source_thread_id,
+            "forkedThreadId": None,
+            "hasInitialMessage": has_initial_message,
+            "cwd": cwd,
+            "model": model,
+            "ephemeral": ephemeral,
+            "turnId": None,
+            "startAttempted": True,
+            "startAttemptedAt": attempted_at,
+            "ambiguous": True,
+        }
+        result = {
+            "ok": True,
+            "accepted": False,
+            "operationType": "fork_thread",
+            "status": "unknown_after_app_server_exit",
+            "phase": "unknown_after_app_server_exit",
+            "sourceThreadId": source_thread_id,
+            "forkState": fork_state,
+            "appServerGeneration": generation,
+            "lastError": reason,
+            "pollRecommended": False,
+            "nextRecommendedAction": "inspect_diagnostics",
+            "recommendedPollAfterSeconds": 0,
+        }
+        self.storage.update_operation(
+            operation_id,
+            status="unknown_after_app_server_exit",
+            phase="unknown_after_app_server_exit",
+            result_json=json.dumps(result, ensure_ascii=False),
+            last_error=reason,
+            completed_at=now,
+            updated_at=now,
+            next_attempt_at=None,
+            app_server_generation=generation,
+        )
+        return result
 
     async def _send_message_resolved(
         self,
@@ -788,6 +922,8 @@ class OperationServiceMixin:
         return response
 
     async def codex_send_message(self, args: dict[str, Any]) -> dict[str, Any]:
+        if self._should_delegate_compatibility_write("codex_send_message", args):
+            return self._delegated_compatibility_write_payload("codex_send_message", args)
         chat_id = _required_string(args, "chat_id")
         message = _required_string(args, "message")
         resolved_thread_id = _optional_string(args.get("_resolved_thread_id"))
@@ -883,6 +1019,8 @@ class OperationServiceMixin:
         )
 
     async def codex_start_chat(self, args: dict[str, Any]) -> dict[str, Any]:
+        if self._should_delegate_compatibility_write("codex_start_chat", args):
+            return self._delegated_compatibility_write_payload("codex_start_chat", args)
         project_id = _required_string(args, "project_id")
         message = _required_string(args, "message")
         project = self.catalog.get_project(project_id)
@@ -1132,6 +1270,8 @@ class OperationServiceMixin:
         return self._attach_agent_guidance(live, surface="turn_status")
 
     async def codex_execute_plan(self, args: dict[str, Any]) -> dict[str, Any]:
+        if self._should_delegate_compatibility_write("codex_execute_plan", args):
+            return self._delegated_compatibility_write_payload("codex_execute_plan", args)
         workflow_id = _optional_string(args.get("workflow_id"))
         if workflow_id and not args.get("_operation_id") and not args.get("_skip_prompt_dedup") and not bool(args.get("force", False)):
             return self.codex_approve_plan(args)
@@ -1411,6 +1551,7 @@ class OperationServiceMixin:
                 thread_id=initial_thread_id,
                 workflow_id=_optional_string(args.get("workflow_id")),
                 strict_hash_only=input_item_state is not None,
+                resource_keys=resource_keys,
             )
             prompt_submission_id = _optional_string(dedup.get("promptSubmissionId"))
         if operation_type not in {"steer_turn", "fork_thread"} and dedup.get("action") == "continue_existing_chat":
@@ -1673,6 +1814,24 @@ class OperationServiceMixin:
                         operation.get("thread_id"),
                     )
                     return
+            if (
+                operation_type == "fork_thread"
+                and payload.get("_fork_start_attempted")
+                and not _optional_string(operation.get("thread_id"))
+            ):
+                self._mark_fork_start_unknown_after_attempt(
+                    operation_id=operation_id,
+                    source_thread_id=_optional_string(payload.get("source_thread_id")) or _optional_string(payload.get("_fork_source_thread_id")),
+                    cwd=_optional_string(payload.get("cwd")) or _optional_string(operation.get("cwd")),
+                    model=_optional_string(payload.get("model")),
+                    ephemeral=bool(payload.get("ephemeral", False)),
+                    has_initial_message=bool(_optional_string(payload.get("message"))),
+                    attempted_at=_optional_string(payload.get("_fork_start_attempted_at")),
+                    reason="MCP server restarted after thread/fork attempt before forked thread id was persisted.",
+                    generation=operation.get("app_server_generation"),
+                )
+                LOG.info("operation fork marked unknown after attempted thread/fork operation_id=%s", operation_id)
+                return
             if operation_type == "review_start" and payload.get("_review_start_attempted") and not _optional_string(operation.get("turn_id")):
                 self._mark_review_start_unknown_after_attempt(
                     operation,
@@ -1852,6 +2011,19 @@ class OperationServiceMixin:
                     current,
                     reason=f"Worker lost certainty after review/start attempt: {redact_text(str(exc), max_chars=500)}",
                 )
+            elif str(current.get("operation_type") or "") == "fork_thread" and _operation_request_from_row(current).get("_fork_start_attempted"):
+                fork_payload = _operation_request_from_row(current)
+                self._mark_fork_start_unknown_after_attempt(
+                    operation_id=operation_id,
+                    source_thread_id=_optional_string(fork_payload.get("source_thread_id")) or _optional_string(fork_payload.get("_fork_source_thread_id")),
+                    cwd=_optional_string(current.get("cwd")) or _optional_string(fork_payload.get("cwd")),
+                    model=_optional_string(fork_payload.get("model")),
+                    ephemeral=bool(fork_payload.get("ephemeral", False)),
+                    has_initial_message=bool(_optional_string(fork_payload.get("message"))),
+                    attempted_at=_optional_string(fork_payload.get("_fork_start_attempted_at")),
+                    reason=f"Worker lost certainty after thread/fork attempt: {redact_text(str(exc), max_chars=500)}",
+                    generation=current.get("app_server_generation"),
+                )
             elif str(current.get("operation_type") or "") == "review_start" and _operation_review_start_attempted(current):
                 self.storage.update_operation(
                     operation_id,
@@ -1987,6 +2159,13 @@ class OperationServiceMixin:
         response["operationSource"] = "durable_queue"
         response["lease_state"] = self._operation_lease_state(latest)
         response["leaseState"] = response["lease_state"]
+        if thread_id:
+            with suppress(Exception):
+                self.storage.backfill_resource_lock_thread(
+                    operation_id,
+                    thread_id=thread_id,
+                    project_id=_optional_string(latest.get("project_id")),
+                )
         scheduling = self.storage.get_operation_scheduling(operation_id)
         if scheduling is not None and str(latest.get("status") or "") in OPERATION_TERMINAL_STATUSES:
             if scheduling.get("queue_status") != latest.get("status"):
@@ -2004,6 +2183,17 @@ class OperationServiceMixin:
             worker_id = _optional_string(scheduling.get("worker_id"))
             worker = self.storage.get_worker(worker_id) if worker_id else None
             terminal_queue = str(latest.get("status") or "") in OPERATION_TERMINAL_STATUSES
+            consumes_slot = _operation_consumes_turn_slot_for_status(latest)
+            if not slot_claim and not terminal_queue and scheduling.get("queue_status") in {"scheduled", "running"} and consumes_slot:
+                slot_claim = {
+                    "claimed": True,
+                    "workerId": worker_id,
+                    "projectKey": latest.get("project_id") or (path_key(latest.get("cwd")) if latest.get("cwd") else None),
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "claimedAt": scheduling.get("scheduled_at"),
+                    "source": "derived_from_running_operation",
+                }
             response["queueState"] = {
                 "queueStatus": scheduling.get("queue_status"),
                 "queuedReason": scheduling.get("queued_reason"),
@@ -2028,6 +2218,8 @@ class OperationServiceMixin:
                     {
                         "lockKey": row.get("lock_key"),
                         "lockMode": row.get("lock_mode"),
+                        "threadId": row.get("thread_id"),
+                        "projectId": row.get("project_id"),
                         "workerId": row.get("worker_id"),
                         "expiresAt": row.get("expires_at"),
                     }
@@ -2117,9 +2309,21 @@ class OperationServiceMixin:
             if str(latest.get("status") or "") != waiting_status:
                 self.storage.update_operation(operation_id, status=waiting_status, phase=waiting_status, updated_at=_now_iso())
         response["source"] = "live" if turn_status and turn_status.get("source") == "live" else "storage"
-        response["stalenessSeconds"] = _staleness_seconds(str(latest.get("updated_at") or ""))
+        operation_row_age = _staleness_seconds(str(latest.get("updated_at") or ""))
+        response["operationRowAgeSeconds"] = operation_row_age
+        response["stalenessSeconds"] = operation_row_age
+        response["stalenessMeaning"] = "operation_row_age"
+        response["turnFreshness"] = {
+            "lastProgressAgeSeconds": _staleness_seconds(str(response.get("latestProgressAt") or "")),
+            "turnStatusAgeSeconds": _staleness_seconds(str((turn_status or {}).get("updatedAt") or (turn_status or {}).get("updated_at") or "")),
+        }
+        response["workerFreshness"] = {
+            "heartbeatAgeSeconds": (response.get("workerState") or {}).get("stalenessSeconds"),
+        }
         response["nextRecommendedAction"] = _operation_next_action(response)
-        if response.get("queueState", {}).get("queuedReason") in {"resource_lock_conflict", "global_slot_limit", "project_slot_limit", "agent_slot_limit", "thread_slot_limit", "write_project_slot_limit"}:
+        if response.get("queueState", {}).get("queuedReason") in {"resource_lock_conflict", "write_project_slot_limit"}:
+            response["nextRecommendedAction"] = "wait_for_resource_lock"
+        elif response.get("queueState", {}).get("queuedReason") in {"global_slot_limit", "project_slot_limit", "agent_slot_limit", "thread_slot_limit"}:
             response["nextRecommendedAction"] = "wait_for_worker_slot"
         elif response.get("queueState", {}).get("queuedReason") in {"worker_health_degraded", "app_server_backpressure"}:
             response["nextRecommendedAction"] = "inspect_worker_health"
@@ -2144,6 +2348,9 @@ class OperationServiceMixin:
         turn_status: dict[str, Any] | None,
         message_max_chars: int,
     ) -> dict[str, Any] | None:
+        request_payload = _operation_request_from_row(operation)
+        if _is_plan_mode_operation_request(request_payload):
+            return None
         stored: dict[str, Any] | None = None
         try:
             loaded = json.loads(str(operation.get("final_report_json") or "null"))
@@ -2151,7 +2358,6 @@ class OperationServiceMixin:
                 stored = loaded
         except json.JSONDecodeError:
             stored = None
-        request_payload = _operation_request_from_row(operation)
         output_schema_state = request_payload.get("_output_schema_state") if isinstance(request_payload.get("_output_schema_state"), dict) else None
         schema_hash = _optional_string((output_schema_state or {}).get("schemaHash")) or _optional_string(request_payload.get("output_schema_hash"))
         final_text = _optional_string((turn_status or {}).get("finalMessage")) or _optional_string((turn_status or {}).get("final_message"))
@@ -2300,6 +2506,8 @@ class OperationServiceMixin:
                 progress_max_chars=progress_max_chars,
             )
         )
+        if status.get("tokenUsage") is not None:
+            status["tokenUsage"] = _compact_turn_token_usage(status.get("tokenUsage"))
         return status
 
     def _tracked_turn_status(
@@ -2325,6 +2533,10 @@ class OperationServiceMixin:
                 running = process is not None and getattr(process, "returncode", None) is None
                 status["source"] = "live" if running else "storage"
                 status["appServerGeneration"] = getattr(self._app_server, "process_generation", status.get("processGeneration"))
+                status["latestMessages"] = _filter_public_messages(status.get("latestMessages") or status.get("last_messages") or [])
+                status["last_messages"] = status["latestMessages"]
+                if status.get("tokenUsage") is not None:
+                    status["tokenUsage"] = _compact_turn_token_usage(status.get("tokenUsage"))
             return status
         turn = self.storage.get_tracked_turn(turn_id)
         if turn is None:
@@ -2336,6 +2548,7 @@ class OperationServiceMixin:
                 "text": _truncate_text(message.get("text"), message_max_chars)[0],
             }
             for message in self.storage.get_last_tracked_turn_messages(turn_id, last_messages)
+            if _optional_string(message.get("text"))
         ]
         final_message = _truncate_text(turn.get("final_message"), message_max_chars)[0]
         status_value = _turn_status_with_final_message(turn["status"], final_message)
@@ -2423,7 +2636,7 @@ class OperationServiceMixin:
                 "text": _truncate_text(message.text, message_max_chars)[0],
             }
             for message in summary.messages
-            if message.turn_id == turn_id and message.role == "assistant"
+            if message.turn_id == turn_id and message.role == "assistant" and _optional_string(message.text)
         ][-last_messages:]
         chat = self.catalog.get_chat(summary.thread_id or hook_thread_id)
         final_message = _truncate_text(turns_last_assistant(summary.messages, turn_id), message_max_chars)[0]
@@ -2505,7 +2718,7 @@ class OperationServiceMixin:
                 "text": _truncate_text(message.text, message_max_chars)[0],
             }
             for message in summary.messages
-            if message.turn_id == turn_id and message.role == "assistant"
+            if message.turn_id == turn_id and message.role == "assistant" and _optional_string(message.text)
         ][-last_messages:]
         chat = self.catalog.get_chat(summary.thread_id or thread_dir.name)
         final_message = messages[-1]["text"] if messages else None
@@ -2590,6 +2803,117 @@ def _resource_keys_value(value: Any) -> list[str]:
     if len(keys) > 50:
         raise invalid_argument("Too many resource_keys.", maxItems=50, actualItems=len(keys))
     return keys
+
+
+def _dedup_resource_key_decision(current: list[str], existing: list[str]) -> dict[str, Any]:
+    current_set = {str(item).casefold() for item in current if str(item).strip()}
+    existing_set = {str(item).casefold() for item in existing if str(item).strip()}
+    overlap = sorted(current_set & existing_set)
+    compared = bool(current_set and existing_set)
+    if compared and not overlap:
+        reason = "disjoint_resource_keys"
+    elif compared:
+        reason = "overlapping_resource_keys"
+    else:
+        reason = "missing_resource_keys"
+    return {
+        "reason": reason,
+        "compared": compared,
+        "overlap": overlap,
+    }
+
+
+def _operation_consumes_turn_slot_for_status(operation: dict[str, Any]) -> bool:
+    operation_type = str(operation.get("operation_type") or "")
+    request = _operation_request_from_row(operation)
+    if operation_type == "steer_turn":
+        return False
+    if operation_type == "fork_thread" and not _optional_string(request.get("message")):
+        return False
+    return True
+
+
+def _is_plan_mode_operation_request(request: dict[str, Any]) -> bool:
+    collaboration_mode = _optional_string(request.get("collaboration_mode")) or _optional_string(request.get("collaborationMode"))
+    return collaboration_mode == "plan"
+
+
+def _filter_public_messages(messages: Any) -> list[dict[str, Any]]:
+    if not isinstance(messages, list):
+        return []
+    filtered: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        text = _optional_string(message.get("text"))
+        if not text:
+            continue
+        copied = dict(message)
+        copied["text"] = text
+        filtered.append(copied)
+    return filtered
+
+
+def _compact_turn_token_usage(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    if value.get("precision") == "coarse" and "totalTokensBand" in value:
+        return dict(value)
+    totals = _collect_token_counts(value)
+    return {
+        "available": bool(totals),
+        "precision": "coarse",
+        "totalTokensBand": _token_count_band(totals.get("totalTokens")),
+        "inputTokensBand": _token_count_band(totals.get("inputTokens")),
+        "outputTokensBand": _token_count_band(totals.get("outputTokens")),
+        "bucketCount": _count_usage_buckets(value),
+        "identityRedacted": True,
+    }
+
+
+def _collect_token_counts(value: Any) -> dict[str, int]:
+    result: dict[str, int] = {}
+    if isinstance(value, dict):
+        for key, raw in value.items():
+            if key in {"totalTokens", "inputTokens", "outputTokens"}:
+                try:
+                    result[key] = max(result.get(key, 0), int(raw))
+                except (TypeError, ValueError):
+                    pass
+            nested = _collect_token_counts(raw)
+            for nested_key, nested_value in nested.items():
+                result[nested_key] = max(result.get(nested_key, 0), nested_value)
+    elif isinstance(value, list):
+        for item in value:
+            nested = _collect_token_counts(item)
+            for nested_key, nested_value in nested.items():
+                result[nested_key] = max(result.get(nested_key, 0), nested_value)
+    return result
+
+
+def _count_usage_buckets(value: Any) -> int:
+    if isinstance(value, dict):
+        count = 1 if any(key in value for key in {"totalTokens", "inputTokens", "outputTokens"}) else 0
+        return count + sum(_count_usage_buckets(item) for item in value.values())
+    if isinstance(value, list):
+        return sum(_count_usage_buckets(item) for item in value)
+    return 0
+
+
+def _token_count_band(value: int | None) -> str | None:
+    if value is None:
+        return None
+    if value <= 0:
+        return "0"
+    if value < 1_000:
+        return "<1k"
+    if value < 10_000:
+        return "1k-10k"
+    if value < 100_000:
+        return "10k-100k"
+    if value < 1_000_000:
+        return "100k-1m"
+    return "1m+"
 
 
 def _safe_json_dict(value: Any) -> dict[str, Any]:

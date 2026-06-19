@@ -271,6 +271,42 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertEqual(1, len(diagnostics["progressJournal"]["warnings"]))
         self.assertEqual(1, logs["returnedEventCount"])
 
+    def test_analyze_issue_evidence_uses_compact_refs_without_raw_payload(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ToolService(_search_service_config(root, root / ".codex" / "state_5.sqlite"))
+            try:
+                service.storage.record_app_server_event(
+                    "inbound",
+                    {
+                        "method": "item/commandExecution/completed",
+                        "params": {
+                            "threadId": "thread-evidence",
+                            "turnId": "turn-evidence",
+                            "status": "completed",
+                            "output": "RAW DIRECTORY LISTING SHOULD NOT LEAK",
+                            "message": "timeout while reading output",
+                        },
+                    },
+                    datetime.now(timezone.utc).isoformat(),
+                    process_generation=1,
+                )
+                analysis = service.codex_analyze_issue(
+                    {
+                        "thread_id": "thread-evidence",
+                        "turn_id": "turn-evidence",
+                        "problem_text": "timeout",
+                        "include_evidence": True,
+                    }
+                )
+            finally:
+                asyncio.run(service.close())
+
+        serialized = json.dumps(analysis, ensure_ascii=False)
+        self.assertNotIn("RAW DIRECTORY LISTING", serialized)
+        self.assertTrue(analysis["evidenceTruncated"])
+        self.assertIn("findings", analysis)
+
     def test_health_summary_and_operation_diagnostics_correlation(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

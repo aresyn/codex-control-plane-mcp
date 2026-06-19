@@ -20,6 +20,65 @@ def _diagnostic_int_or_none(value: Any) -> int | None:
         return None
 
 
+def _compact_analysis_evidence(analysis: dict[str, Any]) -> bool:
+    truncated = False
+    containers: list[dict[str, Any]] = []
+    containers.extend(item for item in analysis.get("findings") or [] if isinstance(item, dict))
+    root_cause = analysis.get("likelyRootCause")
+    if isinstance(root_cause, dict):
+        containers.append(root_cause)
+    for item in containers:
+        evidence = item.get("evidence")
+        if not isinstance(evidence, list):
+            continue
+        compacted: list[dict[str, Any]] = []
+        for entry in evidence[:10]:
+            compacted_entry, entry_truncated = _compact_evidence_entry(entry)
+            compacted.append(compacted_entry)
+            truncated = truncated or entry_truncated
+        if len(evidence) > len(compacted):
+            truncated = True
+        item["evidence"] = compacted
+        item["evidenceTruncated"] = truncated
+    return truncated
+
+
+def _compact_evidence_entry(entry: Any) -> tuple[dict[str, Any], bool]:
+    if not isinstance(entry, dict):
+        text = redact_text(entry, max_chars=500)
+        return {"kind": "text", "summary": text}, len(str(entry)) > len(text)
+    payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
+    summary_source = (
+        entry.get("message")
+        or entry.get("summary")
+        or entry.get("raw")
+        or payload.get("method")
+        or payload.get("type")
+        or entry.get("method")
+        or entry.get("eventType")
+        or entry.get("category")
+        or ""
+    )
+    summary = redact_text(summary_source, max_chars=500)
+    compact = {
+        "kind": str(entry.get("source") or entry.get("kind") or entry.get("type") or "evidence"),
+        "eventId": entry.get("eventId") or entry.get("id"),
+        "method": entry.get("method") or payload.get("method"),
+        "category": entry.get("category"),
+        "severity": entry.get("severity"),
+        "timestamp": entry.get("timestamp") or entry.get("createdAt") or entry.get("receivedAt"),
+        "operationId": entry.get("operationId") or payload.get("operationId"),
+        "workflowId": entry.get("workflowId") or payload.get("workflowId"),
+        "threadId": entry.get("threadId") or payload.get("threadId") or payload.get("reviewThreadId"),
+        "turnId": entry.get("turnId") or payload.get("turnId") or payload.get("reviewTurnId"),
+        "summary": summary,
+    }
+    compact = {key: value for key, value in compact.items() if value not in (None, "", [])}
+    raw_size = len(json.dumps(entry, ensure_ascii=False, default=str))
+    compact_size = len(json.dumps(compact, ensure_ascii=False, default=str))
+    return compact, raw_size > compact_size or raw_size > 500
+
+
 class DiagnosticServiceMixin:
     def codex_health_summary(self, args: dict[str, Any]) -> dict[str, Any]:
         since_minutes = _bounded_int(args.get("since_minutes", 120), 1, 10080)
@@ -37,6 +96,9 @@ class DiagnosticServiceMixin:
             self.storage.list_stale_operations(stale_before=stale_before, limit=50),
         )[:20]
         premature_terminal_operations = self._premature_terminal_operations(context=context, limit=20)
+        scoped_request = bool(context["operationId"] or context["workflowId"] or context["threadId"] or context["turnId"])
+        check_stale_operations = stale_operations if scoped_request else []
+        check_premature_terminal_operations = premature_terminal_operations if scoped_request else []
         since = _since_iso(since_minutes)
         recent_events = [
             event_to_tool(row, include_payload=False)
@@ -49,24 +111,25 @@ class DiagnosticServiceMixin:
             )
         ]
         recent_errors = _recent_error_events(recent_events)[:max_recent_errors] if bool(args.get("include_recent_errors", True)) else []
-        workflows = [context["workflow"]] if context["workflow"] is not None else self.storage.list_workflows(limit=10)
+        historical_workflows = self.storage.list_workflows(limit=50) if not scoped_request else []
+        workflows = [context["workflow"]] if context["workflow"] is not None else []
         checks = self._diagnostic_checks(
             app_status=app_status,
             pending_interactions=pending,
             workflows=workflows,
             event_pointers=recent_events,
             log_path=_diagnostic_log_path(),
-            stale_operations=stale_operations,
-            premature_terminal_operations=premature_terminal_operations,
+            stale_operations=check_stale_operations,
+            premature_terminal_operations=check_premature_terminal_operations,
         )
         hook_history = self._hook_history_snapshot()
         recommendations = _recommended_actions_from_checks(checks)
-        if stale_operations:
+        if check_stale_operations:
             recommendations.insert(0, "recover_stale_operations")
         next_action = _health_next_action(
             app_status=app_status,
             pending_interactions=pending,
-            stale_operations=stale_operations,
+            stale_operations=check_stale_operations,
             recent_errors=recent_errors,
             checks=checks,
         )
@@ -82,6 +145,20 @@ class DiagnosticServiceMixin:
             if self._runtime_capabilities_cache_at is not None and self._runtime_capabilities_cache is not None
             else None
         )
+        historical_debt = {
+            "staleOperationCount": len(stale_operations),
+            "prematureTerminalOperationCount": len(premature_terminal_operations),
+            "orphanedWorkflowCount": len([row for row in historical_workflows if row and row.get("phase") == "orphaned_after_app_server_exit"]),
+            "staleOperations": [_operation_summary_to_tool(row) for row in stale_operations[:10]],
+            "prematureTerminalOperations": [_operation_summary_to_tool(row) for row in premature_terminal_operations[:10]],
+            "blocksReadiness": scoped_request and bool(stale_operations or premature_terminal_operations),
+            "nextRecommendedAction": "run_targeted_cleanup" if (stale_operations or premature_terminal_operations) else "none",
+            "agentGuidanceText": (
+                "Это исторический долг state DB. Он не должен блокировать новые задачи, пока worker, очередь и app-server сейчас готовы."
+                if (stale_operations or premature_terminal_operations) and not scoped_request
+                else None
+            ),
+        }
         result = {
             "ok": True,
             "generatedAt": generated_at,
@@ -106,6 +183,7 @@ class DiagnosticServiceMixin:
             },
             "activeWork": active_work,
             "stallSupervisor": stall_supervisor,
+            "historicalDebt": historical_debt,
             "staleOperations": [_operation_summary_to_tool(row) for row in stale_operations],
             "prematureTerminalOperations": [_operation_summary_to_tool(row) for row in premature_terminal_operations],
             "recentErrors": recent_errors,
@@ -133,8 +211,8 @@ class DiagnosticServiceMixin:
             },
             "recommendedActions": _unique_strings(recommendations),
             "nextRecommendedAction": next_action,
-            "recommendedPollAfterSeconds": 15 if active_turns or pending or stale_operations else 0,
-            "pollRecommended": bool(active_turns or pending or stale_operations),
+            "recommendedPollAfterSeconds": 15 if active_turns or pending or check_stale_operations else 0,
+            "pollRecommended": bool(active_turns or pending or check_stale_operations),
         }
         return redact_payload(self._attach_agent_guidance(result, surface="health_summary"))
 
@@ -249,7 +327,8 @@ class DiagnosticServiceMixin:
             self.catalog.refresh()
         app_status = self.codex_get_app_server_status({"include_recent_events": True})
         pending = self._pending_interactions_for_diagnostics(context, limit=50)
-        workflows = [workflow] if workflow is not None else self.storage.list_workflows(limit=20)
+        scoped_request = bool(operation_id or workflow_id or thread_id or turn_id)
+        workflows = [workflow] if workflow is not None else ([] if scoped_request else self.storage.list_workflows(limit=20))
         active_work = {
             "pendingRequests": app_status.get("pendingRequests", 0),
             "activeTurns": app_status.get("activeTurns", []),
@@ -282,6 +361,8 @@ class DiagnosticServiceMixin:
             stale_operations=stale_operations,
             premature_terminal_operations=premature_terminal_operations,
         )
+        scoped_checks = checks
+        background_checks: list[dict[str, Any]] = []
         hook_history = self._hook_history_snapshot()
         correlation = self._diagnostic_correlation(context)
         progress_journal = self._progress_journal_snapshot(context, limit=event_limit)
@@ -308,6 +389,8 @@ class DiagnosticServiceMixin:
             "collectedAt": _now_iso(),
             "overallStatus": overall_status(checks),
             "checks": checks,
+            "scopedFindings": scoped_checks,
+            "backgroundFindings": background_checks,
             "filters": {
                 "operationId": operation_id,
                 "workflowId": workflow_id,
@@ -435,7 +518,8 @@ class DiagnosticServiceMixin:
                 "turn_id": args.get("turn_id"),
                 "since_minutes": since_minutes,
                 "include_logs": False,
-                "event_limit": 100,
+                "event_limit": _bounded_int(args.get("event_limit", 50), 1, 100),
+                "timeline_limit": _bounded_int(args.get("timeline_limit", 50), 1, 100),
             }
         )
         logs = self.codex_get_diagnostic_logs(
@@ -445,11 +529,13 @@ class DiagnosticServiceMixin:
                 "thread_id": context.get("filters", {}).get("threadId") or args.get("thread_id"),
                 "turn_id": context.get("filters", {}).get("turnId") or args.get("turn_id"),
                 "since_minutes": since_minutes,
-                "limit": 100,
-                "include_payload": True,
+                "limit": _bounded_int(args.get("event_limit", 50), 1, 100),
+                "max_line_chars": 500,
+                "include_payload": False,
             }
         )
         analysis = analyze_context(problem_text, context, logs)
+        evidence_truncated = _compact_analysis_evidence(analysis)
         diagnosis_id = "diag_" + uuid.uuid4().hex
         created_at = _now_iso()
         if not bool(args.get("include_evidence", True)):
@@ -480,6 +566,7 @@ class DiagnosticServiceMixin:
             "ok": True,
             "diagnosisId": diagnosis_id,
             "createdAt": created_at,
+            "evidenceTruncated": evidence_truncated,
             **analysis,
         }
         return self._attach_agent_guidance(result, surface="analyze_issue")
@@ -1084,12 +1171,16 @@ class DiagnosticServiceMixin:
             "events": install_status.get("events") or {},
             "hooksJson": install_status.get("hooksJson"),
             "configPath": install_status.get("configPath"),
+            "configExists": bool(install_status.get("configExists") or (install_status.get("configPath") and Path(str(install_status.get("configPath"))).exists())),
+            "stateDb": str(self.config.state_db_path),
+            "stateDbExists": self.config.state_db_path.exists(),
             "dbWritable": db_writable,
             "dbError": db_error,
             "threadCount": storage_status["threadCount"],
             "turnCount": storage_status["turnCount"],
             "messageCount": storage_status["messageCount"],
             "lastHookEventAt": storage_status["lastHookEventAt"],
+            "source": "mcp_state_db+codex_hooks_json",
             "warnings": warnings,
         }
 

@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,6 +33,7 @@ class McpStdioClient:
         env.setdefault("PYTHONIOENCODING", "utf-8")
         self.timeout_seconds = timeout_seconds
         self.next_id = 1
+        self._stdout_lines: queue.Queue[str | None] = queue.Queue()
         self.process = subprocess.Popen(
             [sys.executable, "-m", "codex_control_plane_mcp.server"],
             cwd=cwd,
@@ -41,6 +44,18 @@ class McpStdioClient:
             text=True,
             encoding="utf-8",
         )
+        self._stdout_reader = threading.Thread(target=self._read_stdout, daemon=True)
+        self._stdout_reader.start()
+
+    def _read_stdout(self) -> None:
+        if self.process.stdout is None:
+            self._stdout_lines.put(None)
+            return
+        try:
+            for line in self.process.stdout:
+                self._stdout_lines.put(line)
+        finally:
+            self._stdout_lines.put(None)
 
     def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         if self.process.stdin is None or self.process.stdout is None:
@@ -52,13 +67,17 @@ class McpStdioClient:
         self.process.stdin.flush()
         deadline = time.monotonic() + self.timeout_seconds
         while time.monotonic() < deadline:
-            line = self.process.stdout.readline()
-            if not line:
+            remaining = max(0.01, deadline - time.monotonic())
+            try:
+                line = self._stdout_lines.get(timeout=min(0.25, remaining))
+            except queue.Empty:
                 if self.process.poll() is not None:
                     stderr = self.process.stderr.read() if self.process.stderr is not None else ""
                     raise RuntimeError(f"MCP subprocess exited early with code {self.process.returncode}: {stderr}")
-                time.sleep(0.05)
                 continue
+            if line is None:
+                stderr = self.process.stderr.read() if self.process.stderr is not None else ""
+                raise RuntimeError(f"MCP subprocess stdout closed with code {self.process.poll()}: {stderr}")
             try:
                 response = json.loads(line)
             except json.JSONDecodeError as exc:
