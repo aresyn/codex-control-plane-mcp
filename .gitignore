@@ -15,6 +15,7 @@ venv/
 logs/
 state/
 work/
+corrective_action_plan.md
 dist/
 build/
 *.egg-info/

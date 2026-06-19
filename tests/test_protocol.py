@@ -299,6 +299,11 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertEqual(["action_id"], compact_status_schema["required"])
         self.assertNotIn("codex_delete_thread", by_name)
 
+        worker_command_schema = by_name["codex_get_worker_command_status"]["inputSchema"]["properties"]
+        self.assertIn("include_result", worker_command_schema)
+        self.assertTrue(worker_command_schema["include_result"]["default"])
+        self.assertEqual(12000, worker_command_schema["max_result_chars"]["default"])
+
         restart_schema = by_name["codex_restart_app_server"]["inputSchema"]["properties"]
         self.assertIn("force", restart_schema)
 

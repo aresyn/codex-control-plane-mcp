@@ -129,15 +129,35 @@ class WorkerServiceMixin:
         }
 
     def codex_get_worker_command_status(self, args: dict[str, Any]) -> dict[str, Any]:
+        started = time.monotonic()
         command_id = _required_string(args, "command_id")
+        include_result = bool(args.get("include_result", True))
+        max_result_chars = _bounded_int(args.get("max_result_chars", 12000), 0, 200000)
         row = self.storage.get_worker_command(command_id)
         if row is None:
             raise invalid_argument("Worker command was not found.", command_id=command_id)
-        payload = _worker_command_row_to_tool(row)
+        payload = _worker_command_row_to_tool(
+            row,
+            include_result=include_result,
+            max_result_chars=max_result_chars,
+        )
         payload["ok"] = True
         payload["pollRecommended"] = payload.get("status") not in {"completed", "failed", "cancelled", "canceled"}
         payload["recommendedPollAfterSeconds"] = 2 if payload["pollRecommended"] else 0
         payload["nextRecommendedAction"] = "poll_worker_command" if payload["pollRecommended"] else "none"
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        payload["elapsedMs"] = elapsed_ms
+        if elapsed_ms > 2000:
+            payload["slowStatusEndpoint"] = {
+                "code": "slow_status_endpoint",
+                "elapsedMs": elapsed_ms,
+                "toolName": "codex_get_worker_command_status",
+            }
+            LOG.warning(
+                "slow status endpoint name=codex_get_worker_command_status elapsed_ms=%d command_id=%s",
+                elapsed_ms,
+                command_id,
+            )
         return payload
 
 
@@ -163,15 +183,29 @@ def _worker_row_to_tool(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _worker_command_row_to_tool(row: dict[str, Any]) -> dict[str, Any]:
+def _worker_command_row_to_tool(
+    row: dict[str, Any],
+    *,
+    include_result: bool = True,
+    max_result_chars: int = 12000,
+) -> dict[str, Any]:
     request = _json_dict(row.get("request_json"))
-    result = _json_dict(row.get("result_json"))
+    result_payload = _bounded_worker_command_result(
+        row.get("result_json"),
+        include_result=include_result,
+        max_result_chars=max_result_chars,
+    )
     return {
         "commandId": row.get("command_id"),
         "commandType": row.get("command_type"),
         "status": row.get("status"),
         "request": _compact_worker_payload(request),
-        "result": _compact_worker_payload(result) if result else None,
+        "result": result_payload["result"],
+        "resultAvailable": result_payload["resultAvailable"],
+        "resultIncluded": result_payload["resultIncluded"],
+        "resultTruncated": result_payload["resultTruncated"],
+        "resultStoredChars": result_payload["resultStoredChars"],
+        "resultWarning": result_payload["resultWarning"],
         "workerId": row.get("worker_id"),
         "createdAt": row.get("created_at"),
         "updatedAt": row.get("updated_at"),
@@ -262,6 +296,66 @@ def _json_list(value: Any) -> list[Any]:
     except json.JSONDecodeError:
         return []
     return parsed if isinstance(parsed, list) else []
+
+
+def _bounded_worker_command_result(
+    value: Any,
+    *,
+    include_result: bool,
+    max_result_chars: int,
+) -> dict[str, Any]:
+    raw = str(value or "")
+    available = bool(raw)
+    base = {
+        "result": None,
+        "resultAvailable": available,
+        "resultIncluded": False,
+        "resultTruncated": False,
+        "resultStoredChars": len(raw) if available else 0,
+        "resultWarning": None,
+    }
+    if not available:
+        return base
+    if not include_result:
+        base["resultWarning"] = "result_omitted_by_request"
+        return base
+    if max_result_chars <= 0:
+        base["resultTruncated"] = True
+        base["resultWarning"] = "max_result_chars_zero"
+        return base
+    if len(raw) > max_result_chars:
+        base["resultTruncated"] = True
+        base["resultWarning"] = "stored_result_exceeds_max_result_chars"
+        base["result"] = {
+            "truncated": True,
+            "storedChars": len(raw),
+            "maxResultChars": max_result_chars,
+        }
+        return base
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        base["resultWarning"] = "invalid_result_json"
+        base["result"] = {"available": True, "parseError": "invalid_result_json"}
+        base["resultIncluded"] = True
+        return base
+    if not isinstance(parsed, dict):
+        parsed = {"value": parsed}
+    compacted = _compact_worker_payload(parsed)
+    rendered = json.dumps(compacted, ensure_ascii=False, default=str)
+    if len(rendered) > max_result_chars:
+        base["resultTruncated"] = True
+        base["resultWarning"] = "compacted_result_exceeds_max_result_chars"
+        base["result"] = {
+            "truncated": True,
+            "storedChars": len(raw),
+            "compactedChars": len(rendered),
+            "maxResultChars": max_result_chars,
+        }
+        return base
+    base["result"] = compacted
+    base["resultIncluded"] = True
+    return base
 
 
 def _has_live_worker(workers: list[dict[str, Any]]) -> bool:

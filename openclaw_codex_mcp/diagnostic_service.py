@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from . import tools as _tools
+from .active_work import worker_active_turns_snapshot
 
 globals().update(_tools.__dict__)
 
@@ -139,6 +140,7 @@ class DiagnosticServiceMixin:
             "pendingInteractions": pending,
             "activeTurnCount": len(active_turns),
             "pendingInteractionCount": len(pending),
+            "staleActiveRecordsExcluded": app_status.get("staleActiveRecordsExcluded", 0),
         }
         runtime_cache_age = (
             int(time.monotonic() - self._runtime_capabilities_cache_at)
@@ -731,6 +733,12 @@ class DiagnosticServiceMixin:
         ]
 
     def _active_turns_snapshot(self, app_status: dict[str, Any]) -> list[dict[str, Any]]:
+        if app_status.get("workerManaged"):
+            return [
+                redact_payload(item)
+                for item in worker_active_turns_snapshot(self.storage).get("activeTurns", [])
+                if isinstance(item, dict)
+            ]
         rows: list[dict[str, Any]] = []
         seen: set[str] = set()
         for item in app_status.get("activeTurns") or []:

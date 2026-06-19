@@ -868,6 +868,8 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["command_id"],
             "properties": {
                 "command_id": {"type": "string", "minLength": 1},
+                "include_result": {"type": "boolean", "default": True},
+                "max_result_chars": {"type": "integer", "minimum": 0, "maximum": 200000, "default": 12000},
             },
             "additionalProperties": False,
         },

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -304,6 +305,175 @@ class CentralWorkerArchitectureTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(1, terminal_queue["count"])
             self.assertEqual("unknown_after_app_server_exit", cleaned["queue_status"])
 
+    async def test_worker_managed_app_status_excludes_stale_active_records(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_db = root / ".codex" / "state_5.sqlite"
+            config = _search_service_config(root, state_db)
+            config.execution_mode = "client"
+            service = ToolService(config)
+            try:
+                now = datetime.now(timezone.utc).isoformat()
+                service.storage.upsert_worker(
+                    worker_id="worker-live",
+                    role="worker",
+                    status="running",
+                    pid=123,
+                    hostname="host",
+                    config_fingerprint=service._config_fingerprint,
+                    started_at=now,
+                    last_heartbeat_at=now,
+                    app_server_generation=1,
+                )
+                _insert_operation_with_scheduling(
+                    service,
+                    operation_id="op-ready",
+                    status="running",
+                    turn_id="turn-ready",
+                    queue_status="running",
+                    now=now,
+                )
+                service.storage.upsert_tracked_turn(
+                    {
+                        "turn_id": "turn-ready",
+                        "thread_id": "thread-ready",
+                        "chat_id": "thread-ready",
+                        "project_id": "project-id",
+                        "project_path": str(root),
+                        "status": "ready",
+                        "started_at": now,
+                        "updated_at": now,
+                        "completed_at": None,
+                        "first_message_at": None,
+                        "final_message": None,
+                        "last_error": None,
+                        "source": "test",
+                    }
+                )
+                _insert_operation_with_scheduling(
+                    service,
+                    operation_id="op-terminal",
+                    status="completed",
+                    turn_id="turn-terminal-op",
+                    queue_status="running",
+                    now=now,
+                )
+                _insert_operation_with_scheduling(
+                    service,
+                    operation_id="op-terminal-turn",
+                    status="running",
+                    turn_id="turn-done",
+                    queue_status="running",
+                    now=now,
+                )
+                service.storage.upsert_tracked_turn(
+                    {
+                        "turn_id": "turn-done",
+                        "thread_id": "thread-done",
+                        "chat_id": "thread-done",
+                        "project_id": "project-id",
+                        "project_path": str(root),
+                        "status": "completed",
+                        "started_at": now,
+                        "updated_at": now,
+                        "completed_at": now,
+                        "first_message_at": None,
+                        "final_message": "done",
+                        "last_error": None,
+                        "source": "test",
+                    }
+                )
+                _insert_operation_with_scheduling(
+                    service,
+                    operation_id="op-active",
+                    status="running",
+                    turn_id="turn-active",
+                    queue_status="running",
+                    now=now,
+                )
+                service.storage.upsert_tracked_turn(
+                    {
+                        "turn_id": "turn-active",
+                        "thread_id": "thread-active",
+                        "chat_id": "thread-active",
+                        "project_id": "project-id",
+                        "project_path": str(root),
+                        "status": "running",
+                        "started_at": now,
+                        "updated_at": now,
+                        "completed_at": None,
+                        "first_message_at": None,
+                        "final_message": None,
+                        "last_error": None,
+                        "source": "test",
+                    }
+                )
+
+                app_status = service.codex_get_app_server_status({})
+                health = service.codex_health_summary({})
+            finally:
+                await service.close()
+
+            self.assertEqual(1, app_status["activeTurnCount"])
+            self.assertEqual("turn-active", app_status["activeTurns"][0]["turnId"])
+            self.assertGreaterEqual(app_status["staleActiveRecordsExcluded"], 3)
+            self.assertEqual(1, health["activeWork"]["activeTurnCount"])
+            self.assertEqual("turn-active", health["activeWork"]["activeTurns"][0]["turnId"])
+
+    async def test_health_summary_historical_debt_does_not_create_active_work(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_db = root / ".codex" / "state_5.sqlite"
+            config = _search_service_config(root, state_db)
+            config.execution_mode = "client"
+            service = ToolService(config)
+            try:
+                heartbeat_now = datetime.now(timezone.utc).isoformat()
+                stale_time = "2026-05-25T00:00:00+00:00"
+                service.storage.upsert_worker(
+                    worker_id="worker-live",
+                    role="worker",
+                    status="running",
+                    pid=123,
+                    hostname="host",
+                    config_fingerprint=service._config_fingerprint,
+                    started_at=heartbeat_now,
+                    last_heartbeat_at=heartbeat_now,
+                    app_server_generation=1,
+                )
+                _insert_operation_with_scheduling(
+                    service,
+                    operation_id="op-historical-ready",
+                    status="running",
+                    turn_id="turn-historical-ready",
+                    queue_status="running",
+                    now=stale_time,
+                )
+                service.storage.upsert_tracked_turn(
+                    {
+                        "turn_id": "turn-historical-ready",
+                        "thread_id": "thread-historical-ready",
+                        "chat_id": "thread-historical-ready",
+                        "project_id": "project-id",
+                        "project_path": str(root),
+                        "status": "ready",
+                        "started_at": stale_time,
+                        "updated_at": stale_time,
+                        "completed_at": None,
+                        "first_message_at": None,
+                        "final_message": None,
+                        "last_error": None,
+                        "source": "test",
+                    }
+                )
+                health = service.codex_health_summary({"stale_after_minutes": 1})
+            finally:
+                await service.close()
+
+            self.assertEqual(0, health["activeWork"]["activeTurnCount"])
+            self.assertFalse(health["pollRecommended"])
+            self.assertFalse(health["historicalDebt"]["blocksReadiness"])
+
     async def test_worker_status_marks_stale_workers_and_redacts_command_paths(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -349,6 +519,78 @@ class CentralWorkerArchitectureTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("stale", status["workers"][0]["effectiveStatus"])
             self.assertNotIn("secret.jsonl", rendered)
             self.assertTrue(status["recentCommands"][0]["result"]["appServerResult"]["redacted"])
+
+    async def test_worker_command_status_is_bounded_and_can_omit_result(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_db = root / ".codex" / "state_5.sqlite"
+            service = ToolService(_search_service_config(root, state_db))
+            try:
+                now = "2026-06-19T00:00:00+00:00"
+                service.storage.create_worker_command(
+                    command_id="cmd-large",
+                    command_type="codex_get_runtime_capabilities",
+                    status="completed",
+                    request={"toolName": "codex_get_runtime_capabilities", "arguments": {}},
+                    created_at=now,
+                    updated_at=now,
+                )
+                service.storage.update_worker_command(
+                    "cmd-large",
+                    result_json=json.dumps({"ok": True, "payload": "x" * 50000}, ensure_ascii=False),
+                    updated_at=now,
+                    completed_at=now,
+                )
+                omitted = await service.call(
+                    "codex_get_worker_command_status",
+                    {"command_id": "cmd-large", "include_result": False},
+                )
+                truncated = await service.call(
+                    "codex_get_worker_command_status",
+                    {"command_id": "cmd-large", "max_result_chars": 1000},
+                )
+            finally:
+                await service.close()
+
+            self.assertEqual("completed", omitted["status"])
+            self.assertTrue(omitted["resultAvailable"])
+            self.assertFalse(omitted["resultIncluded"])
+            self.assertFalse(omitted["pollRecommended"])
+            self.assertEqual("result_omitted_by_request", omitted["resultWarning"])
+            self.assertTrue(truncated["resultTruncated"])
+            self.assertEqual("stored_result_exceeds_max_result_chars", truncated["resultWarning"])
+            self.assertFalse(truncated["pollRecommended"])
+
+    async def test_worker_command_status_handles_invalid_result_json(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_db = root / ".codex" / "state_5.sqlite"
+            service = ToolService(_search_service_config(root, state_db))
+            try:
+                now = "2026-06-19T00:00:00+00:00"
+                service.storage.create_worker_command(
+                    command_id="cmd-invalid-json",
+                    command_type="codex_get_runtime_capabilities",
+                    status="completed",
+                    request={"toolName": "codex_get_runtime_capabilities", "arguments": {}},
+                    created_at=now,
+                    updated_at=now,
+                )
+                service.storage.update_worker_command(
+                    "cmd-invalid-json",
+                    result_json="{not-json",
+                    updated_at=now,
+                    completed_at=now,
+                )
+                status = await service.call("codex_get_worker_command_status", {"command_id": "cmd-invalid-json"})
+            finally:
+                await service.close()
+
+            self.assertEqual("completed", status["status"])
+            self.assertTrue(status["resultAvailable"])
+            self.assertTrue(status["resultIncluded"])
+            self.assertEqual("invalid_result_json", status["resultWarning"])
+            self.assertEqual("invalid_result_json", status["result"]["parseError"])
 
     async def test_cleanup_releases_locks_for_non_slot_operations(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -588,3 +830,44 @@ async def _wait_for_steer_calls(fake: FakeAppServer, *, expected: int) -> None:
         if len(fake.turn_steer_calls) >= expected:
             return
         await asyncio.sleep(0.01)
+
+
+def _insert_operation_with_scheduling(
+    service: ToolService,
+    *,
+    operation_id: str,
+    status: str,
+    turn_id: str,
+    queue_status: str,
+    now: str,
+) -> None:
+    service.storage.create_operation(
+        {
+            "operation_id": operation_id,
+            "client_request_id": operation_id,
+            "operation_type": "start_chat",
+            "status": status,
+            "phase": status,
+            "project_id": "project-id",
+            "chat_id": "thread-" + turn_id,
+            "thread_id": "thread-" + turn_id,
+            "turn_id": turn_id,
+            "workflow_id": None,
+            "cwd": None,
+            "title": None,
+            "request_json": json.dumps({"message": operation_id}, ensure_ascii=False),
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+    service.storage.upsert_operation_scheduling(
+        operation_id=operation_id,
+        agent_id="agent",
+        priority="normal",
+        estimated_cost_class="normal",
+        resource_keys=[],
+        queue_status=queue_status,
+        queued_reason=None,
+        created_at=now,
+        updated_at=now,
+    )

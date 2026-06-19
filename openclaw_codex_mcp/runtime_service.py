@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from . import tools as _tools
+from .active_work import worker_active_turns_snapshot
 
 globals().update(_tools.__dict__)
 
@@ -56,7 +57,8 @@ class RuntimeServiceMixin:
                     if self._app_server is not None
                     else None
                 )
-                worker_active_turns = _runtime_worker_active_turns(self.storage)
+                active_snapshot = worker_active_turns_snapshot(self.storage)
+                worker_active_turns = active_snapshot["activeTurns"]
                 result = {
                     "ok": True,
                     "running": True,
@@ -69,7 +71,9 @@ class RuntimeServiceMixin:
                     "pendingRequests": 0,
                     "activeTurns": worker_active_turns,
                     "activeTurnCount": len(worker_active_turns),
+                    "workerDerivedActiveTurns": worker_active_turns,
                     "appServerReportedActiveTurns": [],
+                    "staleActiveRecordsExcluded": active_snapshot["staleActiveRecordsExcluded"],
                     "codexBinaryPath": str(self.config.codex_binary_path),
                     "codexBinaryExists": self.config.codex_binary_path.exists(),
                 }
@@ -636,43 +640,3 @@ def _runtime_live_worker_snapshot(storage: Any) -> dict[str, Any] | None:
         if int((now - heartbeat.astimezone(timezone.utc)).total_seconds()) < 120:
             return row
     return None
-
-
-def _runtime_worker_active_turns(storage: Any) -> list[dict[str, Any]]:
-    rows = storage.connection.execute(
-        """
-        SELECT ops.operation_id, ops.operation_type, ops.status, ops.thread_id, ops.turn_id,
-               ops.project_id, ops.cwd, sched.agent_id, sched.worker_id, turns.status AS turn_status,
-               turns.updated_at AS turn_updated_at
-          FROM codex_operations AS ops
-          LEFT JOIN codex_operation_scheduling AS sched ON sched.operation_id = ops.operation_id
-          LEFT JOIN tracked_turns AS turns ON turns.turn_id = ops.turn_id
-         WHERE sched.queue_status IN ('scheduled', 'running')
-            OR turns.status IN ('running', 'starting', 'waiting_for_approval', 'waiting_for_user_input', 'ready')
-         ORDER BY ops.updated_at DESC
-         LIMIT 100
-        """
-    ).fetchall()
-    active: list[dict[str, Any]] = []
-    for row in rows:
-        operation_type = str(row["operation_type"] or "")
-        if operation_type == "steer_turn":
-            continue
-        if operation_type == "fork_thread" and not row["turn_id"]:
-            continue
-        active.append(
-            {
-                "operationId": row["operation_id"],
-                "operationType": operation_type,
-                "status": row["turn_status"] or row["status"],
-                "operationStatus": row["status"],
-                "threadId": row["thread_id"],
-                "turnId": row["turn_id"],
-                "projectId": row["project_id"],
-                "agentId": row["agent_id"],
-                "workerId": row["worker_id"],
-                "updatedAt": row["turn_updated_at"],
-            }
-        )
-    return active
-
