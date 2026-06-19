@@ -2281,22 +2281,53 @@ def _sandbox_value_from_policy(policy: dict[str, Any]) -> str:
     return "read-only"
 
 
+_PLAN_MODE_SANDBOX_RANK = {
+    "read-only": 0,
+    "respect_existing": 0,
+    "workspace-write": 1,
+    "danger-full-access": 2,
+}
+
+
+def _plan_mode_sandbox_floor(default_sandbox_policy: dict[str, Any]) -> str:
+    configured = _sandbox_value_from_policy(default_sandbox_policy)
+    if _PLAN_MODE_SANDBOX_RANK.get(configured, 0) > _PLAN_MODE_SANDBOX_RANK["workspace-write"]:
+        return configured
+    return "workspace-write"
+
+
+def _raise_plan_mode_sandbox_to_floor(requested_sandbox: str, floor: str) -> tuple[str, bool, str | None]:
+    requested_rank = _PLAN_MODE_SANDBOX_RANK.get(requested_sandbox, 0)
+    floor_rank = _PLAN_MODE_SANDBOX_RANK.get(floor, _PLAN_MODE_SANDBOX_RANK["workspace-write"])
+    if requested_rank >= floor_rank:
+        return requested_sandbox, False, None
+    reason = "plan_mode_requires_workspace_write"
+    if floor != "workspace-write":
+        reason = "plan_mode_uses_configured_sandbox_floor"
+    return floor, True, reason
+
+
 def _plan_mode_runtime_policy(
     args: dict[str, Any],
     *,
     default_sandbox_policy: dict[str, Any],
     default_approval_policy: str,
 ) -> dict[str, Any]:
+    sandbox_floor = _plan_mode_sandbox_floor(default_sandbox_policy)
     requested_sandbox = _optional_string(args.get("sandbox")) or _sandbox_value_from_policy(default_sandbox_policy)
     requested_approval = _optional_string(args.get("approval_policy")) or default_approval_policy
-    effective_sandbox = requested_sandbox
-    adjusted = False
-    reason: str | None = None
-    if effective_sandbox in {"read-only", "respect_existing"}:
-        effective_sandbox = "workspace-write"
-        adjusted = True
-        reason = "plan_mode_requires_workspace_write"
+    effective_sandbox, sandbox_adjusted, sandbox_reason = _raise_plan_mode_sandbox_to_floor(requested_sandbox, sandbox_floor)
     effective_approval = _approval_policy_for_start(requested_approval, default_approval_policy)
+    approval_adjusted = False
+    approval_reason: str | None = None
+    if default_approval_policy == "never" and effective_approval != "never":
+        effective_approval = "never"
+        approval_adjusted = True
+        approval_reason = "plan_mode_uses_configured_approval_policy"
+    adjusted = sandbox_adjusted or approval_adjusted
+    reason = sandbox_reason or approval_reason
+    if sandbox_adjusted and approval_adjusted:
+        reason = "plan_mode_uses_configured_runtime_policy"
     return {
         "mode": "plan",
         "requestedSandbox": requested_sandbox,
@@ -2305,7 +2336,9 @@ def _plan_mode_runtime_policy(
         "effectiveApprovalPolicy": effective_approval,
         "runtimePolicyAdjusted": adjusted,
         "adjustmentReason": reason,
-        "sandboxFloor": "workspace-write",
+        "sandboxFloor": sandbox_floor,
+        "sandboxPolicyAdjusted": sandbox_adjusted,
+        "approvalPolicyAdjusted": approval_adjusted,
     }
 
 

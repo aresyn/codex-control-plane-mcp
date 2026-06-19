@@ -339,6 +339,54 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertEqual({"type": "dangerFullAccess"}, turn_start_calls[0]["sandbox_policy"])
         self.assertEqual("never", turn_start_calls[0]["approval_policy"])
 
+    def test_plan_workflow_configured_danger_full_access_overrides_weaker_call_policy(self) -> None:
+        async def scenario() -> tuple[dict, dict, list[dict]]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                config = _search_service_config(root, root / ".codex" / "state_5.sqlite")
+                config.default_sandbox_policy = {"type": "dangerFullAccess"}
+                config.default_approval_policy = "never"
+                service = ToolService(config)
+                fake = FakeAppServer(service.storage, first_message=None)
+                service._app_server = fake  # type: ignore[assignment]
+                try:
+                    started = await service.codex_start_plan_workflow(
+                        {
+                            "project_id": project_id_for_path(str(project)),
+                            "message": "prepare a plan",
+                            "sandbox": "read-only",
+                            "approval_policy": "on-request",
+                            "client_request_id": "workflow-plan-runtime-local-danger-overrides-call",
+                            "first_message_timeout_seconds": 1,
+                        }
+                    )
+                    status = started
+                    for _ in range(50):
+                        status = service.codex_get_workflow_status({"workflow_id": started["workflowId"]})
+                        if status["planTurnId"]:
+                            break
+                        await asyncio.sleep(0.01)
+                    return started, status, fake.turn_start_calls
+                finally:
+                    await service.close()
+
+        started, status, turn_start_calls = asyncio.run(scenario())
+
+        self.assertEqual("read-only", started["requestedSandbox"])
+        self.assertEqual("danger-full-access", started["effectiveSandbox"])
+        self.assertEqual("on-request", started["requestedApprovalPolicy"])
+        self.assertEqual("never", started["effectiveApprovalPolicy"])
+        self.assertEqual("danger-full-access", started["runtimePolicy"]["sandboxFloor"])
+        self.assertTrue(started["runtimePolicyAdjusted"])
+        self.assertTrue(started["runtimePolicy"]["sandboxPolicyAdjusted"])
+        self.assertTrue(started["runtimePolicy"]["approvalPolicyAdjusted"])
+        self.assertEqual("danger-full-access", status["effectiveSandbox"])
+        self.assertEqual("never", status["effectiveApprovalPolicy"])
+        self.assertEqual({"type": "dangerFullAccess"}, turn_start_calls[0]["sandbox_policy"])
+        self.assertEqual("never", turn_start_calls[0]["approval_policy"])
+
     def test_retry_workflow_with_runtime_policy_creates_linked_workflow(self) -> None:
         async def scenario() -> tuple[dict, dict, dict, dict, dict, list[dict], dict]:
             with TemporaryDirectory() as tmp:

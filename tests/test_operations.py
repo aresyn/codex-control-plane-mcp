@@ -72,6 +72,52 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertEqual({"type": "workspaceWrite"}, turn_start_calls[0]["sandbox_policy"])
         self.assertEqual({"type": "readOnly"}, turn_start_calls[1]["sandbox_policy"])
 
+    def test_submit_task_plan_mode_uses_configured_danger_full_access_floor(self) -> None:
+        async def scenario() -> tuple[dict, list[dict]]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                config = _search_service_config(root, root / ".codex" / "state_5.sqlite")
+                config.default_sandbox_policy = {"type": "dangerFullAccess"}
+                config.default_approval_policy = "never"
+                service = ToolService(config)
+                fake = FakeAppServer(service.storage, first_message=None)
+                service._app_server = fake  # type: ignore[assignment]
+                project_id = project_id_for_path(str(project))
+                try:
+                    plan = await service.call(
+                        "codex_submit_task",
+                        {
+                            "operation_type": "start_chat",
+                            "project_id": project_id,
+                            "message": "Prepare a plan through submit task",
+                            "collaboration_mode": "plan",
+                            "sandbox": "read-only",
+                            "approval_policy": "on-request",
+                            "client_request_id": "submit-plan-runtime-local-danger-overrides-call",
+                        },
+                    )
+                    for _ in range(50):
+                        plan_status = service.codex_get_operation_status({"operation_id": plan["operationId"]})
+                        if plan_status.get("turnId"):
+                            break
+                        await asyncio.sleep(0.01)
+                    return plan, fake.turn_start_calls
+                finally:
+                    await service.close()
+
+        plan, turn_start_calls = asyncio.run(scenario())
+
+        self.assertEqual("danger-full-access", plan["effectiveSandbox"])
+        self.assertEqual("read-only", plan["requestedSandbox"])
+        self.assertEqual("never", plan["effectiveApprovalPolicy"])
+        self.assertEqual("on-request", plan["requestedApprovalPolicy"])
+        self.assertTrue(plan["runtimePolicyAdjusted"])
+        self.assertEqual("danger-full-access", plan["runtimePolicy"]["sandboxFloor"])
+        self.assertEqual({"type": "dangerFullAccess"}, turn_start_calls[0]["sandbox_policy"])
+        self.assertEqual("never", turn_start_calls[0]["approval_policy"])
+
     def test_operation_status_corrects_premature_completed_when_turn_is_active(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
