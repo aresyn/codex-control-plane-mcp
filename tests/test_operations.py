@@ -762,6 +762,43 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertTrue(result["pollRecommended"])
         self.assertEqual("running", result["status"])
 
+    def test_send_message_resolves_fresh_thread_from_durable_operation_without_catalog(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "Project"
+            project.mkdir()
+            service = ToolService(_search_service_config(root, root / ".codex" / "state_5.sqlite"))
+            fake = FakeAppServer(service.storage, first_message="fresh thread follow-up")
+            service._app_server = fake  # type: ignore[assignment]
+            project_id = project_id_for_path(str(project))
+            service.storage.create_operation(
+                _storage_operation_row(
+                    "op-known-thread",
+                    status="completed",
+                    operation_type="start_chat",
+                    thread_id="thread-known-only",
+                    cwd=str(project),
+                    request={"operation_type": "start_chat", "message": "already completed"},
+                )
+            )
+            service.storage.update_operation("op-known-thread", project_id=project_id, chat_id="thread-known-only")
+            try:
+                result = asyncio.run(
+                    service.codex_send_message(
+                        {
+                            "chat_id": "thread-known-only",
+                            "message": "continue fresh thread",
+                        }
+                    )
+                )
+            finally:
+                asyncio.run(service.close())
+
+        self.assertTrue(result["accepted"])
+        self.assertEqual("thread-known-only", result["threadId"])
+        self.assertEqual(1, len(fake.turn_start_calls))
+        self.assertEqual("thread-known-only", fake.turn_start_calls[0]["thread_id"])
+
     def test_submit_task_output_schema_passes_to_turn_start_and_persists_structured_report(self) -> None:
         async def scenario() -> tuple[dict, dict, dict, list[dict], dict]:
             with TemporaryDirectory() as tmp:

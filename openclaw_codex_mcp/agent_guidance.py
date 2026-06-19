@@ -773,7 +773,7 @@ def _has_pending_interactions(payload: dict[str, Any]) -> bool:
 
 def _runtime_policy_failure(payload: dict[str, Any]) -> bool:
     text = json.dumps(redact_payload(payload), ensure_ascii=False).casefold()
-    return any(marker in text for marker in ("createprocessasuserw failed: 5", "windows sandbox", "access is denied", "runtimepolicyadjusted"))
+    return any(marker in text for marker in ("createprocessasuserw failed: 5", "windows sandbox", "access is denied"))
 
 
 def _scope_from_details(details: dict[str, Any]) -> tuple[str, str]:

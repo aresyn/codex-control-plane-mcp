@@ -344,6 +344,49 @@ class OperationLeaseStorageTests(unittest.TestCase):
         self.assertEqual("assistant text from lifecycle id", canonical["latestMessages"][-1]["text"])
         self.assertIsNone(lifecycle)
 
+    def test_turn_tracker_keeps_explicit_lifecycle_turn_id_when_ack_id_differs(self) -> None:
+        with TemporaryDirectory() as tmp:
+            storage = McpStorage(Path(tmp) / "mcp.sqlite")
+            storage.connect()
+            try:
+                tracker = TurnTracker(storage)
+                tracker.register_turn(
+                    turn_id="turn-ack",
+                    thread_id="thread-alias",
+                    chat_id="thread-alias",
+                    project_id="project",
+                    project_path=str(Path(tmp)),
+                    status="running",
+                    started_at="2026-05-25T00:00:00+00:00",
+                    user_message="ack prompt",
+                )
+                tracker.record_event(
+                    {
+                        "method": "turn/started",
+                        "params": {
+                            "threadId": "thread-alias",
+                            "turnId": "turn-live",
+                            "turn": {"id": "turn-live", "status": "running", "startedAt": 1779667205000000000},
+                        },
+                    },
+                    received_at="2026-05-25T00:00:01+00:00",
+                )
+                tracker.record_event(
+                    {
+                        "method": "turn/completed",
+                        "params": {"threadId": "thread-alias", "turnId": "turn-live"},
+                    },
+                    received_at="2026-05-25T00:00:02+00:00",
+                )
+                ack = storage.get_tracked_turn("turn-ack") or {}
+                live = storage.get_tracked_turn("turn-live") or {}
+            finally:
+                storage.close()
+
+        self.assertEqual("running", ack["status"])
+        self.assertEqual("completed", live["status"])
+        self.assertEqual("2026-05-25T00:00:05+00:00", live["started_at"])
+
     def test_startup_recovery_resets_starting_without_turn_and_preserves_turn(self) -> None:
         with TemporaryDirectory() as tmp:
             storage = McpStorage(Path(tmp) / "mcp.sqlite")

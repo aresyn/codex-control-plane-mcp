@@ -499,6 +499,19 @@ class OperationStoreMixin:
         ).fetchone()
         return dict(row) if row is not None else None
 
+    def get_latest_operation_for_thread(self, thread_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            """
+            SELECT *
+            FROM codex_operations
+            WHERE thread_id = ? OR chat_id = ?
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT 1
+            """,
+            (thread_id, thread_id),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
     def list_operations(self, *, status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         if status:
             rows = self.connection.execute(

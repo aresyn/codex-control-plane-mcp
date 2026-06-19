@@ -71,7 +71,8 @@ class SearchIndex:
     def refresh(self, *, include_archived: bool, time_budget_seconds: int) -> SearchIndexStatus:
         started = time.monotonic()
         status = SearchIndexStatus(refreshed=True)
-        self.catalog.refresh()
+        if time_budget_seconds > 3 or getattr(self.catalog, "_last_refresh_at", None) is None:
+            self.catalog.refresh()
         chats = list(self.catalog.chats.values())
         for chat in chats:
             if chat.archived and not include_archived:

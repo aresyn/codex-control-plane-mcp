@@ -120,6 +120,7 @@ class TurnTracker:
         thread_id = _extract_thread_id(payload)
         payload_turn_id = _extract_turn_id(payload)
         turn_id = payload_turn_id
+        method = str(payload.get("method") or "")
         if thread_id is not None:
             active_turn_id = self._thread_active_turn.get(thread_id)
             if turn_id is None:
@@ -127,7 +128,11 @@ class TurnTracker:
             elif active_turn_id and turn_id != active_turn_id:
                 active_turn = self.storage.get_tracked_turn(active_turn_id)
                 payload_turn = self.storage.get_tracked_turn(turn_id)
-                if payload_turn is None and str((active_turn or {}).get("status") or "") in ACTIVE_STATUSES:
+                if (
+                    payload_turn is None
+                    and str((active_turn or {}).get("status") or "") in ACTIVE_STATUSES
+                    and not method.startswith("turn/")
+                ):
                     turn_id = active_turn_id
         if turn_id is None:
             return
@@ -139,6 +144,8 @@ class TurnTracker:
 
         current = self.storage.get_tracked_turn(turn_id)
         if current is None:
+            params = _payload_params(payload)
+            raw_turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
             self.storage.upsert_tracked_turn(
                 {
                     "turn_id": turn_id,
@@ -147,7 +154,7 @@ class TurnTracker:
                     "project_id": None,
                     "project_path": None,
                     "status": "running",
-                    "started_at": received_at,
+                    "started_at": _ms_to_iso(raw_turn.get("startedAt")) or received_at,
                     "updated_at": received_at,
                     "completed_at": None,
                     "first_message_at": None,
@@ -213,6 +220,8 @@ class TurnTracker:
                 if thread_id in self._thread_active_turn and self._thread_active_turn[thread_id] == turn_id:
                     self._thread_active_turn.pop(thread_id, None)
                 self._resolve_first_message(turn_id, None)
+            elif status in ACTIVE_STATUSES:
+                self._thread_active_turn[thread_id] = turn_id
 
     def record_thread_snapshot(self, payload: Any, *, received_at: str | None = None) -> None:
         received_at = received_at or now_iso()
@@ -1153,7 +1162,18 @@ def _ms_to_iso(value: Any) -> str | None:
         return None
     if parsed <= 0:
         return None
-    return datetime.fromtimestamp(parsed / 1000, timezone.utc).isoformat()
+    if parsed > 1e17:
+        seconds = parsed / 1_000_000_000
+    elif parsed > 1e14:
+        seconds = parsed / 1_000_000
+    elif parsed > 1e11:
+        seconds = parsed / 1_000
+    else:
+        seconds = parsed
+    try:
+        return datetime.fromtimestamp(seconds, timezone.utc).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 def _snapshot_turn_error(turn: dict[str, Any]) -> str | None:

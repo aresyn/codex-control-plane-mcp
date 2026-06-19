@@ -178,11 +178,13 @@ class ProjectChatCatalog:
                 existing.project_path = existing.project_path or project_path or record.project_path
                 existing.title = existing.title or record.title or record.thread_id[:16]
                 existing.created_at = existing.created_at or record.created_at
+                incoming_newer = bool(record.updated_at and (not existing.updated_at or record.updated_at >= existing.updated_at))
                 if record.updated_at and (not existing.updated_at or record.updated_at > existing.updated_at):
                     existing.updated_at = record.updated_at
                 existing.last_message_preview = record.last_message_preview or existing.last_message_preview
-                existing.status = _chat_status_from_turn_status(record.status)
-                existing.status_confidence = "medium"
+                if incoming_newer or existing.status in {"unknown", ""}:
+                    existing.status = _chat_status_from_turn_status(record.status)
+                    existing.status_confidence = "medium"
                 existing.source = "mixed"
                 continue
             chat = Chat(

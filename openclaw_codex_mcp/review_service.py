@@ -183,7 +183,7 @@ class ReviewServiceMixin:
         )
         review_thread_id = _extract_review_thread_id(review_result) or source_thread_id
         turn = review_result.get("turn") if isinstance(review_result.get("turn"), dict) else {}
-        review_turn_id = _extract_turn_id(review_result)
+        review_turn_id = _extract_review_turn_id(review_result)
         if not review_turn_id:
             raise send_failed("review/start did not return review turn id.")
         generation = review_result.get("_processGeneration") or client.process_generation

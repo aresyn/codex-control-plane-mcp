@@ -345,6 +345,54 @@ class OperationServiceMixin:
             "projectPath": effective_path,
         }
 
+    def _resolve_known_thread_context(self, thread_id: str, project_id: str | None = None) -> dict[str, Any] | None:
+        tracked_turn = self.storage.get_latest_tracked_turn_for_thread(thread_id)
+        operation = self.storage.get_latest_operation_for_thread(thread_id)
+        hook_thread = self.storage.get_hook_thread(thread_id)
+        source = "unknown"
+        resolved_project_id = project_id
+        project_path: str | None = None
+        chat_id = thread_id
+        status: str | None = None
+
+        if tracked_turn is not None:
+            source = "tracked_turn"
+            resolved_project_id = _optional_string(tracked_turn.get("project_id")) or resolved_project_id
+            project_path = _optional_string(tracked_turn.get("project_path"))
+            chat_id = _optional_string(tracked_turn.get("chat_id")) or thread_id
+            status = _optional_string(tracked_turn.get("status"))
+        if operation is not None and not project_path:
+            source = "operation"
+            resolved_project_id = _optional_string(operation.get("project_id")) or resolved_project_id
+            project_path = _optional_string(operation.get("cwd"))
+            chat_id = _optional_string(operation.get("chat_id")) or _optional_string(operation.get("thread_id")) or thread_id
+            status = _optional_string(operation.get("status"))
+        if hook_thread is not None and not project_path:
+            source = "hook_history"
+            project_path = _optional_string(hook_thread.get("project_path"))
+            if project_path and not resolved_project_id:
+                resolved_project_id = project_id_for_path(project_path)
+            status = "completed"
+
+        if project_id and resolved_project_id and project_id != resolved_project_id:
+            return None
+        effective_path = canonical_existing_path(project_path)
+        if not effective_path or not is_allowed_path(effective_path, self.config.allowed_roots):
+            return None
+        if not resolved_project_id:
+            resolved_project_id = project_id_for_path(effective_path)
+        return {
+            "threadId": thread_id,
+            "chatId": chat_id,
+            "projectId": resolved_project_id,
+            "projectPath": effective_path,
+            "status": status,
+            "source": source,
+            "trackedTurn": tracked_turn,
+            "operation": operation,
+            "hookThread": hook_thread,
+        }
+
     def _dedup_metadata_for_result(self, dedup: dict[str, Any] | None) -> dict[str, Any]:
         if not dedup or dedup.get("action") == "new":
             return {}
@@ -757,26 +805,39 @@ class OperationServiceMixin:
             )
         project_id = args.get("project_id")
         chat = self.catalog.get_chat(chat_id, str(project_id) if project_id else None)
-        if chat is None:
-            raise thread_not_found(chat_id)
-        project_path = canonical_existing_path(chat.project_path)
+        if chat is not None:
+            resolved_chat_id = chat.chat_id
+            resolved_thread_id = chat.thread_id
+            resolved_project_id = chat.project_id
+            project_path = canonical_existing_path(chat.project_path)
+            status, confidence, evidence = self.catalog.infer_chat_status(chat)
+        else:
+            context = self._resolve_known_thread_context(chat_id, str(project_id) if project_id else None)
+            if context is None:
+                raise thread_not_found(chat_id)
+            resolved_chat_id = str(context["chatId"])
+            resolved_thread_id = str(context["threadId"])
+            resolved_project_id = _optional_string(context.get("projectId"))
+            project_path = canonical_existing_path(context.get("projectPath"))
+            status = _optional_string(context.get("status")) or "unknown"
+            confidence = "storage"
+            evidence = [{"source": context.get("source"), "status": status}]
         if not project_path or not is_allowed_path(project_path, self.config.allowed_roots):
-            raise invalid_argument("Chat project path is outside the allowlist.", project_path=chat.project_path)
-        status, confidence, evidence = self.catalog.infer_chat_status(chat)
+            raise invalid_argument("Chat project path is outside the allowlist.", project_path=project_path)
         if status in {"running", "waiting_for_approval", "waiting_for_user", "waiting_for_user_input"} and confidence != "low":
-            raise busy(chat.thread_id, status)
+            raise busy(resolved_thread_id, status)
         prompt_submission_id = _optional_string(args.get("_prompt_submission_id"))
         dedup_metadata = args.get("_dedup_metadata") if isinstance(args.get("_dedup_metadata"), dict) else None
         if not bool(args.get("_skip_prompt_dedup")) and not prompt_submission_id:
             dedup_basis = str(args.get("_prompt_dedup_basis") or self._prompt_dedup_basis(str(args.get("_prompt_dedup_operation_type") or "send_message"), message))
             dedup = self._prepare_prompt_submission(
-                project_id=chat.project_id,
+                project_id=resolved_project_id,
                 project_path_key=path_key(project_path),
                 operation_type=str(args.get("_prompt_dedup_operation_type") or "send_message"),
                 message=message,
                 dedup_basis=dedup_basis,
-                chat_id=chat.chat_id,
-                thread_id=chat.thread_id,
+                chat_id=resolved_chat_id,
+                thread_id=resolved_thread_id,
                 workflow_id=_optional_string(args.get("workflow_id")),
             )
             prompt_submission_id = _optional_string(dedup.get("promptSubmissionId"))
@@ -788,7 +849,7 @@ class OperationServiceMixin:
                 return await self._send_message_resolved(
                     chat_id=existing_chat_id,
                     thread_id=existing_thread_id,
-                    project_id=chat.project_id,
+                    project_id=resolved_project_id,
                     project_path=project_path,
                     message=message,
                     args=args,
@@ -800,8 +861,8 @@ class OperationServiceMixin:
         message_preview = _redacted_preview(message)
         LOG.info(
             "send_message accepted_for_start chat_id=%s thread_id=%s status=%s confidence=%s timeout=%s approval_policy=%s sandbox_policy=%s message_chars=%d message_preview=%r",
-            chat.chat_id,
-            chat.thread_id,
+            resolved_chat_id,
+            resolved_thread_id,
             status,
             confidence,
             _bounded_int(args.get("timeout_seconds", DEFAULT_TOOL_START_TIMEOUT_SECONDS), 1, 7200),
@@ -811,9 +872,9 @@ class OperationServiceMixin:
             message_preview,
         )
         return await self._send_message_resolved(
-            chat_id=chat.chat_id,
-            thread_id=chat.thread_id,
-            project_id=chat.project_id,
+            chat_id=resolved_chat_id,
+            thread_id=resolved_thread_id,
+            project_id=resolved_project_id,
             project_path=project_path,
             message=message,
             args=args,
@@ -1927,10 +1988,22 @@ class OperationServiceMixin:
         response["lease_state"] = self._operation_lease_state(latest)
         response["leaseState"] = response["lease_state"]
         scheduling = self.storage.get_operation_scheduling(operation_id)
+        if scheduling is not None and str(latest.get("status") or "") in OPERATION_TERMINAL_STATUSES:
+            if scheduling.get("queue_status") != latest.get("status"):
+                self.storage.update_operation_scheduling(
+                    operation_id,
+                    queue_status=str(latest.get("status") or "completed"),
+                    queued_reason=None,
+                    updated_at=_now_iso(),
+                    slot_claim={"claimed": False},
+                )
+                self.storage.release_resource_locks_for_operation(operation_id)
+                scheduling = self.storage.get_operation_scheduling(operation_id)
         if scheduling is not None:
             slot_claim = _safe_json_dict(scheduling.get("slot_claim_json"))
             worker_id = _optional_string(scheduling.get("worker_id"))
             worker = self.storage.get_worker(worker_id) if worker_id else None
+            terminal_queue = str(latest.get("status") or "") in OPERATION_TERMINAL_STATUSES
             response["queueState"] = {
                 "queueStatus": scheduling.get("queue_status"),
                 "queuedReason": scheduling.get("queued_reason"),
@@ -1942,7 +2015,7 @@ class OperationServiceMixin:
                 "scheduledAt": scheduling.get("scheduled_at"),
                 "updatedAt": scheduling.get("updated_at"),
             }
-            response["slotState"] = slot_claim or {"claimed": False}
+            response["slotState"] = {"claimed": False} if terminal_queue else (slot_claim or {"claimed": False})
             response["workerState"] = {
                 "workerId": worker_id,
                 "status": (worker or {}).get("status"),
@@ -1959,7 +2032,7 @@ class OperationServiceMixin:
                         "expiresAt": row.get("expires_at"),
                     }
                     for row in self.storage.list_resource_locks(operation_id=operation_id, limit=20)
-                ]
+                ] if not terminal_queue else []
             }
         else:
             response["queueState"] = {

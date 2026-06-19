@@ -55,7 +55,7 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertEqual("INVALID_ARGUMENT", raised.exception.code)
 
     def test_pending_interaction_tools_list_and_answer_live_request(self) -> None:
-        async def scenario() -> tuple[dict, dict, dict, dict]:
+        async def scenario() -> tuple[dict, dict, dict, dict, dict]:
             with TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 config = _search_service_config(root, root / ".codex" / "state_5.sqlite")
@@ -91,11 +91,16 @@ class McpDefinitionTests(unittest.TestCase):
                         {"interaction_id": interaction["interactionId"], "decision": "accept"}
                     )
                     row = service.storage.get_pending_interaction(str(interaction["interactionId"])) or {}
-                    return interaction, listed, turn_status, {"answered": answered, "row": row}
+                    after_default = service.codex_list_pending_interactions({"thread_id": "thread-pending"})
+                    after_answered = service.codex_list_pending_interactions({"thread_id": "thread-pending", "status": "answered"})
+                    return interaction, listed, turn_status, {"answered": answered, "row": row}, {
+                        "default": after_default,
+                        "answered": after_answered,
+                    }
                 finally:
                     await service.close()
 
-        interaction, listed, turn_status, result = asyncio.run(scenario())
+        interaction, listed, turn_status, result, after = asyncio.run(scenario())
 
         self.assertEqual("pending", interaction["status"])
         self.assertEqual(1, listed["returned_count"])
@@ -103,6 +108,8 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertEqual("item-1", turn_status["pendingInteractions"][0]["itemId"])
         self.assertTrue(result["answered"]["answered"])
         self.assertEqual("answered", result["row"]["status"])
+        self.assertEqual(0, after["default"]["returnedCount"])
+        self.assertEqual(1, after["answered"]["returnedCount"])
 
     def test_pending_interaction_timeout_auto_declines(self) -> None:
         async def scenario() -> tuple[dict, dict, list[dict], str]:
@@ -235,6 +242,43 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertEqual(1, unarchive_calls)
         self.assertGreaterEqual(refresh_count, 2)
         self.assertEqual(["completed", "completed"], sorted(item["status"] for item in actions))
+
+    def test_thread_lifecycle_resolves_fork_only_thread_from_operation(self) -> None:
+        async def scenario() -> tuple[dict, list[dict]]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                service = ToolService(_search_service_config(root, root / ".codex" / "state_5.sqlite"))
+                fake = FakeAppServer(service.storage, first_message=None)
+                service._app_server = fake  # type: ignore[assignment]
+                project_id = project_id_for_path(str(project))
+                service.storage.create_operation(
+                    _storage_operation_row(
+                        "op-fork-only",
+                        status="completed",
+                        operation_type="fork_thread",
+                        thread_id="thread-fork-only",
+                        cwd=str(project),
+                        request={"operation_type": "fork_thread", "source_thread_id": "thread-source"},
+                    )
+                )
+                service.storage.update_operation("op-fork-only", project_id=project_id, chat_id="thread-fork-only")
+                try:
+                    archived = await service.call(
+                        "codex_archive_thread",
+                        {"thread_id": "thread-fork-only", "project_id": project_id},
+                    )
+                    return archived, fake.thread_archive_calls
+                finally:
+                    await service.close()
+
+        archived, archive_calls = asyncio.run(scenario())
+
+        self.assertEqual("completed", archived["status"])
+        self.assertEqual("operation", archived["threadState"]["source"])
+        self.assertEqual(1, len(archive_calls))
+        self.assertNotIn("AppData", json.dumps(archived, ensure_ascii=False))
 
     def test_thread_lifecycle_rejects_missing_or_busy_thread(self) -> None:
         async def scenario() -> tuple[dict, dict, int]:

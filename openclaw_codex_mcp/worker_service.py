@@ -39,8 +39,7 @@ class WorkerServiceMixin:
             entries = [
                 row
                 for row in entries
-                if row.get("operationStatus") not in OPERATION_TERMINAL_STATUSES
-                and row.get("queueStatus") in {"queued", "scheduled", "running"}
+                if _queue_entry_should_be_visible(row, self.storage)
             ]
         if status_filter:
             entries = [row for row in entries if row.get("queueStatus") == status_filter]
@@ -128,10 +127,14 @@ class WorkerServiceMixin:
 
 
 def _worker_row_to_tool(row: dict[str, Any]) -> dict[str, Any]:
+    staleness = _staleness_seconds(str(row.get("last_heartbeat_at") or ""))
+    status = row.get("status")
+    effective_status = "stale" if status == "running" and staleness is not None and int(staleness) >= 120 else status
     return {
         "workerId": row.get("worker_id"),
         "role": row.get("role"),
-        "status": row.get("status"),
+        "status": status,
+        "effectiveStatus": effective_status,
         "pid": row.get("pid"),
         "hostname": row.get("hostname"),
         "configFingerprint": row.get("config_fingerprint"),
@@ -141,7 +144,7 @@ def _worker_row_to_tool(row: dict[str, Any]) -> dict[str, Any]:
         "activeTurnCount": row.get("active_turn_count") or 0,
         "appServerGeneration": row.get("app_server_generation"),
         "lastError": row.get("last_error"),
-        "stalenessSeconds": _staleness_seconds(str(row.get("last_heartbeat_at") or "")),
+        "stalenessSeconds": staleness,
     }
 
 
@@ -152,8 +155,8 @@ def _worker_command_row_to_tool(row: dict[str, Any]) -> dict[str, Any]:
         "commandId": row.get("command_id"),
         "commandType": row.get("command_type"),
         "status": row.get("status"),
-        "request": redact_payload(request),
-        "result": redact_payload(result) if result else None,
+        "request": _compact_worker_payload(request),
+        "result": _compact_worker_payload(result) if result else None,
         "workerId": row.get("worker_id"),
         "createdAt": row.get("created_at"),
         "updatedAt": row.get("updated_at"),
@@ -229,11 +232,47 @@ def _json_list(value: Any) -> list[Any]:
 
 def _has_live_worker(workers: list[dict[str, Any]]) -> bool:
     for worker in workers:
-        if worker.get("role") == "worker" and worker.get("status") == "running":
-            staleness = worker.get("stalenessSeconds")
-            if staleness is None or int(staleness) < 120:
-                return True
+        if worker.get("role") == "worker" and worker.get("effectiveStatus") == "running":
+            return True
     return False
+
+
+def _queue_entry_should_be_visible(entry: dict[str, Any], storage: Any) -> bool:
+    if entry.get("operationStatus") in OPERATION_TERMINAL_STATUSES:
+        return False
+    if entry.get("queueStatus") not in {"queued", "scheduled", "running"}:
+        return False
+    turn_id = _optional_string(entry.get("turnId") or entry.get("turn_id"))
+    if not turn_id:
+        return True
+    tracked = storage.get_tracked_turn(turn_id)
+    if tracked is not None and str(tracked.get("status") or "") not in TURN_ACTIVE_STATUSES:
+        return False
+    return True
+
+
+def _compact_worker_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    redacted = redact_payload(payload)
+    return _strip_worker_raw_results(redacted)
+
+
+def _strip_worker_raw_results(value: Any) -> Any:
+    if isinstance(value, dict):
+        cleaned: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            lower = key_text.lower()
+            if key_text == "appServerResult":
+                cleaned[key_text] = {"present": True, "redacted": True}
+                continue
+            if lower in {"path", "transcriptpath", "sessionpath"} and isinstance(item, str):
+                cleaned[key_text] = "[redacted-path]"
+                continue
+            cleaned[key_text] = _strip_worker_raw_results(item)
+        return cleaned
+    if isinstance(value, list):
+        return [_strip_worker_raw_results(item) for item in value]
+    return value
 
 
 def _project_concurrency_key(row: dict[str, Any]) -> str:

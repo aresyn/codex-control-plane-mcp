@@ -2335,6 +2335,27 @@ def _extract_review_thread_id(result: dict[str, Any]) -> str | None:
     return result.get("reviewThreadId") or result.get("review_thread_id") or _extract_thread_id(result)
 
 
+def _extract_review_turn_id(result: dict[str, Any]) -> str | None:
+    for key in ("reviewTurnId", "review_turn_id"):
+        value = result.get(key)
+        if value:
+            return str(value)
+    for key in ("reviewTurn", "review_turn"):
+        nested = result.get(key)
+        if isinstance(nested, dict) and nested.get("id"):
+            return str(nested["id"])
+        if isinstance(nested, dict) and nested.get("turnId"):
+            return str(nested["turnId"])
+    review = result.get("review")
+    if isinstance(review, dict):
+        turn = review.get("turn")
+        if isinstance(turn, dict) and turn.get("id"):
+            return str(turn["id"])
+        if review.get("turnId"):
+            return str(review["turnId"])
+    return _extract_turn_id(result)
+
+
 def _review_target_from_args(args: dict[str, Any]) -> dict[str, Any]:
     target_type = _required_string(args, "target_type")
     if target_type == "uncommitted_changes":

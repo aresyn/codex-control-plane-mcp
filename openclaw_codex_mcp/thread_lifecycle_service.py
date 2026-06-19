@@ -59,8 +59,8 @@ class ThreadLifecycleServiceMixin:
                     or _optional_string(workflow.get("execution_turn_id"))
                     or _optional_string(workflow.get("plan_turn_id"))
                 )
-        status = args.get("status")
-        status = str(status).strip() if status not in (None, "") else None
+        raw_status = args.get("status", "pending")
+        status = str(raw_status).strip() if raw_status not in (None, "") else None
         limit = _bounded_int(args.get("limit", 50), 1, 200)
         manager = self._app_server.interactions if self._app_server is not None else PendingInteractionManager(self.storage)
         if workflow_id and thread_id and not turn_id:
@@ -166,6 +166,7 @@ class ThreadLifecycleServiceMixin:
     def _resolve_interrupt_target(self, args: dict[str, Any]) -> dict[str, Any]:
         thread_id = _optional_string(args.get("thread_id"))
         turn_id = _optional_string(args.get("turn_id"))
+        explicit_turn_id = turn_id
         operation_id = _optional_string(args.get("operation_id"))
         workflow_id = _optional_string(args.get("workflow_id"))
         source = "direct"
@@ -203,6 +204,13 @@ class ThreadLifecycleServiceMixin:
             turn = self.storage.get_tracked_turn(turn_id)
             thread_id = _optional_string((turn or {}).get("thread_id"))
 
+        if thread_id and explicit_turn_id is None:
+            active_turn = self._active_turn_for_thread(thread_id)
+            active_turn_id = _optional_string((active_turn or {}).get("turn_id"))
+            if active_turn_id and active_turn_id != turn_id:
+                turn_id = active_turn_id
+                source = f"{source}+active_turn"
+
         if not thread_id or not turn_id:
             raise invalid_argument(
                 "codex_interrupt_turn requires thread_id+turn_id or resolvable operation_id/workflow_id.",
@@ -225,6 +233,7 @@ class ThreadLifecycleServiceMixin:
         chat = self.catalog.get_chat(thread_id, project_id)
         tracked_turn = self.storage.get_latest_tracked_turn_for_thread(thread_id)
         hook_thread = self.storage.get_hook_thread(thread_id)
+        known_thread = self._resolve_known_thread_context(thread_id, project_id)
         source = "unknown"
         project_path: str | None = None
         archived: bool | None = None
@@ -244,6 +253,11 @@ class ThreadLifecycleServiceMixin:
             project_path = _optional_string(hook_thread.get("project_path"))
             resolved_project_id = resolved_project_id or (project_id_for_path(project_path) if project_path else None)
             archived = False
+        elif known_thread is not None:
+            source = _optional_string(known_thread.get("source")) or "operation"
+            project_path = _optional_string(known_thread.get("projectPath"))
+            resolved_project_id = _optional_string(known_thread.get("projectId")) or resolved_project_id
+            archived = None
         else:
             raise thread_not_found(thread_id)
 
@@ -275,18 +289,30 @@ class ThreadLifecycleServiceMixin:
     ) -> dict[str, Any]:
         chat = self.catalog.get_chat(thread_id, project_id)
         tracked_turn = self.storage.get_latest_tracked_turn_for_thread(thread_id)
+        known_thread = self._resolve_known_thread_context(thread_id, project_id)
         pending = self._pending_interactions_for_context(thread_id=thread_id, turn_id=None, status="pending", limit=20)
         active_turn = self._active_turn_for_thread(thread_id)
         archived = expected_archived
         if archived is None and chat is not None:
             archived = bool(chat.archived)
+        known = bool(chat is not None or tracked_turn is not None or self.storage.get_hook_thread(thread_id) is not None or known_thread is not None)
+        known_source = (
+            chat.source if chat is not None else (
+                "tracked_turn" if tracked_turn is not None else (
+                    "hook_history" if self.storage.get_hook_thread(thread_id) is not None else _optional_string((known_thread or {}).get("source"))
+                )
+            )
+        )
         return {
-            "known": bool(chat is not None or tracked_turn is not None or self.storage.get_hook_thread(thread_id) is not None),
+            "known": known,
             "threadId": thread_id,
-            "projectId": (chat.project_id if chat is not None else None) or _optional_string((tracked_turn or {}).get("project_id")) or project_id,
+            "projectId": (chat.project_id if chat is not None else None)
+            or _optional_string((tracked_turn or {}).get("project_id"))
+            or _optional_string((known_thread or {}).get("projectId"))
+            or project_id,
             "title": chat.title if chat is not None else None,
             "archived": archived,
-            "source": chat.source if chat is not None else ("tracked_turn" if tracked_turn is not None else "hook_history"),
+            "source": known_source,
             "latestTurnId": _optional_string((tracked_turn or {}).get("turn_id")),
             "latestTurnStatus": _optional_string((tracked_turn or {}).get("status")),
             "activeTurnId": _optional_string((active_turn or {}).get("turn_id")),
@@ -371,7 +397,7 @@ class ThreadLifecycleServiceMixin:
             "pollRecommended": not terminal,
         }
         if result_payload.get("appServerResult") is not None:
-            response["appServerResult"] = result_payload.get("appServerResult")
+            response["appServerResult"] = _compact_lifecycle_app_server_result(result_payload.get("appServerResult"))
         if include_events:
             response["events"] = [
                 event_to_tool(row, include_payload=False)
@@ -543,4 +569,24 @@ class ThreadLifecycleServiceMixin:
             raise invalid_argument("Thread lifecycle action was not found.", action_id=action_id)
         action = self._reconcile_thread_compaction_action(action)
         return self._thread_lifecycle_action_to_tool(action, include_events=include_events)
+
+
+def _compact_lifecycle_app_server_result(value: Any) -> Any:
+    redacted = redact_payload(value)
+    return _strip_lifecycle_raw_paths(redacted)
+
+
+def _strip_lifecycle_raw_paths(value: Any) -> Any:
+    if isinstance(value, dict):
+        cleaned: dict[str, Any] = {}
+        for key, item in value.items():
+            lower = str(key).lower()
+            if lower in {"path", "transcriptpath", "sessionpath"} and isinstance(item, str):
+                cleaned[str(key)] = "[redacted-path]"
+                continue
+            cleaned[str(key)] = _strip_lifecycle_raw_paths(item)
+        return cleaned
+    if isinstance(value, list):
+        return [_strip_lifecycle_raw_paths(item) for item in value]
+    return value
 

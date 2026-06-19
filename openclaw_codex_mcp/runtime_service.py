@@ -49,10 +49,29 @@ class RuntimeServiceMixin:
     def codex_get_app_server_status(self, args: dict[str, Any]) -> dict[str, Any]:
         include_recent_events = bool(args.get("include_recent_events", False))
         if self._app_server is None:
+            if self.config.execution_mode in {"client", "observe"}:
+                worker = _runtime_live_worker_snapshot(self.storage)
+                if worker is not None:
+                    return {
+                        "ok": True,
+                        "running": True,
+                        "started": False,
+                        "scope": "worker_managed",
+                        "workerManaged": True,
+                        "pid": worker.get("pid"),
+                        "workerId": worker.get("worker_id"),
+                        "processGeneration": worker.get("app_server_generation") or 0,
+                        "pendingRequests": 0,
+                        "activeTurns": [],
+                        "codexBinaryPath": str(self.config.codex_binary_path),
+                        "codexBinaryExists": self.config.codex_binary_path.exists(),
+                    }
             return {
                 "ok": True,
                 "running": False,
                 "started": False,
+                "scope": "local_process",
+                "workerManaged": False,
                 "pid": None,
                 "processGeneration": 0,
                 "pendingRequests": 0,
@@ -105,6 +124,73 @@ class RuntimeServiceMixin:
         method_results: dict[str, dict[str, Any]] = {}
         warnings: list[dict[str, Any]] = []
         app_status_before = self.codex_get_app_server_status({"include_recent_events": False})
+        if self.config.execution_mode in {"client", "observe"} and self._app_server is None:
+            reason = f"execution_mode={self.config.execution_mode}; live inventory is owned by the worker process"
+
+            def skip_live_inventory(method: str) -> None:
+                method_results[method] = {"status": "skipped", "reason": reason, "elapsedMs": 0}
+
+            for method in (
+                "model/list",
+                "permissionProfile/list",
+                "windowsSandbox/readiness",
+                "hooks/list",
+                "skills/list",
+                "modelProvider/capabilities/read",
+                "account/read",
+                "account/usage/read",
+                "account/rateLimits/read",
+            ):
+                skip_live_inventory(method)
+            warnings.append(
+                {
+                    "method": "runtime/inventory",
+                    "code": "WORKER_MANAGED_RUNTIME",
+                    "status": "skipped",
+                    "message": "Runtime inventory was not collected in client/observe mode because the worker owns codex-app-server.",
+                    "retryable": False,
+                }
+            )
+            runtime_capabilities = {
+                "status": "passive",
+                "generatedAt": generated_at,
+                "appServer": {
+                    "running": app_status_before.get("running"),
+                    "started": app_status_before.get("started"),
+                    "workerManaged": app_status_before.get("workerManaged"),
+                    "workerId": app_status_before.get("workerId"),
+                    "processGeneration": app_status_before.get("processGeneration"),
+                    "initialize": None,
+                },
+                "schemaMethods": schema_methods_block(),
+                "models": None,
+                "permissionProfiles": None,
+                "sandboxReadiness": None,
+                "hooks": None,
+                "skills": None,
+                "modelProviderCapabilities": None,
+                "accountStatus": None,
+                "accountUsage": None,
+                "rateLimits": None,
+            }
+            result = {
+                "ok": True,
+                "runtimeCapabilities": runtime_capabilities,
+                "cacheState": {
+                    "hit": False,
+                    "ageSeconds": 0,
+                    "ttlSeconds": RUNTIME_CAPABILITIES_CACHE_TTL_SECONDS,
+                    "cacheKey": hashlib.sha256(cache_key.encode("utf-8")).hexdigest(),
+                },
+                "methodResults": method_results,
+                "warnings": warnings,
+                "recommendedPollAfterSeconds": 0,
+                "pollRecommended": False,
+            }
+            self._runtime_capabilities_cache = copy.deepcopy(result)
+            self._runtime_capabilities_cache_key = cache_key
+            self._runtime_capabilities_cache_at = time.monotonic()
+            return result
         try:
             client = await self._app()
         except CodexMcpError as exc:
@@ -437,11 +523,32 @@ class RuntimeServiceMixin:
             "sandbox": sandbox,
             "approvalPolicy": approval_policy,
             "checks": checks,
-            "runtimeCapabilities": runtime_health_subset(runtime, capabilities.get("cacheState")),
+            "runtimeCapabilities": runtime_health_subset(
+                capabilities,
+                cache_age_seconds=(capabilities.get("cacheState") or {}).get("ageSeconds")
+                if isinstance(capabilities.get("cacheState"), dict)
+                else None,
+            ),
             "probeOperation": probe_operation,
             "nextRecommendedAction": "start_workflow" if status == "ok" else "inspect_diagnostics",
             "recommendedPollAfterSeconds": 0,
             "pollRecommended": False,
         }
         return self._attach_agent_guidance(result, surface="preflight_project_run")
+
+
+def _runtime_live_worker_snapshot(storage: Any) -> dict[str, Any] | None:
+    now = datetime.now(timezone.utc)
+    for row in storage.list_workers(limit=20):
+        if row.get("role") != "worker" or row.get("status") != "running":
+            continue
+        try:
+            heartbeat = datetime.fromisoformat(str(row.get("last_heartbeat_at") or "").replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if heartbeat.tzinfo is None:
+            heartbeat = heartbeat.replace(tzinfo=timezone.utc)
+        if int((now - heartbeat.astimezone(timezone.utc)).total_seconds()) < 120:
+            return row
+    return None
 

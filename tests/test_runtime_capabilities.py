@@ -144,6 +144,32 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertNotIn("account/usage/read", fake.inventory_calls)
         self.assertNotIn("account/rateLimits/read", fake.inventory_calls)
 
+    def test_client_mode_runtime_capabilities_are_passive_without_starting_app_server(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = _search_service_config(root, root / ".codex" / "state_runtime_client.sqlite")
+            config.execution_mode = "client"
+            service = ToolService(config)
+            try:
+                result = asyncio.run(service.codex_get_runtime_capabilities({}))
+                preflight = asyncio.run(
+                    service.codex_preflight_project_run(
+                        {
+                            "cwd": str(root),
+                            "live_probe": False,
+                        }
+                    )
+                )
+                app_server = service._app_server
+            finally:
+                asyncio.run(service.close())
+
+        self.assertIsNone(app_server)
+        self.assertTrue(result["ok"])
+        self.assertEqual("passive", result["runtimeCapabilities"]["status"])
+        self.assertEqual("skipped", result["methodResults"]["model/list"]["status"])
+        self.assertEqual("passive", preflight["runtimeCapabilities"]["status"])
+
     def test_runtime_capabilities_unauthenticated_skips_account_usage_and_limits(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

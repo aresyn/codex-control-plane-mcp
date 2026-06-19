@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -269,6 +270,52 @@ class CentralWorkerArchitectureTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(0, active_queue["count"])
             self.assertEqual(1, terminal_queue["count"])
             self.assertEqual("unknown_after_app_server_exit", cleaned["queue_status"])
+
+    async def test_worker_status_marks_stale_workers_and_redacts_command_paths(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_db = root / ".codex" / "state_5.sqlite"
+            service = ToolService(_search_service_config(root, state_db))
+            try:
+                service.storage.upsert_worker(
+                    worker_id="worker-stale",
+                    role="worker",
+                    status="running",
+                    pid=123,
+                    hostname="host",
+                    config_fingerprint="fp",
+                    started_at="2026-05-25T00:00:00+00:00",
+                    last_heartbeat_at="2026-05-25T00:00:00+00:00",
+                )
+                service.storage.create_worker_command(
+                    command_id="cmd-path",
+                    command_type="archive_thread",
+                    status="completed",
+                    request={"thread_id": "thread"},
+                    created_at="2026-05-25T00:00:00+00:00",
+                    updated_at="2026-05-25T00:00:00+00:00",
+                )
+                service.storage.update_worker_command(
+                    "cmd-path",
+                    result_json=json.dumps(
+                        {
+                            "appServerResult": {
+                                "thread": {"path": "C:\\Users\\shan\\.codex\\sessions\\secret.jsonl"},
+                            }
+                        },
+                        ensure_ascii=False,
+                    ),
+                    updated_at="2026-05-25T00:00:01+00:00",
+                    completed_at="2026-05-25T00:00:01+00:00",
+                )
+                status = await service.call("codex_get_worker_status", {"include_recent_commands": True})
+            finally:
+                await service.close()
+
+            rendered = json.dumps(status, ensure_ascii=False)
+            self.assertEqual("stale", status["workers"][0]["effectiveStatus"])
+            self.assertNotIn("secret.jsonl", rendered)
+            self.assertTrue(status["recentCommands"][0]["result"]["appServerResult"]["redacted"])
 
     async def test_cleanup_releases_locks_for_non_slot_operations(self) -> None:
         with TemporaryDirectory() as tmp:
