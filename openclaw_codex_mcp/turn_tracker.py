@@ -118,9 +118,17 @@ class TurnTracker:
     def record_event(self, payload: dict[str, Any], *, received_at: str | None = None) -> None:
         received_at = received_at or now_iso()
         thread_id = _extract_thread_id(payload)
-        turn_id = _extract_turn_id(payload)
-        if turn_id is None and thread_id is not None:
-            turn_id = self._thread_active_turn.get(thread_id)
+        payload_turn_id = _extract_turn_id(payload)
+        turn_id = payload_turn_id
+        if thread_id is not None:
+            active_turn_id = self._thread_active_turn.get(thread_id)
+            if turn_id is None:
+                turn_id = active_turn_id
+            elif active_turn_id and turn_id != active_turn_id:
+                active_turn = self.storage.get_tracked_turn(active_turn_id)
+                payload_turn = self.storage.get_tracked_turn(turn_id)
+                if payload_turn is None and str((active_turn or {}).get("status") or "") in ACTIVE_STATUSES:
+                    turn_id = active_turn_id
         if turn_id is None:
             return
         if thread_id is None:

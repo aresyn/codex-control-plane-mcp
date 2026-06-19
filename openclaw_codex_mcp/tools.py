@@ -415,6 +415,11 @@ TOOLS: list[dict[str, Any]] = [
                 "last_messages": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
                 "message_max_chars": {"type": "integer", "minimum": 500, "maximum": 200000, "default": 8000},
                 "include_events": {"type": "boolean", "default": True},
+                "refresh_live_goal": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Best-effort live thread/goal sync. Defaults to false so frequent workflow polling stays passive and cannot create app-server requests.",
+                },
             },
             "additionalProperties": False,
         },

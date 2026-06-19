@@ -55,6 +55,8 @@ class ServerConfig:
     hook_history_max_text_chars: int = 20_000
     max_image_input_items: int = 10
     max_image_input_bytes: int = 20_000_000
+    turn_stall_timeout_seconds: int = 900
+    stalled_turn_action: str = "diagnose_only"
 
     @classmethod
     def load(cls, base_dir: Path | None = None) -> "ServerConfig":
@@ -201,6 +203,16 @@ class ServerConfig:
                 os.environ.get("CODEX_MCP_MAX_IMAGE_INPUT_BYTES")
                 or payload.get("max_image_input_bytes"),
                 20_000_000,
+            ),
+            turn_stall_timeout_seconds=_int_value(
+                os.environ.get("CODEX_MCP_TURN_STALL_TIMEOUT_SECONDS")
+                or payload.get("turn_stall_timeout_seconds"),
+                900,
+            ),
+            stalled_turn_action=_stalled_turn_action_value(
+                os.environ.get("CODEX_MCP_STALLED_TURN_ACTION")
+                or payload.get("stalled_turn_action"),
+                "diagnose_only",
             ),
         )
 
@@ -471,3 +483,10 @@ def _sandbox_policy_type(value: str) -> str:
     if compact_key in aliases:
         return aliases[compact_key]
     raise ValueError(f"Unsupported default sandbox policy: {value}")
+
+
+def _stalled_turn_action_value(value: object, default: str) -> str:
+    selected = str(value or default).strip()
+    if selected in {"diagnose_only", "interrupt"}:
+        return selected
+    raise ValueError(f"Unsupported stalled turn action: {selected}")

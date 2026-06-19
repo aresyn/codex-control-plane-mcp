@@ -562,11 +562,11 @@ class McpDefinitionTests(unittest.TestCase):
                     )
                     active = started
                     for _ in range(50):
-                        active = await service.call("codex_get_workflow_status", {"workflow_id": started["workflowId"]})
+                        active = await service.call("codex_get_workflow_status", {"workflow_id": started["workflowId"], "refresh_live_goal": True})
                         if active["threadId"] and active["threadGoal"]["syncState"] == "active":
                             break
                         await asyncio.sleep(0.01)
-                    repeated_active = await service.call("codex_get_workflow_status", {"workflow_id": started["workflowId"]})
+                    repeated_active = await service.call("codex_get_workflow_status", {"workflow_id": started["workflowId"], "refresh_live_goal": True})
                     service.storage.upsert_tracked_plan_item(
                         {
                             "item_id": "plan-goal-1",
@@ -595,7 +595,7 @@ class McpDefinitionTests(unittest.TestCase):
                     )
                     executing = active
                     for _ in range(50):
-                        executing = await service.call("codex_get_workflow_status", {"workflow_id": started["workflowId"]})
+                        executing = await service.call("codex_get_workflow_status", {"workflow_id": started["workflowId"], "refresh_live_goal": True})
                         if executing["executionTurnId"]:
                             break
                         await asyncio.sleep(0.01)
@@ -606,7 +606,7 @@ class McpDefinitionTests(unittest.TestCase):
                         completed_at="2026-05-25T00:00:04+00:00",
                         final_message="Final workflow report",
                     )
-                    completed = await service.call("codex_get_workflow_status", {"workflow_id": started["workflowId"]})
+                    completed = await service.call("codex_get_workflow_status", {"workflow_id": started["workflowId"], "refresh_live_goal": True})
                     return (
                         started,
                         active,
@@ -667,6 +667,42 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertEqual("not_configured", status["threadGoal"]["syncState"])
         self.assertEqual(0, set_count)
 
+    def test_workflow_status_default_does_not_refresh_live_goal(self) -> None:
+        async def scenario() -> tuple[dict, int, int]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                service = ToolService(_search_service_config(root, root / ".codex" / "state_5.sqlite"))
+                fake = FakeAppServer(service.storage, first_message=None)
+                service._app_server = fake  # type: ignore[assignment]
+                try:
+                    started = await service.codex_start_plan_workflow(
+                        {
+                            "project_id": project_id_for_path(str(project)),
+                            "message": "prepare a passive polling plan",
+                            "client_request_id": "workflow-passive-status-goal",
+                            "goal": "This goal should not sync during passive polling",
+                            "first_message_timeout_seconds": 1,
+                        }
+                    )
+                    status = started
+                    for _ in range(50):
+                        status = await service.call("codex_get_workflow_status", {"workflow_id": started["workflowId"]})
+                        if status["threadId"]:
+                            break
+                        await asyncio.sleep(0.01)
+                    return status, len(fake.thread_goal_set_calls), len(fake.thread_goal_get_calls)
+                finally:
+                    await service.close()
+
+        status, set_count, get_count = asyncio.run(scenario())
+
+        self.assertEqual("pending_thread", status["threadGoal"]["syncState"])
+        self.assertFalse(status["threadGoal"]["liveRefreshPerformed"])
+        self.assertEqual(0, set_count)
+        self.assertEqual(0, get_count)
+
     def test_plan_workflow_goal_unsupported_does_not_fail_status(self) -> None:
         async def scenario() -> tuple[dict, int]:
             with TemporaryDirectory() as tmp:
@@ -689,7 +725,7 @@ class McpDefinitionTests(unittest.TestCase):
                     )
                     status = started
                     for _ in range(50):
-                        status = await service.call("codex_get_workflow_status", {"workflow_id": started["workflowId"]})
+                        status = await service.call("codex_get_workflow_status", {"workflow_id": started["workflowId"], "refresh_live_goal": True})
                         if status["threadGoal"]["syncState"] == "unsupported":
                             break
                         await asyncio.sleep(0.01)
@@ -727,7 +763,7 @@ class McpDefinitionTests(unittest.TestCase):
                     )
                     errored = started
                     for _ in range(50):
-                        errored = await service.call("codex_get_workflow_status", {"workflow_id": started["workflowId"]})
+                        errored = await service.call("codex_get_workflow_status", {"workflow_id": started["workflowId"], "refresh_live_goal": True})
                         if errored["threadGoal"]["syncState"] == "error":
                             break
                         await asyncio.sleep(0.01)
@@ -739,7 +775,7 @@ class McpDefinitionTests(unittest.TestCase):
                         "status": "active",
                         "tokenBudget": 4321,
                     }
-                    recovered = await service.call("codex_get_workflow_status", {"workflow_id": started["workflowId"]})
+                    recovered = await service.call("codex_get_workflow_status", {"workflow_id": started["workflowId"], "refresh_live_goal": True})
                     return recovered, len(fake.thread_goal_set_calls), len(fake.thread_goal_get_calls)
                 finally:
                     await service.close()
@@ -775,7 +811,7 @@ class McpDefinitionTests(unittest.TestCase):
                     )
                     complete_active = complete_started
                     for _ in range(50):
-                        complete_active = await service.call("codex_get_workflow_status", {"workflow_id": complete_started["workflowId"]})
+                        complete_active = await service.call("codex_get_workflow_status", {"workflow_id": complete_started["workflowId"], "refresh_live_goal": True})
                         if complete_active["threadGoal"]["syncState"] == "active":
                             break
                         await asyncio.sleep(0.01)
@@ -802,7 +838,7 @@ class McpDefinitionTests(unittest.TestCase):
                     service.codex_approve_plan({"workflow_id": complete_started["workflowId"], "client_request_id": "workflow-goal-complete-exec"})
                     complete_executing = complete_active
                     for _ in range(50):
-                        complete_executing = await service.call("codex_get_workflow_status", {"workflow_id": complete_started["workflowId"]})
+                        complete_executing = await service.call("codex_get_workflow_status", {"workflow_id": complete_started["workflowId"], "refresh_live_goal": True})
                         if complete_executing["executionTurnId"]:
                             break
                         await asyncio.sleep(0.01)
@@ -813,7 +849,7 @@ class McpDefinitionTests(unittest.TestCase):
                         completed_at="2026-05-25T00:00:04+00:00",
                         final_message="Final workflow report",
                     )
-                    complete_done = await service.call("codex_get_workflow_status", {"workflow_id": complete_started["workflowId"]})
+                    complete_done = await service.call("codex_get_workflow_status", {"workflow_id": complete_started["workflowId"], "refresh_live_goal": True})
 
                     override_started = await service.codex_start_plan_workflow(
                         {
@@ -826,12 +862,12 @@ class McpDefinitionTests(unittest.TestCase):
                     )
                     override_active = override_started
                     for _ in range(50):
-                        override_active = await service.call("codex_get_workflow_status", {"workflow_id": override_started["workflowId"]})
+                        override_active = await service.call("codex_get_workflow_status", {"workflow_id": override_started["workflowId"], "refresh_live_goal": True})
                         if override_active["threadGoal"]["syncState"] == "active":
                             break
                         await asyncio.sleep(0.01)
                     fake.thread_goals[override_active["threadId"]]["objective"] = "External goal override"
-                    override_status = await service.call("codex_get_workflow_status", {"workflow_id": override_started["workflowId"]})
+                    override_status = await service.call("codex_get_workflow_status", {"workflow_id": override_started["workflowId"], "refresh_live_goal": True})
                     return complete_done, fake.thread_goal_set_calls, override_status, len(fake.thread_goal_clear_calls)
                 finally:
                     await service.close()

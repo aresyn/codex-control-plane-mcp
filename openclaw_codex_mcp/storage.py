@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import random
 import sqlite3
+import time
+from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 from .statuses import OPERATION_ACTIVE_STATUSES, OPERATION_STARTABLE_STATUSES, PROMPT_SUBMISSION_CLEANUP_STATUSES
 
@@ -599,6 +602,8 @@ CREATE VIRTUAL TABLE IF NOT EXISTS codex_hook_messages_fts USING fts5(
 );
 """
 
+_T = TypeVar("_T")
+
 
 class McpStorage:
     def __init__(self, path: Path) -> None:
@@ -607,11 +612,10 @@ class McpStorage:
 
     def connect(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(str(self.path), check_same_thread=False)
+        self._connection = sqlite3.connect(str(self.path), timeout=30.0, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
-        self._connection.executescript(SCHEMA)
-        self._apply_schema_migrations()
-        self._connection.commit()
+        self._configure_connection()
+        self._initialize_schema_with_retry()
 
     def close(self) -> None:
         if self._connection is not None:
@@ -694,6 +698,78 @@ class McpStorage:
 
     def commit(self) -> None:
         self.connection.commit()
+
+    def execute_write_with_retry(
+        self,
+        sql: str,
+        parameters: Any = (),
+        *,
+        commit: bool = True,
+        attempts: int = 6,
+    ) -> sqlite3.Cursor:
+        cursor: sqlite3.Cursor | None = None
+
+        def operation() -> sqlite3.Cursor:
+            nonlocal cursor
+            cursor = self.connection.execute(sql, parameters)
+            if commit:
+                self.connection.commit()
+            assert cursor is not None
+            return cursor
+
+        return self._sqlite_retry(operation, attempts=attempts)
+
+    def _configure_connection(self) -> None:
+        assert self._connection is not None
+        pragmas = [
+            ("PRAGMA busy_timeout=30000", True),
+            ("PRAGMA journal_mode=WAL", False),
+            ("PRAGMA synchronous=NORMAL", False),
+            ("PRAGMA foreign_keys=ON", False),
+        ]
+        for statement, required in pragmas:
+            try:
+                self._connection.execute(statement)
+            except sqlite3.DatabaseError:
+                if required:
+                    raise
+
+    def _initialize_schema_with_retry(self) -> None:
+        def operation() -> None:
+            assert self._connection is not None
+            self._connection.executescript(SCHEMA)
+            self._apply_schema_migrations()
+            self._connection.commit()
+
+        self._sqlite_retry(operation, attempts=10, base_delay_seconds=0.05, max_delay_seconds=1.0)
+
+    def _sqlite_retry(
+        self,
+        operation: Callable[[], _T],
+        *,
+        attempts: int = 6,
+        base_delay_seconds: float = 0.025,
+        max_delay_seconds: float = 0.5,
+    ) -> _T:
+        last_error: sqlite3.OperationalError | None = None
+        for attempt in range(max(1, attempts)):
+            try:
+                return operation()
+            except sqlite3.OperationalError as exc:
+                if not _is_sqlite_busy(exc) or attempt >= attempts - 1:
+                    raise
+                last_error = exc
+                with suppress(sqlite3.Error):
+                    self.connection.rollback()
+                delay = min(max_delay_seconds, base_delay_seconds * (2**attempt))
+                time.sleep(delay + random.uniform(0, delay / 3))
+        assert last_error is not None
+        raise last_error
+
+
+def _is_sqlite_busy(exc: sqlite3.OperationalError) -> bool:
+    text = str(exc).lower()
+    return "database is locked" in text or "database table is locked" in text or "database is busy" in text
 
 def _install_storage_mixins() -> None:
     from .diagnostic_store import DiagnosticStoreMixin

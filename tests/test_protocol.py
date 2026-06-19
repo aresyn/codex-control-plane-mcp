@@ -249,6 +249,7 @@ class McpDefinitionTests(unittest.TestCase):
 
         workflow_status_schema = by_name["codex_get_workflow_status"]["inputSchema"]
         self.assertEqual(["workflow_id"], workflow_status_schema["required"])
+        self.assertFalse(workflow_status_schema["properties"]["refresh_live_goal"]["default"])
 
         adopt_schema = by_name["codex_adopt_workflow_plan"]["inputSchema"]
         self.assertEqual(["workflow_id", "candidate_turn_id", "candidate_plan_hash"], adopt_schema["required"])

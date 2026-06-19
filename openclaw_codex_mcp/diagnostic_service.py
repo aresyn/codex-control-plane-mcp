@@ -13,6 +13,13 @@ def _diagnostic_workflow_metadata(workflow: dict[str, Any]) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _diagnostic_int_or_none(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class DiagnosticServiceMixin:
     def codex_health_summary(self, args: dict[str, Any]) -> dict[str, Any]:
         since_minutes = _bounded_int(args.get("since_minutes", 120), 1, 10080)
@@ -23,6 +30,7 @@ class DiagnosticServiceMixin:
         app_status = self.codex_get_app_server_status({"include_recent_events": False})
         pending = self._pending_interactions_for_diagnostics(context, limit=20)
         active_turns = self._active_turns_snapshot(app_status)
+        stall_supervisor = self._stall_supervisor_snapshot(active_turns, pending)
         stale_before = (datetime.now(timezone.utc) - timedelta(minutes=stale_after_minutes)).isoformat()
         stale_operations = _filter_operations_for_context(
             context,
@@ -97,6 +105,7 @@ class DiagnosticServiceMixin:
                 "codexBinaryExists": app_status.get("codexBinaryExists", self.config.codex_binary_path.exists()),
             },
             "activeWork": active_work,
+            "stallSupervisor": stall_supervisor,
             "staleOperations": [_operation_summary_to_tool(row) for row in stale_operations],
             "prematureTerminalOperations": [_operation_summary_to_tool(row) for row in premature_terminal_operations],
             "recentErrors": recent_errors,
@@ -119,6 +128,8 @@ class DiagnosticServiceMixin:
                 "defaultApprovalPolicy": self.config.default_approval_policy,
                 "defaultSandboxPolicy": self.config.default_sandbox_policy,
                 "startAppServerForReadTools": self.config.start_app_server_for_read_tools,
+                "turnStallTimeoutSeconds": self.config.turn_stall_timeout_seconds,
+                "stalledTurnAction": self.config.stalled_turn_action,
             },
             "recommendedActions": _unique_strings(recommendations),
             "nextRecommendedAction": next_action,
@@ -126,6 +137,49 @@ class DiagnosticServiceMixin:
             "pollRecommended": bool(active_turns or pending or stale_operations),
         }
         return redact_payload(self._attach_agent_guidance(result, surface="health_summary"))
+
+    def _stall_supervisor_snapshot(self, active_turns: list[dict[str, Any]], pending: list[dict[str, Any]]) -> dict[str, Any]:
+        timeout_seconds = int(getattr(self.config, "turn_stall_timeout_seconds", 900) or 900)
+        action = str(getattr(self.config, "stalled_turn_action", "diagnose_only") or "diagnose_only")
+        pending_turn_ids = {
+            _optional_string(item.get("turnId")) or _optional_string(item.get("turn_id"))
+            for item in pending
+            if isinstance(item, dict)
+        }
+        pending_thread_ids = {
+            _optional_string(item.get("threadId")) or _optional_string(item.get("thread_id"))
+            for item in pending
+            if isinstance(item, dict)
+        }
+        pending_turn_ids.discard(None)
+        pending_thread_ids.discard(None)
+        stalled: list[dict[str, Any]] = []
+        for turn in active_turns:
+            staleness = _diagnostic_int_or_none(turn.get("stalenessSeconds"))
+            turn_id = _optional_string(turn.get("turnId")) or _optional_string(turn.get("turn_id"))
+            thread_id = _optional_string(turn.get("threadId")) or _optional_string(turn.get("thread_id"))
+            has_pending = bool((turn_id and turn_id in pending_turn_ids) or (thread_id and thread_id in pending_thread_ids))
+            if staleness is None or staleness < timeout_seconds or has_pending:
+                continue
+            stalled.append(
+                {
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "status": turn.get("status"),
+                    "updatedAt": turn.get("updatedAt") or turn.get("updated_at"),
+                    "stalenessSeconds": staleness,
+                    "hasPendingInteraction": has_pending,
+                }
+            )
+        return {
+            "enabled": True,
+            "mode": action,
+            "timeoutSeconds": timeout_seconds,
+            "stalledTurnCount": len(stalled),
+            "stalledTurns": stalled[:20],
+            "automaticInterruptEnabled": action == "interrupt",
+            "nextRecommendedAction": "mark_stale_turns_orphaned" if stalled and action == "diagnose_only" else None,
+        }
 
     def _diagnostic_context(self, args: dict[str, Any]) -> dict[str, Any]:
         operation_id = _optional_string(args.get("operation_id"))
@@ -1301,12 +1355,14 @@ class DiagnosticServiceMixin:
                 500,
                 200000,
             ),
+            "_skip_prompt_dedup": True,
+            "_prompt_dedup_basis": f"retry_workflow:{workflow_id}:{retry_client_request_id}:{prompt_hash(normalize_prompt(message))}",
         }
         retry_args = {key: value for key, value in retry_args.items() if value not in (None, "")}
         preview_request = {
             key: value
             for key, value in retry_args.items()
-            if key not in {"message"}
+            if key not in {"message"} and not str(key).startswith("_")
         }
         preview_request.update(
             {

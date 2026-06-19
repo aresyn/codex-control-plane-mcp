@@ -427,8 +427,11 @@ Inputs:
   `clear`.
 - `goal_completion_objective`: optional objective used with `set_complete`.
 
-Goal sync starts after the workflow has a `threadId`. `codex_get_workflow_status`
-performs best-effort sync and returns:
+Goal sync starts after the workflow has a `threadId`, but normal workflow polling
+is passive. `codex_get_workflow_status` does not call app-server goal methods
+unless the caller passes `refresh_live_goal=true`.
+
+When `refresh_live_goal=true`, MCP performs best-effort sync and returns:
 
 - `threadGoal.configured`
 - `threadGoal.managed`
@@ -441,6 +444,7 @@ performs best-effort sync and returns:
 - `threadGoal.clearedAt`
 - `threadGoal.lastError`
 - `threadGoal.available`
+- `threadGoal.liveRefreshPerformed`
 
 Common `syncState` values:
 
@@ -457,6 +461,30 @@ Common `syncState` values:
 
 MCP does not auto-generate goals from prompt or title. It redacts and truncates
 goal text in public status and workflow events.
+
+Clients should keep frequent polling passive. Use `refresh_live_goal=true` only
+for an explicit goal sync check or a repair flow.
+
+## Stalled turn supervision
+
+MCP reports stalled turns in `codex_health_summary.stallSupervisor` without
+calling app-server:
+
+- `mode`: `diagnose_only` or `interrupt`
+- `timeoutSeconds`: configured inactivity threshold
+- `stalledTurnCount`
+- `stalledTurns`
+- `automaticInterruptEnabled`
+- `nextRecommendedAction`
+
+Public defaults are conservative:
+
+- `CODEX_MCP_TURN_STALL_TIMEOUT_SECONDS=900`
+- `CODEX_MCP_STALLED_TURN_ACTION=diagnose_only`
+
+`diagnose_only` never interrupts a turn by itself. Agents should collect
+diagnostics and run repair actions with `dry_run=true` before retrying or
+interrupting work.
 
 ## Structured final reports
 

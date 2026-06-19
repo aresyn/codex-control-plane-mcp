@@ -20,7 +20,7 @@ class DiagnosticStoreMixin:
                 thread_id = thread.get("id")
             if not turn_id and isinstance(turn, dict):
                 turn_id = turn.get("id")
-        self.connection.execute(
+        self.execute_write_with_retry(
             """
             INSERT INTO app_server_events(direction, jsonrpc_id, method, thread_id, turn_id, process_generation, payload_json, received_at)
             VALUES(?, ?, ?, ?, ?, ?, ?, ?)
@@ -36,7 +36,6 @@ class DiagnosticStoreMixin:
                 received_at,
             ),
         )
-        self.connection.commit()
 
     def list_app_server_events(
         self,

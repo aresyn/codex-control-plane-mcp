@@ -605,7 +605,9 @@ If OpenClaw owns a high-level goal, pass it explicitly:
 }
 ```
 
-Read `threadGoal` from `codex_get_workflow_status`:
+Read `threadGoal` from `codex_get_workflow_status`. Normal workflow polling is
+passive and does not call live app-server goal methods. If you need to sync or
+verify the goal, call `codex_get_workflow_status` with `refresh_live_goal=true`.
 
 - `syncState == "active"`: the goal was set;
 - `pending_thread`: the workflow thread is not known yet;
@@ -896,6 +898,13 @@ returns a normal durable operation id.
 
 If `pollRecommended == true`, there is active work, pending interaction, or
 stale operation state. Continue health polling or run diagnostics.
+
+Read `stallSupervisor` before deciding to retry a long-running turn:
+
+- `mode == "diagnose_only"`: do not interrupt automatically;
+- `stalledTurnCount > 0`: collect diagnostics and run repair with `dry_run=true`;
+- `automaticInterruptEnabled == true`: only then may an automated local policy
+  interrupt stale turns.
 
 ## Diagnostics
 

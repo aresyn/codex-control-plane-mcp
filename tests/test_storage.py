@@ -307,6 +307,43 @@ class OperationLeaseStorageTests(unittest.TestCase):
         self.assertTrue(after_terminal["terminalEvidence"]["trusted"])
         self.assertEqual("intermediate assistant text", stored_after["final_message"])
 
+    def test_turn_tracker_canonicalizes_unknown_lifecycle_turn_to_active_thread_turn(self) -> None:
+        with TemporaryDirectory() as tmp:
+            storage = McpStorage(Path(tmp) / "mcp.sqlite")
+            storage.connect()
+            try:
+                tracker = TurnTracker(storage)
+                tracker.register_turn(
+                    turn_id="turn-ack",
+                    thread_id="thread-canonical",
+                    chat_id="thread-canonical",
+                    project_id="project",
+                    project_path=str(Path(tmp)),
+                    status="running",
+                    started_at="2026-05-25T00:00:00+00:00",
+                    user_message="canonical prompt",
+                )
+                tracker.record_event(
+                    {
+                        "method": "item/created",
+                        "params": {
+                            "threadId": "thread-canonical",
+                            "turnId": "turn-lifecycle",
+                            "item": {"type": "agentMessage", "text": "assistant text from lifecycle id"},
+                        },
+                    },
+                    received_at="2026-05-25T00:00:01+00:00",
+                )
+                canonical = tracker.get_turn_status("turn-ack", last_messages=10, message_max_chars=8000)
+                lifecycle = storage.get_tracked_turn("turn-lifecycle")
+            finally:
+                storage.close()
+
+        self.assertIsNotNone(canonical)
+        self.assertEqual("first_message_received", canonical["status"])
+        self.assertEqual("assistant text from lifecycle id", canonical["latestMessages"][-1]["text"])
+        self.assertIsNone(lifecycle)
+
     def test_startup_recovery_resets_starting_without_turn_and_preserves_turn(self) -> None:
         with TemporaryDirectory() as tmp:
             storage = McpStorage(Path(tmp) / "mcp.sqlite")

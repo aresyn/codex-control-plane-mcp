@@ -68,6 +68,10 @@ class WorkflowServiceMixin:
             "timeout_seconds": args.get("timeout_seconds", DEFAULT_TOOL_START_TIMEOUT_SECONDS),
             "first_message_max_chars": args.get("first_message_max_chars", 8000),
         }
+        if args.get("_skip_prompt_dedup"):
+            operation_args["_skip_prompt_dedup"] = True
+        if args.get("_prompt_dedup_basis"):
+            operation_args["_prompt_dedup_basis"] = args.get("_prompt_dedup_basis")
         start_operation = self.codex_submit_task(operation_args)
         plan_operation_id = str(start_operation.get("operationId") or "")
         if not plan_operation_id:
@@ -157,17 +161,21 @@ class WorkflowServiceMixin:
         last_messages = _bounded_int(args.get("last_messages", 10), 1, 50)
         message_max_chars = _bounded_int(args.get("message_max_chars", 8000), 500, 200000)
         include_events = bool(args.get("include_events", True))
+        refresh_live_goal = bool(args.get("refresh_live_goal", False))
         result = self._workflow_status_payload(
             workflow,
             last_messages=last_messages,
             message_max_chars=message_max_chars,
             include_events=include_events,
         )
-        if str(workflow.get("workflow_kind") or "") == "code_review":
+        if str(workflow.get("workflow_kind") or "") == "code_review" or not refresh_live_goal:
+            if isinstance(result.get("threadGoal"), dict):
+                result["threadGoal"]["liveRefreshPerformed"] = False
             return result
         synced = await self._sync_workflow_goal_for_status(workflow_id, phase=str(result.get("phase") or ""))
         if synced is not None:
             result["threadGoal"] = self._workflow_goal_status(synced)
+            result["threadGoal"]["liveRefreshPerformed"] = True
             if include_events:
                 result["events"] = [_workflow_event_to_tool(row) for row in self.storage.list_workflow_events(workflow_id, limit=20)]
         return result

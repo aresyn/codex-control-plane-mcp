@@ -343,13 +343,15 @@ Mirror a workflow goal into Codex Desktop when the client has one:
 
 ```text
 codex_start_plan_workflow(goal="Review the migration plan", goal_completion_action="clear")
-codex_get_workflow_status(workflowId)
+codex_get_workflow_status(workflowId, refresh_live_goal=true)
   -> threadGoal.syncState + threadGoal.currentGoal
 ```
 
 MCP writes a thread goal only when the client passes `goal`. Managed goals use
 `clear` after completion by default. Use `set_complete` or `leave` when the goal
-should remain visible after the workflow ends.
+should remain visible after the workflow ends. Normal workflow polling is
+passive; use `refresh_live_goal=true` only when you want MCP to call live
+app-server goal methods.
 
 Run a Codex code review:
 
@@ -547,6 +549,8 @@ Common variables:
 - `CODEX_MCP_DEFAULT_EFFORT`: default effort level.
 - `CODEX_MCP_MAX_IMAGE_INPUT_ITEMS`: max image attachments per `codex_submit_task`. Defaults to `10`.
 - `CODEX_MCP_MAX_IMAGE_INPUT_BYTES`: max bytes for one local image input. Defaults to `20000000`.
+- `CODEX_MCP_TURN_STALL_TIMEOUT_SECONDS`: inactivity threshold for stalled-turn reporting. Defaults to `900`.
+- `CODEX_MCP_STALLED_TURN_ACTION`: stalled-turn policy. Defaults to `diagnose_only`.
 - `CODEX_MCP_APPROVAL_RESPONSE_TIMEOUT_SECONDS`: pending interaction timeout.
 - `DEEPSEEK_ENV_PATH`: optional `.env` file for DeepSeek summary settings.
 - `DEEPSEEK_SUMMARY_ENABLED`: enables or disables remote summary calls.

@@ -201,8 +201,8 @@ class CodexAppServerClient:
         future: asyncio.Future[Any] = loop.create_future()
         self._pending[request_id] = future
         LOG.info("app-server request start id=%s method=%s timeout=%s", request_id, method, timeout_seconds)
-        await self._send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
         try:
+            await self._send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
             if timeout_seconds is None:
                 result = await future
             else:
@@ -491,7 +491,7 @@ class CodexAppServerClient:
         async with self._write_lock:
             self.process.stdin.write(line.encode("utf-8"))
             await self.process.stdin.drain()
-        self.storage.record_app_server_event("outbound", payload, _now_iso(), process_generation=self.process_generation)
+        self._record_app_server_event_best_effort("outbound", payload, _now_iso())
 
     async def _read_stdout_loop(self) -> None:
         assert self.process is not None and self.process.stdout is not None
@@ -538,27 +538,43 @@ class CodexAppServerClient:
             LOG.warning("failed to decode app-server stdout line: %s", text[:500])
             return
         received_at = _now_iso()
-        self.storage.record_app_server_event("inbound", payload, received_at, process_generation=self.process_generation)
-
         if "method" in payload and payload.get("id") is not None:
-            await self._handle_server_request(payload)
+            try:
+                await self._handle_server_request(payload)
+            except Exception as exc:
+                LOG.exception("app-server server-request handling failed method=%s id=%s", payload.get("method"), payload.get("id"))
+                self.last_error = f"server request handling failed: {payload.get('method')}: {exc}"
+                with suppress(Exception):
+                    await self._send(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": payload.get("id"),
+                            "error": {"code": -32603, "message": "MCP failed to handle app-server request."},
+                        }
+                    )
+            self._record_app_server_event_best_effort("inbound", payload, received_at)
             return
         if "method" in payload:
             self._recent_events.append(payload)
-            self.tracker.record_event(payload, received_at=received_at)
+            self._record_tracker_event_best_effort(payload, received_at)
+            self._record_app_server_event_best_effort("inbound", payload, received_at)
             return
         request_id = payload.get("id")
         future = self._pending.get(request_id)
         if future is None:
+            self._record_app_server_event_best_effort("inbound", payload, received_at)
             return
         if "error" in payload:
             message = str((payload.get("error") or {}).get("message") or "Codex app-server error")
             LOG.warning("app-server response error id=%s message=%s", request_id, message)
-            future.set_exception(RuntimeError(message))
+            if not future.done():
+                future.set_exception(RuntimeError(message))
         else:
             result = payload.get("result")
-            self.tracker.record_thread_snapshot(result, received_at=received_at)
-            future.set_result(result)
+            self._record_thread_snapshot_best_effort(result, received_at)
+            if not future.done():
+                future.set_result(result)
+        self._record_app_server_event_best_effort("inbound", payload, received_at)
 
     async def _handle_server_request(self, payload: dict[str, Any]) -> None:
         method = str(payload.get("method") or "")
@@ -566,7 +582,7 @@ class CodexAppServerClient:
         request_id = payload.get("id")
         event = {"jsonrpc": "2.0", "method": method, "params": params}
         self._recent_events.append(event)
-        self.tracker.record_event(event, received_at=_now_iso())
+        self._record_tracker_event_best_effort(event, _now_iso())
         LOG.info("app-server server-request method=%s id=%s", method, request_id)
 
         if is_supported_interaction_method(method):
@@ -584,6 +600,42 @@ class CodexAppServerClient:
             )
             return
         await self.respond_success(request_id, {})
+
+    def _record_app_server_event_best_effort(self, direction: str, payload: dict[str, Any], received_at: str) -> None:
+        try:
+            self.storage.record_app_server_event(
+                direction,
+                payload,
+                received_at,
+                process_generation=self.process_generation,
+            )
+        except Exception as exc:
+            self.last_error = f"app-server audit write failed: {exc}"
+            LOG.warning(
+                "app-server audit write failed direction=%s method=%s id=%s error=%s",
+                direction,
+                payload.get("method"),
+                payload.get("id"),
+                exc,
+            )
+
+    def _record_tracker_event_best_effort(self, payload: dict[str, Any], received_at: str) -> None:
+        try:
+            self.tracker.record_event(payload, received_at=received_at)
+        except Exception as exc:
+            self.last_error = f"turn tracker event write failed: {exc}"
+            LOG.warning(
+                "turn tracker event write failed method=%s error=%s",
+                payload.get("method"),
+                exc,
+            )
+
+    def _record_thread_snapshot_best_effort(self, result: Any, received_at: str) -> None:
+        try:
+            self.tracker.record_thread_snapshot(result, received_at=received_at)
+        except Exception as exc:
+            self.last_error = f"thread snapshot write failed: {exc}"
+            LOG.warning("thread snapshot write failed error=%s", exc)
 
     async def _resolve_pending_interaction(self, interaction_id: str, request_id: Any) -> None:
         try:

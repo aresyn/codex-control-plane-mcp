@@ -25,6 +25,19 @@ class _FakeProcess:
         return self.returncode
 
 
+class _FakeStdin:
+    def __init__(self, *, drain_error: Exception | None = None) -> None:
+        self.lines: list[bytes] = []
+        self.drain_error = drain_error
+
+    def write(self, data: bytes) -> None:
+        self.lines.append(data)
+
+    async def drain(self) -> None:
+        if self.drain_error is not None:
+            raise self.drain_error
+
+
 class CodexAppServerClientTests(unittest.TestCase):
     def test_start_passes_configured_codex_home_to_app_server_env(self) -> None:
         async def scenario() -> tuple[dict, dict]:
@@ -79,3 +92,59 @@ class CodexAppServerClientTests(unittest.TestCase):
         self.assertEqual(str(status["codexHome"]), env["CODEX_HOME"])
         self.assertNotEqual(env["CODEX_HOME"], str(Path(status["codexHome"]).parent / "wrong-home"))
         self.assertEqual("app-server", captured["args"][1])
+
+    def test_audit_write_failure_does_not_leak_pending_request(self) -> None:
+        async def scenario() -> tuple[dict, int, str | None]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                config = _search_service_config(root, root / ".codex" / "state_5.sqlite")
+                storage = McpStorage(root / "mcp.sqlite")
+                storage.connect()
+                client = CodexAppServerClient(config, storage)
+                process = _FakeProcess()
+                process.stdin = _FakeStdin()
+                client.process = process  # type: ignore[assignment]
+
+                def fail_audit(*args: object, **kwargs: object) -> None:
+                    raise sqlite3.OperationalError("database is locked")
+
+                storage.record_app_server_event = fail_audit  # type: ignore[method-assign]
+                try:
+                    task = asyncio.create_task(client.request("model/list", {}, timeout_seconds=1))
+                    await asyncio.sleep(0)
+                    self.assertEqual(1, len(client._pending))
+                    await client._handle_stdout_line(b'{"jsonrpc":"2.0","id":1,"result":{"ok":true}}')
+                    result = await task
+                    return result, len(client._pending), client.last_error
+                finally:
+                    await client.stop()
+                    storage.close()
+
+        result, pending_count, last_error = asyncio.run(scenario())
+
+        self.assertEqual({"ok": True, "_requestId": 1, "_processGeneration": 0}, result)
+        self.assertEqual(0, pending_count)
+        self.assertIn("audit write failed", last_error or "")
+
+    def test_send_failure_cleans_pending_request(self) -> None:
+        async def scenario() -> int:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                config = _search_service_config(root, root / ".codex" / "state_5.sqlite")
+                storage = McpStorage(root / "mcp.sqlite")
+                storage.connect()
+                client = CodexAppServerClient(config, storage)
+                process = _FakeProcess()
+                process.stdin = _FakeStdin(drain_error=BrokenPipeError("pipe closed"))
+                client.process = process  # type: ignore[assignment]
+                try:
+                    with self.assertRaises(BrokenPipeError):
+                        await client.request("model/list", {}, timeout_seconds=1)
+                    return len(client._pending)
+                finally:
+                    await client.stop()
+                    storage.close()
+
+        pending_count = asyncio.run(scenario())
+
+        self.assertEqual(0, pending_count)

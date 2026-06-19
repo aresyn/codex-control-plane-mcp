@@ -67,6 +67,40 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertEqual(health["generatedAt"], version["generatedAt"])
         self.assertEqual("not_collected", health["runtimeCapabilities"]["status"])
 
+    def test_health_summary_reports_stalled_turns_without_auto_interrupt(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = _search_service_config(root, root / ".codex" / "state_5.sqlite")
+            service = ToolService(config)
+            try:
+                service.storage.upsert_tracked_turn(
+                    {
+                        "turn_id": "turn-stalled-health",
+                        "thread_id": "thread-stalled-health",
+                        "chat_id": "thread-stalled-health",
+                        "project_id": "project",
+                        "project_path": str(root),
+                        "status": "running",
+                        "started_at": "2026-05-25T00:00:00+00:00",
+                        "updated_at": "2026-05-25T00:00:00+00:00",
+                        "completed_at": None,
+                        "first_message_at": None,
+                        "final_message": None,
+                        "last_error": None,
+                        "source": "app_server",
+                    }
+                )
+                health = service.codex_health_summary({})
+            finally:
+                asyncio.run(service.close())
+
+        supervisor = health["stallSupervisor"]
+        self.assertEqual("diagnose_only", supervisor["mode"])
+        self.assertEqual(900, supervisor["timeoutSeconds"])
+        self.assertFalse(supervisor["automaticInterruptEnabled"])
+        self.assertEqual(1, supervisor["stalledTurnCount"])
+        self.assertEqual("mark_stale_turns_orphaned", supervisor["nextRecommendedAction"])
+
     def test_pending_interaction_tool_payload_redacts_secret_answers_and_audits(self) -> None:
         async def scenario() -> tuple[dict, dict, dict, list[dict]]:
             with TemporaryDirectory() as tmp:
