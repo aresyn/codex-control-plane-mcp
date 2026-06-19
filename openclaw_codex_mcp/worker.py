@@ -348,8 +348,21 @@ class CentralWorker:
         for row in self.service.storage.list_resource_locks(limit=500):
             operation_id = str(row.get("operation_id") or "")
             operation = self.service.storage.get_operation(operation_id) if operation_id else None
-            if operation is None or str(operation.get("status") or "") in OPERATION_TERMINAL_STATUSES:
+            if operation is None:
                 self.service.storage.release_resource_locks_for_operation(operation_id)
+                continue
+            request = _operation_request_from_row(operation)
+            if not _operation_consumes_turn_slot(operation, request):
+                self.service.storage.release_resource_locks_for_operation(operation_id)
+                continue
+            if str(operation.get("status") or "") in OPERATION_TERMINAL_STATUSES:
+                self.service.storage.release_resource_locks_for_operation(operation_id)
+                continue
+            turn_id = _optional_string(operation.get("turn_id"))
+            if turn_id:
+                turn = self.service.storage.get_tracked_turn(turn_id)
+                if turn is None or str(turn.get("status") or "") not in TURN_ACTIVE_STATUSES:
+                    self.service.storage.release_resource_locks_for_operation(operation_id)
 
     def _cleanup_terminal_scheduling(self) -> None:
         terminal = tuple(sorted(OPERATION_TERMINAL_STATUSES))

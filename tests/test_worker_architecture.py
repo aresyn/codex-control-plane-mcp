@@ -270,6 +270,129 @@ class CentralWorkerArchitectureTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(1, terminal_queue["count"])
             self.assertEqual("unknown_after_app_server_exit", cleaned["queue_status"])
 
+    async def test_cleanup_releases_locks_for_non_slot_operations(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_db = root / ".codex" / "state_5.sqlite"
+            worker_config = _search_service_config(root, state_db)
+            worker_config.execution_mode = "worker"
+            worker_service = ToolService(worker_config)
+            worker = CentralWorker(worker_service)
+            try:
+                now = "2026-05-25T00:00:00+00:00"
+                operation_id = "steer-lock-cleanup"
+                worker_service.storage.create_operation(
+                    {
+                        "operation_id": operation_id,
+                        "client_request_id": "steer-lock-cleanup",
+                        "operation_type": "steer_turn",
+                        "status": "running",
+                        "phase": "running",
+                        "project_id": "project-id",
+                        "chat_id": "thread-id",
+                        "thread_id": "thread-id",
+                        "turn_id": "turn-id",
+                        "workflow_id": None,
+                        "cwd": str(root),
+                        "title": None,
+                        "request_json": '{"thread_id":"thread-id","expected_turn_id":"turn-id","message":"steer"}',
+                        "created_at": now,
+                        "updated_at": now,
+                    }
+                )
+                worker_service.storage.replace_resource_locks_for_operation(
+                    operation_id=operation_id,
+                    locks=[
+                        {
+                            "lock_key": "thread:thread-id:active-turn",
+                            "operation_id": operation_id,
+                            "thread_id": "thread-id",
+                            "project_id": "project-id",
+                            "lock_mode": "exclusive",
+                            "worker_id": "stale-worker",
+                            "created_at": now,
+                            "expires_at": "2026-05-25T06:00:00+00:00",
+                        }
+                    ],
+                )
+
+                worker._cleanup_terminal_locks()
+                locks = worker_service.storage.list_resource_locks(operation_id=operation_id)
+            finally:
+                await worker_service.close()
+
+            self.assertEqual([], locks)
+
+    async def test_cleanup_releases_locks_when_tracked_turn_is_terminal(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_db = root / ".codex" / "state_5.sqlite"
+            worker_config = _search_service_config(root, state_db)
+            worker_config.execution_mode = "worker"
+            worker_service = ToolService(worker_config)
+            worker = CentralWorker(worker_service)
+            try:
+                now = "2026-05-25T00:00:00+00:00"
+                operation_id = "terminal-turn-lock-cleanup"
+                worker_service.storage.create_operation(
+                    {
+                        "operation_id": operation_id,
+                        "client_request_id": "terminal-turn-lock-cleanup",
+                        "operation_type": "start_chat",
+                        "status": "running",
+                        "phase": "running",
+                        "project_id": "project-id",
+                        "chat_id": "thread-id",
+                        "thread_id": "thread-id",
+                        "turn_id": "turn-done",
+                        "workflow_id": None,
+                        "cwd": str(root),
+                        "title": None,
+                        "request_json": '{"sandbox":"workspace-write"}',
+                        "created_at": now,
+                        "updated_at": now,
+                    }
+                )
+                worker_service.storage.upsert_tracked_turn(
+                    {
+                        "turn_id": "turn-done",
+                        "thread_id": "thread-id",
+                        "chat_id": "thread-id",
+                        "project_id": "project-id",
+                        "project_path": str(root),
+                        "status": "completed",
+                        "started_at": now,
+                        "updated_at": now,
+                        "completed_at": now,
+                        "first_message_at": None,
+                        "final_message": "done",
+                        "last_error": None,
+                        "source": "test",
+                    }
+                )
+                worker_service.storage.replace_resource_locks_for_operation(
+                    operation_id=operation_id,
+                    locks=[
+                        {
+                            "lock_key": "project:project-id:write",
+                            "operation_id": operation_id,
+                            "thread_id": "thread-id",
+                            "project_id": "project-id",
+                            "lock_mode": "exclusive",
+                            "worker_id": "stale-worker",
+                            "created_at": now,
+                            "expires_at": "2026-05-25T06:00:00+00:00",
+                        }
+                    ],
+                )
+
+                worker._cleanup_terminal_locks()
+                locks = worker_service.storage.list_resource_locks(operation_id=operation_id)
+            finally:
+                await worker_service.close()
+
+            self.assertEqual([], locks)
+
     async def test_write_turns_without_resource_keys_serialize_in_same_project(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
