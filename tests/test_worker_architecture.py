@@ -46,6 +46,50 @@ class CentralWorkerArchitectureTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("queued", status["status"])
             self.assertEqual([], fake.turn_start_calls)
 
+    async def test_queued_operation_reports_worker_config_fingerprint_mismatch(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "Project"
+            project.mkdir()
+            config = _search_service_config(root, root / ".codex" / "state_5.sqlite")
+            config.execution_mode = "client"
+            service = ToolService(config)
+            try:
+                now = datetime.now(timezone.utc).isoformat()
+                service.storage.upsert_worker(
+                    worker_id="worker-other-config",
+                    role="worker",
+                    status="running",
+                    pid=123,
+                    hostname="host",
+                    config_fingerprint="other-config-fingerprint",
+                    started_at=now,
+                    last_heartbeat_at=now,
+                    app_server_generation=1,
+                )
+                submitted = await service.call(
+                    "codex_submit_task",
+                    {
+                        "operation_type": "start_chat",
+                        "project_id": project_id_for_path(str(project)),
+                        "message": "queued operation should expose worker fingerprint mismatch",
+                        "client_request_id": "client-mode-config-mismatch",
+                    },
+                )
+                status = await service.call("codex_get_operation_status", {"operation_id": submitted["operationId"]})
+                queue = await service.call("codex_get_queue_status", {"limit": 10})
+            finally:
+                await service.close()
+
+            self.assertEqual("config_fingerprint_mismatch", status["queueState"]["queuedReason"])
+            self.assertEqual("config_fingerprint_mismatch", status["queueState"]["workerCompatibility"]["reason"])
+            self.assertEqual("inspect_worker_health", status["nextRecommendedAction"])
+            queued = {item["operationId"]: item for item in queue["queuedOperations"]}
+            queued_entry = queued[submitted["operationId"]]
+            self.assertEqual("config_fingerprint_mismatch", queued_entry["queuedReason"])
+            self.assertEqual("config_fingerprint_mismatch", queued_entry["workerCompatibility"]["reason"])
+            self.assertEqual("inspect_worker_health", queue["nextRecommendedAction"])
+
     async def test_client_mode_compatibility_start_chat_delegates_to_durable_queue(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

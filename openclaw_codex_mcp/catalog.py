@@ -231,22 +231,28 @@ class ProjectChatCatalog:
              ORDER BY lower(name)
             """
         ).fetchall()
-        return [
-            Project(
-                project_id=str(row["project_id"]),
-                name=str(row["name"]),
-                path=str(row["path"]),
-                normalized_path_key=str(row["normalized_path_key"]),
-                created_at=row["created_at"],
-                last_activity_at=row["last_activity_at"],
-                source=row["source"],
+        projects: list[Project] = []
+        for row in rows:
+            project_path = canonical_existing_path(row["path"])
+            if not project_path or not is_allowed_path(project_path, self.config.allowed_roots):
+                continue
+            projects.append(
+                Project(
+                    project_id=str(row["project_id"]),
+                    name=str(row["name"]),
+                    path=project_path,
+                    normalized_path_key=path_key(project_path),
+                    created_at=row["created_at"],
+                    last_activity_at=row["last_activity_at"],
+                    source=row["source"],
+                )
             )
-            for row in rows
-        ]
+        return projects
 
     def load_cached_chats(self) -> None:
         if self.chats:
             return
+        allowed_project_ids = set(self.projects.keys()) if self.projects else None
         rows = self.storage.connection.execute(
             """
             SELECT chat_id, thread_id, project_id, project_path, title, transcript_path,
@@ -256,12 +262,19 @@ class ProjectChatCatalog:
              ORDER BY updated_at DESC
             """
         ).fetchall()
-        self.chats = {
-            str(row["chat_id"]): Chat(
+        chats: dict[str, Chat] = {}
+        for row in rows:
+            project_id = str(row["project_id"]) if row["project_id"] is not None else None
+            if allowed_project_ids is not None and project_id not in allowed_project_ids:
+                continue
+            project_path = canonical_existing_path(row["project_path"])
+            if project_path and not is_allowed_path(project_path, self.config.allowed_roots):
+                continue
+            chat = Chat(
                 chat_id=str(row["chat_id"]),
                 thread_id=str(row["thread_id"]),
-                project_id=row["project_id"],
-                project_path=row["project_path"],
+                project_id=project_id,
+                project_path=project_path or row["project_path"],
                 title=row["title"],
                 created_at=row["created_at"],
                 updated_at=row["updated_at"],
@@ -272,8 +285,8 @@ class ProjectChatCatalog:
                 status_confidence=row["status_confidence"],
                 source=row["source"],
             )
-            for row in rows
-        }
+            chats[chat.chat_id] = chat
+        self.chats = chats
 
     def get_project(self, project_id: str) -> Project | None:
         self._ensure_refreshed()
@@ -355,7 +368,22 @@ class ProjectChatCatalog:
 
     def _ensure_refreshed(self) -> None:
         if self._last_refresh_at is None:
-            self.refresh()
+            if not self._load_cached_index():
+                self.refresh()
+
+    def _load_cached_index(self) -> bool:
+        projects = self.load_cached_projects()
+        if not projects:
+            return False
+        self.projects = {project.project_id: project for project in projects}
+        self.projects_by_path_key = {
+            project.normalized_path_key: project
+            for project in projects
+            if project.normalized_path_key
+        }
+        self.load_cached_chats()
+        self._last_refresh_at = now_iso()
+        return True
 
     def _projects_from_registry(self) -> list[Project]:
         path = self.config.projects_registry_path

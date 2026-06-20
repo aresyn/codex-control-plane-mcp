@@ -311,7 +311,7 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertEqual(0, archive_calls)
 
     def test_thread_compaction_status_completes_from_app_server_event(self) -> None:
-        async def scenario() -> tuple[dict, dict, dict, int]:
+        async def scenario() -> tuple[dict, dict, dict, int, list[dict]]:
             with TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 project = root / "Project"
@@ -346,11 +346,11 @@ class McpDefinitionTests(unittest.TestCase):
                         "codex_get_thread_compaction_status",
                         {"action_id": started["actionId"]},
                     )
-                    return started, running, completed, len(fake.thread_compact_start_calls)
+                    return started, running, completed, len(fake.thread_compact_start_calls), fake.thread_resume_calls
                 finally:
                     await service.close()
 
-        started, running, completed, compact_calls = asyncio.run(scenario())
+        started, running, completed, compact_calls, resume_calls = asyncio.run(scenario())
 
         self.assertEqual("compact", started["actionType"])
         self.assertEqual("running", started["status"])
@@ -362,6 +362,73 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertFalse(completed["pollRecommended"])
         self.assertEqual("turn-compact-result", completed["targetTurnId"])
         self.assertEqual(1, compact_calls)
+        self.assertEqual(1, len(resume_calls))
+        self.assertEqual("thread-compact", resume_calls[0]["thread_id"])
+        self.assertTrue(str(resume_calls[0]["cwd"]).endswith("Project"))
+        self.assertEqual(30, resume_calls[0]["timeout_seconds"])
+
+    def test_thread_compaction_uses_known_context_when_catalog_lacks_project_path(self) -> None:
+        async def scenario() -> list[dict]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                config = _search_service_config(root, root / ".codex" / "state_5.sqlite")
+                service = ToolService(config)
+                fake = FakeAppServer(service.storage, first_message=None)
+                service._app_server = fake  # type: ignore[assignment]
+                project_id = project_id_for_path(str(project))
+                now = datetime.now(timezone.utc).isoformat()
+                service.storage.upsert_project(
+                    {
+                        "project_id": project_id,
+                        "name": "Project",
+                        "path": str(project),
+                        "normalized_path_key": str(project),
+                        "created_at": now,
+                        "last_activity_at": now,
+                        "source": "cache",
+                        "updated_at": now,
+                    }
+                )
+                service.storage.upsert_chat(
+                    {
+                        "chat_id": "thread-compact-live",
+                        "thread_id": "thread-compact-live",
+                        "project_id": project_id,
+                        "project_path": "",
+                        "title": "Catalog row without project path",
+                        "transcript_path": "",
+                        "created_at": now,
+                        "updated_at": now,
+                        "archived": 0,
+                        "last_message_preview": None,
+                        "status": "idle",
+                        "status_confidence": "medium",
+                        "source": "cache",
+                        "updated_at_local": now,
+                    }
+                )
+                fake.tracker.register_turn(
+                    turn_id="turn-compact-live",
+                    thread_id="thread-compact-live",
+                    chat_id="thread-compact-live",
+                    project_id=project_id,
+                    project_path=str(project),
+                    status="completed",
+                )
+                try:
+                    await service.call("codex_start_thread_compaction", {"thread_id": "thread-compact-live", "project_id": project_id})
+                    return fake.thread_resume_calls
+                finally:
+                    await service.close()
+
+        resume_calls = asyncio.run(scenario())
+
+        self.assertEqual(1, len(resume_calls))
+        self.assertEqual("thread-compact-live", resume_calls[0]["thread_id"])
+        self.assertEqual(30, resume_calls[0]["timeout_seconds"])
+        self.assertTrue(str(resume_calls[0]["cwd"]).endswith("Project"))
 
     def test_thread_compaction_unknown_after_app_server_exit(self) -> None:
         async def scenario() -> dict:

@@ -9,7 +9,7 @@ from typing import Any
 from .config import is_path_under
 
 
-_WINDOWS_PATH_RE = re.compile(r"(?i)(?:[a-z]:\\[^\s\"'<>|]+|\\\\[^\s\"'<>|]+)")
+_WINDOWS_PATH_RE = re.compile(r"(?i)(?:[a-z]:[\\/][^\s\"'<>|\)\]]+|\\\\[^\s\"'<>|\)\]]+)")
 _EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
 _TOKEN_RE = re.compile(
     r"(?i)(?:\b(?:sk|sess|tok|key)[-_][A-Za-z0-9._-]{12,}\b|\bbearer\s+[A-Za-z0-9._~+/=-]{12,})"

@@ -107,6 +107,28 @@ For a running turn, prefer the worker fields over local app-server guesses:
 `queueState`. In client mode the gateway must not start its own app-server just
 to answer status.
 
+## External validation client
+
+During MCP development and release checks, use the external client from this
+repository instead of relying on a Codex Desktop session reload:
+
+```powershell
+python .\scripts\external_mcp_client.py daemon-start
+python .\scripts\external_mcp_client.py daemon-restart-mcp --reason after_code_change
+python .\scripts\external_mcp_client.py run-live-test --scenario full --archive-report
+```
+
+The daemon acts like a separate MCP client. It uses the same tools that
+OpenClaw uses, writes findings to `corrective_action_plan.md`, and can restart
+its own MCP subprocess after a code change. It does not restart the central
+worker, so restart `codex-control-plane-mcp-worker` separately when worker code
+or worker configuration changes.
+
+Use the external client for sandbox live tests before changing OpenClaw gateway
+entries. A clean run should leave `codex_get_queue_status`,
+`codex_get_concurrency_status`, and `codex_get_app_server_status` with zero
+active turns, zero locks, and zero pending requests.
+
 ## Core rules
 
 1. Use `codex_submit_task` for new long-running tasks.

@@ -734,6 +734,23 @@ Full live regression:
 python .\scripts\mcp_live_smoke.py --scenario full --safe-restart --cwd <PROJECT_ROOT>
 ```
 
+Внешний MCP client для разработки и долгих live-проверок:
+
+```powershell
+python .\scripts\external_mcp_client.py daemon-start
+python .\scripts\external_mcp_client.py daemon-restart-mcp --reason after_code_change
+python .\scripts\external_mcp_client.py run-live-test --scenario full --archive-report
+```
+
+Используйте внешний client, когда нужно проверить текущий checkout как обычный
+MCP-клиент без перезапуска Codex Desktop. Он запускает отдельный daemon, держит
+собственный MCP stdio subprocess и после правок может перезапускать только этот
+subprocess. Live findings записываются в `corrective_action_plan.md`; старые
+отчеты можно архивировать через `--archive-report`.
+
+Команды daemon и доступные live-сценарии описаны в
+[docs/EXTERNAL_MCP_CLIENT.md](docs/EXTERNAL_MCP_CLIENT.md).
+
 См. [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md). Позиционирование для
 публичного запуска описано в [docs/PUBLICATION_GUIDE.md](docs/PUBLICATION_GUIDE.md).
 

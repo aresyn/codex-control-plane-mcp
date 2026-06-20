@@ -196,6 +196,42 @@ Worker control commands run on a separate command lane from turn scheduling.
 returns a compact command envelope; request the full result only with
 `include_result=true` and a bounded `max_result_chars`.
 
+## External live-test client
+
+The repository includes `scripts/external_mcp_client.py` for local development
+and release checks. It is not a public MCP tool. It is a standalone client that
+talks to this server through the same MCP protocol used by OpenClaw and Hermes.
+
+The daemon mode keeps one MCP stdio subprocess alive:
+
+```powershell
+python .\scripts\external_mcp_client.py daemon-start
+python .\scripts\external_mcp_client.py daemon-restart-mcp --reason after_code_change
+python .\scripts\external_mcp_client.py run-live-test --scenario baseline --archive-report
+```
+
+`daemon-restart-mcp` restarts only the MCP subprocess owned by the external
+client. It does not restart Codex Desktop and does not restart the central
+worker. If a code change affects worker execution, restart the worker separately
+before running live scenarios.
+
+Live scenarios are regular MCP client flows:
+
+- `baseline`
+- `read`
+- `durable-matrix`
+- `parallel-stress`
+- `steer-interrupt`
+- `workflow-review`
+- `lifecycle`
+- `diagnostics`
+- `full`
+
+Findings are written to `corrective_action_plan.md` using redacted evidence:
+operation ids, workflow ids, thread ids, action ids, compact status fields, and
+short reproduction notes. The report must not include secrets, account ids,
+tokens, raw payloads, or private paths outside the configured sandbox projects.
+
 ## Durable operation types
 
 `codex_submit_task` supports these operation types:

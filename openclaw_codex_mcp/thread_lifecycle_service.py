@@ -230,7 +230,7 @@ class ThreadLifecycleServiceMixin:
 
     def _resolve_lifecycle_thread_context(self, *, thread_id: str, project_id: str | None = None) -> dict[str, Any]:
         resolution = self.thread_resolver.resolve(thread_id, project_id, refresh_catalog=True)
-        known_thread = self._resolve_known_thread_context(thread_id, project_id) if resolution is None else None
+        known_thread = self._resolve_known_thread_context(thread_id, project_id)
         if resolution is None and known_thread is None:
             raise thread_not_found(thread_id)
         chat = resolution.chat if resolution is not None else None
@@ -239,12 +239,19 @@ class ThreadLifecycleServiceMixin:
         ) or project_id
         if project_id and resolved_project_id and project_id != resolved_project_id:
             raise thread_not_found(thread_id)
+        project_path = (
+            (_optional_string(chat.project_path) if chat is not None else None)
+            or _optional_string((known_thread or {}).get("projectPath"))
+        )
+        source = resolution.source if resolution is not None else (_optional_string((known_thread or {}).get("source")) or "operation")
+        if resolution is not None and known_thread is not None and not _optional_string(chat.project_path):
+            source = f"{source}+{_optional_string(known_thread.get('source')) or 'known_thread'}"
         return {
             "threadId": thread_id,
             "projectId": resolved_project_id,
-            "projectPath": _optional_string(chat.project_path) if chat is not None else _optional_string((known_thread or {}).get("projectPath")),
+            "projectPath": project_path,
             "archived": bool(chat.archived) if chat is not None and chat.archived is not None else None,
-            "source": resolution.source if resolution is not None else (_optional_string((known_thread or {}).get("source")) or "operation"),
+            "source": source,
             "chat": chat,
             "threadResolution": resolution.to_tool() if resolution is not None else None,
         }
@@ -478,6 +485,9 @@ class ThreadLifecycleServiceMixin:
         )
         client = await self._app()
         try:
+            project_path = _optional_string(context.get("projectPath"))
+            if project_path:
+                await client.thread_resume(thread_id, project_path, timeout_seconds=min(timeout_seconds, 60))
             app_result = await client.thread_compact_start(thread_id, timeout_seconds=timeout_seconds)
         except Exception as exc:
             now = _now_iso()

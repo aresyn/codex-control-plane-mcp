@@ -194,6 +194,7 @@ class WorkerStoreMixin:
             """
             SELECT sched.*, ops.status AS operation_status, ops.thread_id, ops.turn_id,
                    ops.project_id, ops.cwd, ops.operation_type, ops.request_json,
+                   ops.submitter_config_fingerprint,
                    ops.updated_at AS operation_updated_at
               FROM codex_operation_scheduling AS sched
               LEFT JOIN codex_operations AS ops ON ops.operation_id = sched.operation_id

@@ -170,6 +170,53 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertEqual("skipped", result["methodResults"]["model/list"]["status"])
         self.assertEqual("passive", preflight["runtimeCapabilities"]["status"])
 
+    def test_listed_allowed_project_preflights_and_submits_in_client_mode(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "TestProject1"
+            project.mkdir()
+            config = _search_service_config(root, root / ".codex" / "state_runtime_project.sqlite")
+            config.execution_mode = "client"
+            config.codex_binary_path.write_text("", encoding="utf-8")
+            (config.codex_home / "auth.json").write_text("{}", encoding="utf-8")
+            service = ToolService(config)
+            try:
+                projects = service.codex_list_projects(
+                    {"compact": True, "refresh": True, "roots": [str(project)], "limit": 10}
+                )
+                project_id = (projects["projects"][0]["projectId"] if projects["projects"] else None)
+                preflight = asyncio.run(
+                    service.codex_preflight_project_run(
+                        {
+                            "project_id": project_id,
+                            "cwd": str(project),
+                            "sandbox": "danger-full-access",
+                            "approval_policy": "never",
+                            "live_probe": False,
+                        }
+                    )
+                )
+                submitted = service.codex_submit_task(
+                    {
+                        "operation_type": "start_chat",
+                        "project_id": project_id,
+                        "cwd": str(project),
+                        "message": "MCP regression test. Do not modify files.",
+                        "sandbox": "danger-full-access",
+                        "approval_policy": "never",
+                        "client_request_id": "regression:list-preflight-submit",
+                    }
+                )
+            finally:
+                asyncio.run(service.close())
+
+        self.assertEqual(1, projects["returnedCount"])
+        self.assertTrue(project_id)
+        self.assertNotEqual("error", preflight["status"])
+        self.assertTrue(preflight["ok"])
+        self.assertTrue(submitted["ok"])
+        self.assertEqual("queued", submitted["status"])
+
     def test_runtime_capabilities_unauthenticated_skips_account_usage_and_limits(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

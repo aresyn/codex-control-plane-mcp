@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from openclaw_codex_mcp.agent_safe_redactor import AgentSafeRedactor
+
 from tests.helpers import *
 
 
@@ -35,6 +37,26 @@ class LiveFindingsRegressionTests(unittest.IsolatedAsyncioTestCase):
 
         serialized = json.dumps(diagnostics, ensure_ascii=False)
         self.assertNotIn(str(root), serialized)
+        self.assertIn("[redacted-path:", serialized)
+
+    async def test_agent_safe_redacts_forward_slash_windows_paths_inside_markdown_links(self) -> None:
+        redactor = AgentSafeRedactor(allowed_roots=[Path("D:/CodexProjects")], private_roots=[])
+        payload = {
+            "finalReport": {
+                "text": "Created [quick_result.json](D:/CodexProjects/TestProject1/live_parallel_test/x/quick_result.json).",
+                "summary": "Created D:/CodexProjects/TestProject1/live_parallel_test/x/quick_result.json.",
+            },
+            "latestMessages": [
+                {
+                    "role": "assistant",
+                    "text": "See D:/CodexProjects/TestProject1/live_parallel_test/x/quick_result.json",
+                }
+            ],
+        }
+        redacted = redactor.redact(payload)
+        serialized = json.dumps(redacted, ensure_ascii=False)
+
+        self.assertNotIn("D:/CodexProjects", serialized)
         self.assertIn("[redacted-path:", serialized)
 
     async def test_f015_worker_command_timeout_is_unambiguous_terminal_state(self) -> None:

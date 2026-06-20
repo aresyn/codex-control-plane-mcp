@@ -107,6 +107,28 @@ app-server: `slotState.claimed`, `slotClaim`, `workerState`,
 `resourceLockState` и `queueState`. В client mode gateway не должен запускать
 свой app-server только ради status.
 
+## Внешний client для проверки
+
+Во время разработки MCP и перед release-проверками используйте внешний client
+из этого репозитория, а не перезапуск Codex Desktop session:
+
+```powershell
+python .\scripts\external_mcp_client.py daemon-start
+python .\scripts\external_mcp_client.py daemon-restart-mcp --reason after_code_change
+python .\scripts\external_mcp_client.py run-live-test --scenario full --archive-report
+```
+
+Daemon ведет себя как отдельный MCP-клиент. Он вызывает те же tools, что и
+OpenClaw, пишет findings в `corrective_action_plan.md` и после правки может
+перезапустить свой MCP subprocess. Центральный worker он не перезапускает.
+Если менялся worker-код или worker-конфиг, перезапустите
+`codex-control-plane-mcp-worker` отдельно.
+
+Используйте внешний client для sandbox live-тестов до изменения OpenClaw gateway
+entries. После чистого прогона `codex_get_queue_status`,
+`codex_get_concurrency_status` и `codex_get_app_server_status` должны показывать
+ноль active turns, ноль locks и ноль pending requests.
+
 ## Главные правила для OpenClaw
 
 1. Для новых долгих задач используй `codex_submit_task`.

@@ -2291,6 +2291,7 @@ class OperationServiceMixin:
                 "scheduledAt": scheduling.get("scheduled_at"),
                 "updatedAt": scheduling.get("updated_at"),
             }
+            _annotate_operation_worker_compatibility(response["queueState"], latest, self.storage)
             response["slotState"] = {"claimed": False} if terminal_queue else (slot_claim or {"claimed": False})
             response["workerState"] = {
                 "workerId": worker_id,
@@ -2411,7 +2412,7 @@ class OperationServiceMixin:
             response["nextRecommendedAction"] = "wait_for_resource_lock"
         elif response.get("queueState", {}).get("queuedReason") in {"global_slot_limit", "project_slot_limit", "agent_slot_limit", "thread_slot_limit"}:
             response["nextRecommendedAction"] = "wait_for_worker_slot"
-        elif response.get("queueState", {}).get("queuedReason") in {"worker_health_degraded", "app_server_backpressure"}:
+        elif response.get("queueState", {}).get("queuedReason") in {"worker_health_degraded", "app_server_backpressure", "config_fingerprint_mismatch"}:
             response["nextRecommendedAction"] = "inspect_worker_health"
         if response.get("configRecoveryState", {}).get("state") == "mismatch":
             response["nextRecommendedAction"] = "inspect_diagnostics"
@@ -2967,6 +2968,42 @@ def _dedup_resource_key_decision(current: list[str], existing: list[str]) -> dic
         "compared": compared,
         "overlap": overlap,
     }
+
+
+def _annotate_operation_worker_compatibility(queue_state: dict[str, Any], operation: dict[str, Any], storage: Any) -> None:
+    submitter = _optional_string(operation.get("submitter_config_fingerprint"))
+    live_fingerprints: set[str] = set()
+    for row in storage.list_workers(limit=100):
+        if str(row.get("role") or "") != "worker":
+            continue
+        if str(row.get("status") or "") != "running":
+            continue
+        staleness = _staleness_seconds(str(row.get("last_heartbeat_at") or ""))
+        if staleness is not None and int(staleness) >= 120:
+            continue
+        fingerprint = _optional_string(row.get("config_fingerprint"))
+        if fingerprint:
+            live_fingerprints.add(fingerprint)
+    if not submitter or not live_fingerprints:
+        queue_state["workerCompatibility"] = {
+            "compatibleWorkerAvailable": bool(live_fingerprints),
+            "reason": "unknown_submitter_config" if not submitter else "no_live_worker",
+        }
+        return
+    if submitter in live_fingerprints:
+        queue_state["workerCompatibility"] = {
+            "compatibleWorkerAvailable": True,
+            "reason": "compatible_worker_available",
+        }
+        return
+    queue_state["workerCompatibility"] = {
+        "compatibleWorkerAvailable": False,
+        "reason": "config_fingerprint_mismatch",
+        "submitterConfigFingerprint": submitter,
+        "liveWorkerConfigFingerprints": sorted(live_fingerprints),
+    }
+    if queue_state.get("queueStatus") == "queued" and queue_state.get("queuedReason") == "waiting_for_worker":
+        queue_state["queuedReason"] = "config_fingerprint_mismatch"
 
 
 def _operation_consumes_turn_slot_for_status(operation: dict[str, Any]) -> bool:

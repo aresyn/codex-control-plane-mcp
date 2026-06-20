@@ -195,6 +195,7 @@ class FakeAppServer:
         self.turn_steer_calls: list[dict] = []
         self.review_start_calls: list[dict] = []
         self.thread_start_calls: list[dict] = []
+        self.thread_resume_calls: list[dict] = []
         self.thread_fork_calls: list[dict] = []
         self.thread_archive_calls: list[dict] = []
         self.thread_unarchive_calls: list[dict] = []
@@ -279,6 +280,7 @@ class FakeAppServer:
         }
 
     async def thread_resume(self, thread_id: str, cwd: str, timeout_seconds: float | None = 60) -> dict:
+        self.thread_resume_calls.append({"thread_id": thread_id, "cwd": cwd, "timeout_seconds": timeout_seconds})
         return {"threadId": thread_id}
 
     async def thread_start(self, **kwargs: object) -> dict:

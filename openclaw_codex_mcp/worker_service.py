@@ -37,8 +37,12 @@ class WorkerServiceMixin:
         limit = _bounded_int(args.get("limit", 100), 1, 500)
         status_filter = _optional_string(args.get("status"))
         include_terminal = bool(args.get("include_terminal", False))
+        workers = [_worker_row_to_tool(row) for row in self.storage.list_workers(limit=limit)]
+        live_worker_fingerprints = _live_worker_fingerprints(workers)
         rows = self.storage.list_operation_scheduling(limit=limit)
         entries = [_operation_scheduling_row_to_tool(row) for row in rows]
+        for entry in entries:
+            _annotate_worker_compatibility(entry, live_worker_fingerprints)
         if not include_terminal:
             entries = [
                 row
@@ -247,6 +251,7 @@ def _operation_scheduling_row_to_tool(row: dict[str, Any]) -> dict[str, Any]:
         "operationStatus": row.get("operation_status"),
         "queueStatus": row.get("queue_status"),
         "queuedReason": row.get("queued_reason"),
+        "submitterConfigFingerprint": row.get("submitter_config_fingerprint"),
         "priority": row.get("priority"),
         "estimatedCostClass": row.get("estimated_cost_class"),
         "agentId": row.get("agent_id"),
@@ -384,6 +389,40 @@ def _has_live_worker(workers: list[dict[str, Any]]) -> bool:
     return False
 
 
+def _live_worker_fingerprints(workers: list[dict[str, Any]]) -> set[str]:
+    return {
+        str(worker.get("configFingerprint"))
+        for worker in workers
+        if worker.get("role") == "worker"
+        and worker.get("effectiveStatus") == "running"
+        and worker.get("configFingerprint")
+    }
+
+
+def _annotate_worker_compatibility(entry: dict[str, Any], live_worker_fingerprints: set[str]) -> None:
+    submitter = _optional_string(entry.get("submitterConfigFingerprint"))
+    if not submitter or not live_worker_fingerprints:
+        entry["workerCompatibility"] = {
+            "compatibleWorkerAvailable": bool(live_worker_fingerprints),
+            "reason": "unknown_submitter_config" if not submitter else "no_live_worker",
+        }
+        return
+    if submitter in live_worker_fingerprints:
+        entry["workerCompatibility"] = {
+            "compatibleWorkerAvailable": True,
+            "reason": "compatible_worker_available",
+        }
+        return
+    entry["workerCompatibility"] = {
+        "compatibleWorkerAvailable": False,
+        "reason": "config_fingerprint_mismatch",
+        "submitterConfigFingerprint": submitter,
+        "liveWorkerConfigFingerprints": sorted(live_worker_fingerprints),
+    }
+    if entry.get("queueStatus") == "queued" and entry.get("queuedReason") == "waiting_for_worker":
+        entry["queuedReason"] = "config_fingerprint_mismatch"
+
+
 def _queue_entry_should_be_visible(entry: dict[str, Any], storage: Any) -> bool:
     if entry.get("operationStatus") in OPERATION_TERMINAL_STATUSES:
         return False
@@ -407,6 +446,8 @@ def _queue_next_action(queued: list[dict[str, Any]], blocked_by_locks: list[dict
     if reasons & {"resource_lock_conflict", "write_project_slot_limit"}:
         return "wait_for_resource_lock"
     if reasons & {"worker_health_degraded", "app_server_backpressure"}:
+        return "inspect_worker_health"
+    if reasons & {"config_fingerprint_mismatch"}:
         return "inspect_worker_health"
     if reasons & {"global_slot_limit", "project_slot_limit", "agent_slot_limit", "thread_slot_limit", "waiting_for_worker"}:
         return "wait_for_worker_slot"
