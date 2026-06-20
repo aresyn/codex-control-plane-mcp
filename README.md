@@ -484,6 +484,17 @@ Status payloads now separate freshness signals:
 - `stalenessMeaning="operation_row_age"` for the compatibility
   `stalenessSeconds` field.
 
+Public status payloads are agent-safe. Operation and workflow status return
+`requestSummary` instead of raw `request`; it contains ids, runtime policy,
+scheduling intent, input item state, output schema hash, resource keys, and
+text hashes. It does not include the full prompt, full instructions, raw title,
+raw image URL/path, exact token counts, raw command output, or private paths.
+Use your own stored task text plus `requestSummary.*.sha256` for correlation.
+
+`codex_get_queue_status` only recommends `wait_for_worker_slot` when there is
+actual queued work blocked by slots. If there are running turns but
+`queueSummary.queued == 0`, the queue action is `none`.
+
 ## Runtime capabilities
 
 Use `codex_get_runtime_capabilities` before orchestration or after reconnect. It

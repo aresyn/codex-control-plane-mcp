@@ -482,6 +482,18 @@ sandbox и approval policy, связывает его со старым чере
 - `stalenessMeaning="operation_row_age"` для старого compatibility-поля
   `stalenessSeconds`.
 
+Публичные status payload являются agent-safe. Operation и workflow status
+возвращают `requestSummary` вместо raw `request`: там есть ids, runtime policy,
+scheduling intent, input item state, hash output schema, resource keys и hash
+текстовых полей. Полного prompt, instructions, raw title, raw image URL/path,
+точных token counts, raw command output и приватных путей там нет. Исходный
+текст задачи OpenClaw должен хранить в своем state, а для сопоставления
+использовать `requestSummary.*.sha256`.
+
+`codex_get_queue_status` рекомендует `wait_for_worker_slot` только когда есть
+реальная queued работа, заблокированная слотами. Если turns выполняются, но
+`queueSummary.queued == 0`, queue action будет `none`.
+
 ## Runtime capabilities
 
 Вызывайте `codex_get_runtime_capabilities` перед orchestration или после

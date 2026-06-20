@@ -55,6 +55,8 @@ class WorkerServiceMixin:
         running = [entry for entry in entries if entry.get("queueStatus") in {"scheduled", "running"} and _queue_entry_consumes_turn_slot(entry)]
         auxiliary = [entry for entry in entries if entry.get("queueStatus") in {"scheduled", "running"} and not _queue_entry_consumes_turn_slot(entry)]
         blocked_by_locks = [entry for entry in queued if entry.get("queuedReason") in {"resource_lock_conflict", "write_project_slot_limit"}]
+        next_action = _queue_next_action(queued, blocked_by_locks)
+        poll_recommended = bool(queued or blocked_by_locks)
         return {
             "ok": True,
             "executionMode": self.config.execution_mode,
@@ -72,9 +74,9 @@ class WorkerServiceMixin:
             "blockedByLocks": blocked_by_locks,
             "queueReasons": reasons,
             "operations": entries,
-            "nextRecommendedAction": "wait_for_worker_slot" if entries else "none",
-            "recommendedPollAfterSeconds": 10 if entries else 0,
-            "pollRecommended": bool(entries),
+            "nextRecommendedAction": next_action,
+            "recommendedPollAfterSeconds": 10 if poll_recommended else 0,
+            "pollRecommended": poll_recommended,
         }
 
     def codex_get_concurrency_status(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -381,6 +383,21 @@ def _queue_entry_should_be_visible(entry: dict[str, Any], storage: Any) -> bool:
     if tracked is not None and str(tracked.get("status") or "") not in TURN_ACTIVE_STATUSES:
         return False
     return True
+
+
+def _queue_next_action(queued: list[dict[str, Any]], blocked_by_locks: list[dict[str, Any]]) -> str:
+    if blocked_by_locks:
+        return "wait_for_resource_lock"
+    if not queued:
+        return "none"
+    reasons = {str(item.get("queuedReason") or "") for item in queued}
+    if reasons & {"resource_lock_conflict", "write_project_slot_limit"}:
+        return "wait_for_resource_lock"
+    if reasons & {"worker_health_degraded", "app_server_backpressure"}:
+        return "inspect_worker_health"
+    if reasons & {"global_slot_limit", "project_slot_limit", "agent_slot_limit", "thread_slot_limit", "waiting_for_worker"}:
+        return "wait_for_worker_slot"
+    return "poll_queue"
 
 
 def _compact_worker_payload(payload: dict[str, Any]) -> dict[str, Any]:

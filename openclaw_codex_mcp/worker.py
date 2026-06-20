@@ -40,13 +40,13 @@ class CentralWorker:
         self.service.config.execution_mode = role
         self._heartbeat(status="running", role=role, last_error=None)
         heartbeat_task = asyncio.create_task(self._heartbeat_loop(role))
+        command_task = None if self.observe else asyncio.create_task(self._worker_command_loop(role))
         LOG.info("central worker started worker_id=%s role=%s", self.worker_id, role)
         try:
             while not self._stop.is_set():
                 last_error: str | None = None
                 try:
                     if not self.observe:
-                        await self._process_worker_commands()
                         await self._schedule_startable_operations()
                         self._cleanup_terminal_scheduling()
                         self._cleanup_terminal_locks()
@@ -60,8 +60,13 @@ class CentralWorker:
                     pass
         finally:
             heartbeat_task.cancel()
+            if command_task is not None:
+                command_task.cancel()
             with suppress(BaseException):
                 await heartbeat_task
+            if command_task is not None:
+                with suppress(BaseException):
+                    await command_task
             self._heartbeat(status="stopped", role=role, last_error=None)
             await self.service.close()
             LOG.info("central worker stopped worker_id=%s", self.worker_id)
@@ -96,6 +101,18 @@ class CentralWorker:
             except asyncio.TimeoutError:
                 pass
 
+    async def _worker_command_loop(self, role: str) -> None:
+        while not self._stop.is_set():
+            try:
+                await self._process_worker_commands()
+            except Exception as exc:  # pragma: no cover - defensive control lane guard
+                LOG.exception("worker command loop failed")
+                self._heartbeat(status="degraded", role=role, last_error=str(exc))
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=max(0.25, min(self.interval_seconds, 1.0)))
+            except asyncio.TimeoutError:
+                pass
+
     def _active_turn_count(self) -> int:
         rows = self.service.storage.connection.execute(
             f"""
@@ -123,6 +140,7 @@ class CentralWorker:
             try:
                 timeout_seconds = _worker_command_timeout_seconds(args)
                 result = await asyncio.wait_for(self.service.call(command_type, args), timeout=timeout_seconds)
+                self._store_command_status_snapshot(command_type, result)
                 status = "completed" if result.get("ok", True) and not result.get("error") else "failed"
                 self.service.storage.update_worker_command(
                     command_id,
@@ -213,6 +231,19 @@ class CentralWorker:
                 scheduled_at=_now_iso(),
             )
             self.service._schedule_operation_if_needed(operation)
+
+    def _store_command_status_snapshot(self, command_type: str, result: dict[str, Any]) -> None:
+        if command_type != "codex_get_runtime_capabilities":
+            return
+        with suppress(Exception):
+            self.service.storage.upsert_status_snapshot(
+                snapshot_key="runtime_capabilities:latest",
+                snapshot_type="runtime_capabilities",
+                scope_id=None,
+                payload=redact_payload(result),
+                created_at=_now_iso(),
+                expires_at=_future_iso(15 * 60),
+            )
 
     def _app_server_backpressure(self) -> bool:
         if self.service._app_server is None:

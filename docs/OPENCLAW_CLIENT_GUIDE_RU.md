@@ -160,6 +160,32 @@ app-server: `slotState.claimed`, `slotClaim`, `workerState`,
 - JSON-RPC errors считаются ошибками протокола;
 - domain errors внутри `tools/call` не означают, что MCP transport сломан.
 
+## Безопасный публичный status
+
+Считай MCP status agent-safe ответом, а не raw audit log. Operation и workflow
+status возвращают `requestSummary`, а не raw `request`. В `requestSummary` есть
+ids, runtime policy, scheduling intent, input item state, hash output schema,
+resource keys и hash/размер текстовых полей. Там нет полного prompt,
+instructions, title, raw image path, raw URL или raw command output.
+
+Если OpenClaw нужно позже показать исходный текст задачи, он должен хранить его
+в своем state. Не рассчитывай, что MCP status вернет prompt обратно. Для
+сопоставления используй `requestSummary.messageSummary.sha256` и `operationId`.
+
+Thread titles возвращаются как `titleSummary`. Token usage возвращается
+укрупненно, без exact counts. Diagnostic logs с payload не являются обычной
+поверхностью polling: используй их только для точечной ручной диагностики, и
+там все равно действует secret redaction.
+
+Для queue status действует жесткое правило: если `queueSummary.queued == 0` и
+`blockedByLocks` пустой, `nextRecommendedAction` должен быть `none`, даже если
+есть running turns. Running turns сами по себе не являются поводом создавать
+retry.
+
+Runtime inventory в `client` mode пассивный. `refresh=true` ставит worker
+command. После завершения worker command следующие passive-вызовы могут вернуть
+sanitized worker status snapshot.
+
 ## Идентификаторы и idempotency
 
 OpenClaw должен хранить связь между своей задачей и MCP id:

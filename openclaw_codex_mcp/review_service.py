@@ -462,6 +462,10 @@ class ReviewServiceMixin:
         )
         operation = self.storage.get_operation(operation_id)
         if operation is not None:
+            self._ensure_operation_scheduling(
+                operation,
+                queued_reason="waiting_for_worker" if not self._can_schedule_inline() else None,
+            )
             self._schedule_operation_if_needed(operation)
         workflow = self.storage.get_workflow(workflow_id)
         assert workflow is not None

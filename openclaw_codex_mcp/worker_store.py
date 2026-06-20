@@ -395,3 +395,61 @@ class WorkerStoreMixin:
             f"UPDATE codex_worker_commands SET {', '.join(assignments)} WHERE command_id = :command_id",
             params,
         )
+
+    def upsert_status_snapshot(
+        self,
+        *,
+        snapshot_key: str,
+        snapshot_type: str,
+        scope_id: str | None,
+        payload: dict[str, Any],
+        created_at: str,
+        expires_at: str | None = None,
+    ) -> None:
+        self.execute_write_with_retry(
+            """
+            INSERT INTO codex_status_snapshots(
+              snapshot_key, snapshot_type, scope_id, payload_json, created_at, expires_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(snapshot_key) DO UPDATE SET
+              snapshot_type=excluded.snapshot_type,
+              scope_id=excluded.scope_id,
+              payload_json=excluded.payload_json,
+              created_at=excluded.created_at,
+              expires_at=excluded.expires_at
+            """,
+            (
+                snapshot_key,
+                snapshot_type,
+                scope_id,
+                json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str),
+                created_at,
+                expires_at,
+            ),
+        )
+
+    def get_latest_status_snapshot(self, snapshot_type: str, *, scope_id: str | None = None) -> dict[str, Any] | None:
+        if scope_id is None:
+            row = self.connection.execute(
+                """
+                SELECT *
+                  FROM codex_status_snapshots
+                 WHERE snapshot_type = ?
+                 ORDER BY created_at DESC
+                 LIMIT 1
+                """,
+                (snapshot_type,),
+            ).fetchone()
+        else:
+            row = self.connection.execute(
+                """
+                SELECT *
+                  FROM codex_status_snapshots
+                 WHERE snapshot_type = ? AND scope_id = ?
+                 ORDER BY created_at DESC
+                 LIMIT 1
+                """,
+                (snapshot_type, scope_id),
+            ).fetchone()
+        return dict(row) if row is not None else None

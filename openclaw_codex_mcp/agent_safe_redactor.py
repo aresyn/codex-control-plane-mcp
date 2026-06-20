@@ -11,7 +11,9 @@ from .config import is_path_under
 
 _WINDOWS_PATH_RE = re.compile(r"(?i)(?:[a-z]:\\[^\s\"'<>|]+|\\\\[^\s\"'<>|]+)")
 _EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
-_TOKEN_RE = re.compile(r"(?i)\b(?:sk|sess|tok|key|bearer)[-_A-Za-z0-9.]{12,}\b")
+_TOKEN_RE = re.compile(
+    r"(?i)(?:\b(?:sk|sess|tok|key)[-_][A-Za-z0-9._-]{12,}\b|\bbearer\s+[A-Za-z0-9._~+/=-]{12,})"
+)
 _SECRET_KEYS = {
     "email",
     "accountid",
@@ -76,14 +78,14 @@ class AgentSafeRedactor:
         key_norm = key.replace("-", "_").casefold()
         if key_norm.replace("_", "") in _SAFE_TOKEN_KEYS or key_norm in _SAFE_TOKEN_KEYS:
             return value
+        if key_norm.replace("_", "") == "tokenusage" and isinstance(value, dict):
+            return _coarse_token_usage(value)
         if key_norm in _SECRET_KEYS or any(marker in key_norm for marker in ("token", "secret", "password", "authorization")):
             if value in (None, "", False):
                 return value
             return "[redacted]"
         if isinstance(value, str) and any(marker in key_norm for marker in _PATH_KEY_MARKERS):
             return self._redact_path_text(value)
-        if key_norm == "tokenusage" and isinstance(value, dict):
-            return _coarse_token_usage(value)
         return self._redact_agent_safe(value)
 
     def _redact_secrets(self, value: Any) -> Any:
@@ -114,7 +116,7 @@ class AgentSafeRedactor:
 
     def _is_private_path(self, text: str) -> bool:
         lowered = text.casefold()
-        if ".codex" in lowered or "\\appdata\\" in lowered:
+        if ".codex" in lowered or "\\appdata\\" in lowered or "_kb_history" in lowered or "\\kb_history\\" in lowered:
             return True
         try:
             if self.user_profile and is_path_under(text, self.user_profile):

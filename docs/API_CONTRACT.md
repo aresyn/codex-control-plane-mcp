@@ -80,6 +80,30 @@ Stable tools are asynchronous or pollable when they can trigger long work. New
 fields may be added, but existing input fields and machine-readable status/error
 fields must not be removed without changing `contractVersion`.
 
+## Public status boundary
+
+All public tool responses are returned in `agent_safe` mode unless the tool is
+the explicit raw audit endpoint. Public status payloads do not expose raw
+operation requests, full prompts, full review instructions, full thread titles,
+private local paths, exact token counts, account identifiers, or raw command
+output.
+
+Operation and workflow status use `requestSummary` instead of raw `request`.
+`requestSummary` may include:
+
+- operation type, thread/project/workflow refs, runtime policy, scheduling
+  intent, input item state, output schema hash, and resource keys;
+- text summaries with character count and hash.
+
+`requestSummary` does not include prompt or instruction previews. Clients that
+need to correlate a prompt should compare their own stored request with the
+hash and operation id. Do not build orchestration logic from raw request text.
+
+Thread titles and lifecycle thread state are returned as `titleSummary` with
+count and hash. Runtime and turn token usage is coarse. Raw audit data is only
+available through `codex_get_diagnostic_logs(include_payload=true)`, and that
+payload is still secret-redacted.
+
 ## Write policy defaults
 
 Server-level default write policy is configured by environment/config:
@@ -158,9 +182,19 @@ slot limit blocks scheduling. Write lock conflicts use
 `nextRecommendedAction="wait_for_resource_lock"`. Worker health problems use
 `nextRecommendedAction="inspect_worker_health"`.
 
+If there are active running turns but no queued or blocked work,
+`codex_get_queue_status.nextRecommendedAction` is `none`. Clients should not
+interpret active slots alone as a reason to create a retry or wait for a queue
+slot.
+
 `stalenessSeconds` remains as a compatibility alias for operation row age. New
 clients should read `stalenessMeaning`; a stale operation row is not enough to
 declare a stalled turn without `turnFreshness` and `workerFreshness` evidence.
+
+Worker control commands run on a separate command lane from turn scheduling.
+`codex_get_worker_command_status` is a bounded SQLite read. By default it
+returns a compact command envelope; request the full result only with
+`include_result=true` and a bounded `max_result_chars`.
 
 ## Durable operation types
 

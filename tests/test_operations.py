@@ -978,8 +978,8 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertEqual(1, len(calls))
         self.assertEqual("object", calls[0]["output_schema"]["type"])
         self.assertIn("outputSchemaState", running)
-        self.assertEqual(running["outputSchemaState"]["schemaHash"], running["request"]["output_schema_hash"])
-        self.assertNotIn("output_schema", running["request"])
+        self.assertEqual(running["outputSchemaState"]["schemaHash"], running["requestSummary"]["outputSchemaHash"])
+        self.assertNotIn("output_schema", running["requestSummary"])
         self.assertEqual("completed", completed["status"])
         self.assertEqual("Done", completed["finalReport"]["structured"]["summary"])
         self.assertEqual("ok", completed["finalReport"]["structured"]["status"])
@@ -1078,8 +1078,8 @@ class McpDefinitionTests(unittest.TestCase):
         rendered = json.dumps(running, ensure_ascii=False)
         self.assertNotIn("https://example.com/private/screenshot.png?token=secret", rendered)
         self.assertNotIn("screenshot.png", rendered)
-        self.assertNotIn("input_items", running["request"])
-        self.assertNotIn("_input_items", running["request"])
+        self.assertNotIn("input_items", running["requestSummary"])
+        self.assertNotIn("_input_items", running["requestSummary"])
 
     def test_submit_task_image_inputs_validate_paths_urls_and_operation_types(self) -> None:
         async def scenario() -> tuple[dict, dict, dict, dict, dict, dict, dict, int]:

@@ -196,6 +196,26 @@ class RuntimeServiceMixin:
         if self.config.execution_mode in {"client", "observe"} and self._app_server is None:
             reason = f"execution_mode={self.config.execution_mode}; live inventory is owned by the worker process"
             worker_snapshot = self._worker_runtime_snapshot_for_client()
+            cached_worker_snapshot = self._latest_runtime_capabilities_snapshot()
+            if cached_worker_snapshot is not None:
+                cached_result = copy.deepcopy(cached_worker_snapshot["payload"])
+                runtime_capabilities = cached_result.get("runtimeCapabilities")
+                if isinstance(runtime_capabilities, dict):
+                    runtime_capabilities["cacheSource"] = "worker_status_snapshot"
+                    runtime_capabilities.setdefault("workerRuntimeSnapshot", worker_snapshot)
+                cached_result["cacheState"] = {
+                    "hit": True,
+                    "source": "worker_status_snapshot",
+                    "ageSeconds": cached_worker_snapshot["ageSeconds"],
+                    "ttlSeconds": RUNTIME_CAPABILITIES_CACHE_TTL_SECONDS,
+                    "cacheKey": hashlib.sha256(cache_key.encode("utf-8")).hexdigest(),
+                }
+                cached_result.setdefault("recommendedPollAfterSeconds", 0)
+                cached_result.setdefault("pollRecommended", False)
+                self._runtime_capabilities_cache = copy.deepcopy(cached_result)
+                self._runtime_capabilities_cache_key = cache_key
+                self._runtime_capabilities_cache_at = time.monotonic()
+                return cached_result
 
             def skip_live_inventory(method: str) -> None:
                 method_results[method] = {"status": "skipped", "reason": reason, "elapsedMs": 0}
@@ -645,6 +665,29 @@ class RuntimeServiceMixin:
             "activeTurnCount": worker.get("active_turn_count"),
             "appServerGeneration": worker.get("app_server_generation"),
         }
+
+    def _latest_runtime_capabilities_snapshot(self) -> dict[str, Any] | None:
+        row = self.storage.get_latest_status_snapshot("runtime_capabilities")
+        if row is None:
+            return None
+        expires_at = _optional_string(row.get("expires_at"))
+        if expires_at:
+            try:
+                expires = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+                if expires.tzinfo is None:
+                    expires = expires.replace(tzinfo=timezone.utc)
+                if expires.astimezone(timezone.utc) <= datetime.now(timezone.utc):
+                    return None
+            except ValueError:
+                return None
+        try:
+            payload = json.loads(str(row.get("payload_json") or "{}"))
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        age_seconds = _staleness_seconds(str(row.get("created_at") or "")) or 0
+        return {"payload": payload, "ageSeconds": age_seconds, "createdAt": row.get("created_at")}
 
 
 def _runtime_live_worker_snapshot(storage: Any) -> dict[str, Any] | None:

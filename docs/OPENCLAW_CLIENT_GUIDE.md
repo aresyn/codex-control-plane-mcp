@@ -162,6 +162,30 @@ Rules:
 - JSON-RPC errors are protocol errors;
 - a domain error inside `tools/call` does not mean the MCP transport is broken.
 
+## Public status safety
+
+Treat MCP status as agent-safe, not as a raw audit log. Operation and workflow
+status expose `requestSummary`, not raw `request`. `requestSummary` contains
+ids, runtime policy, scheduling intent, input item state, output schema hash,
+resource keys, and text hashes. It does not contain the full prompt,
+instructions, title, raw image path, raw URL, or raw command output.
+
+OpenClaw must keep its own source task text in its local state if it needs it
+later. Do not expect MCP status to return the prompt back. Use
+`requestSummary.messageSummary.sha256` and `operationId` only for correlation.
+
+Thread titles are returned as `titleSummary`. Token usage is coarse. Diagnostic
+logs with payloads are not a polling surface; use them only for targeted manual
+debugging, and still expect secret redaction.
+
+Queue status has one strict rule: if `queueSummary.queued == 0` and
+`blockedByLocks` is empty, `nextRecommendedAction` should be `none`, even when
+there are running turns. Running turns are not a request to create a retry.
+
+Runtime inventory in `client` mode is passive. `refresh=true` queues a worker
+command. Once the worker completes it, later passive calls can return the
+sanitized worker status snapshot.
+
 ## Identifiers and idempotency
 
 OpenClaw should persist these identifiers:

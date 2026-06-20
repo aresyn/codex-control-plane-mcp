@@ -8,6 +8,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from openclaw_codex_mcp.catalog import project_id_for_path
+from openclaw_codex_mcp.agent_safe_redactor import AgentSafeRedactor
 from openclaw_codex_mcp.tools import ToolService
 from openclaw_codex_mcp.worker import CentralWorker
 
@@ -77,6 +78,120 @@ class CentralWorkerArchitectureTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("worker_managed", app_status["scope"])
             self.assertFalse(app_status["running"])
             self.assertIn("ignoredLocalProcess", app_status)
+
+    async def test_public_operation_status_exposes_request_summary_not_raw_prompt(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "Project"
+            project.mkdir()
+            config = _search_service_config(root, root / ".codex" / "state_5.sqlite")
+            config.execution_mode = "client"
+            service = ToolService(config)
+            raw_prompt = "PRIVATE PROMPT SHOULD NOT LEAK INTO PUBLIC STATUS"
+            raw_title = "PRIVATE THREAD TITLE SHOULD NOT LEAK"
+            try:
+                result = await service.call(
+                    "codex_submit_task",
+                    {
+                        "operation_type": "start_chat",
+                        "project_id": project_id_for_path(str(project)),
+                        "message": raw_prompt,
+                        "title": raw_title,
+                        "client_request_id": "public-request-summary",
+                    },
+                )
+                status = await service.call("codex_get_operation_status", {"operation_id": result["operationId"]})
+            finally:
+                await service.close()
+
+            rendered = json.dumps(status, ensure_ascii=False, sort_keys=True)
+            self.assertNotIn(raw_prompt, rendered)
+            self.assertNotIn(raw_title, rendered)
+            self.assertNotIn("request", status)
+            self.assertIn("requestSummary", status)
+            self.assertEqual(len(raw_prompt), status["requestSummary"]["messageSummary"]["chars"])
+            self.assertNotIn("preview", status["requestSummary"]["messageSummary"])
+            self.assertIn("titleSummary", status)
+            self.assertNotIn("preview", status["titleSummary"])
+
+    async def test_review_workflow_start_in_client_mode_has_durable_queue_state(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "Project"
+            project.mkdir()
+            config = _search_service_config(root, root / ".codex" / "state_5.sqlite")
+            config.execution_mode = "client"
+            service = ToolService(config)
+            try:
+                result = await service.call(
+                    "codex_start_review_workflow",
+                    {
+                        "project_id": project_id_for_path(str(project)),
+                        "cwd": str(project),
+                        "target_type": "custom",
+                        "instructions": "Review this sandbox project.",
+                        "client_request_id": "review-client-queue-state",
+                    },
+                )
+            finally:
+                await service.close()
+
+            review_operation = result["reviewStartOperation"]
+            self.assertEqual("queued", review_operation["queueState"]["queueStatus"])
+            self.assertEqual("waiting_for_worker", review_operation["queueState"]["queuedReason"])
+            self.assertNotEqual("legacy_inline", review_operation["queueState"]["queueStatus"])
+
+    def test_agent_safe_redactor_keeps_skill_names_and_compacts_usage_and_kb_paths(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            redactor = AgentSafeRedactor(allowed_roots=[root], private_roots=[])
+            payload = {
+                "skillName": "skill-installer",
+                "tokenUsage": {"inputTokens": 12345, "outputTokens": 6789},
+                "transcriptPath": str(root / "_kb_history" / "thread.jsonl"),
+            }
+
+            result = redactor.redact(payload)
+
+            self.assertEqual("skill-installer", result["skillName"])
+            self.assertEqual("coarse", result["tokenUsage"]["precision"])
+            self.assertNotIn("inputTokens", result["tokenUsage"])
+            self.assertTrue(str(result["transcriptPath"]).startswith("[redacted-path:"))
+
+    async def test_client_mode_runtime_capabilities_reads_worker_status_snapshot(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = _search_service_config(root, root / ".codex" / "state_5.sqlite")
+            config.execution_mode = "client"
+            service = ToolService(config)
+            try:
+                now = datetime.now(timezone.utc).isoformat()
+                service.storage.upsert_status_snapshot(
+                    snapshot_key="runtime_capabilities:latest",
+                    snapshot_type="runtime_capabilities",
+                    scope_id=None,
+                    payload={
+                        "ok": True,
+                        "runtimeCapabilities": {
+                            "status": "ok",
+                            "generatedAt": now,
+                            "models": {"available": True, "count": 1},
+                        },
+                        "methodResults": {"model/list": {"status": "ok"}},
+                    },
+                    created_at=now,
+                )
+                result = await service.call(
+                    "codex_get_runtime_capabilities",
+                    {"refresh": False, "include_account": True},
+                )
+            finally:
+                await service.close()
+
+            self.assertEqual("ok", result["runtimeCapabilities"]["status"])
+            self.assertEqual("worker_status_snapshot", result["runtimeCapabilities"]["cacheSource"])
+            self.assertTrue(result["cacheState"]["hit"])
+            self.assertEqual("worker_status_snapshot", result["cacheState"]["source"])
 
     async def test_worker_respects_global_active_turn_limit(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -304,6 +419,49 @@ class CentralWorkerArchitectureTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(0, active_queue["count"])
             self.assertEqual(1, terminal_queue["count"])
             self.assertEqual("unknown_after_app_server_exit", cleaned["queue_status"])
+
+    async def test_queue_status_does_not_recommend_slot_wait_without_queued_work(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_db = root / ".codex" / "state_5.sqlite"
+            config = _search_service_config(root, state_db)
+            config.execution_mode = "client"
+            service = ToolService(config)
+            try:
+                now = datetime.now(timezone.utc).isoformat()
+                _insert_operation_with_scheduling(
+                    service,
+                    operation_id="op-running-only",
+                    status="running",
+                    turn_id="turn-running-only",
+                    queue_status="running",
+                    now=now,
+                )
+                service.storage.upsert_tracked_turn(
+                    {
+                        "turn_id": "turn-running-only",
+                        "thread_id": "thread-running-only",
+                        "chat_id": "thread-running-only",
+                        "project_id": "project-id",
+                        "project_path": str(root),
+                        "status": "running",
+                        "started_at": now,
+                        "updated_at": now,
+                        "completed_at": None,
+                        "first_message_at": None,
+                        "final_message": None,
+                        "last_error": None,
+                        "source": "test",
+                    }
+                )
+                queue = await service.call("codex_get_queue_status", {"limit": 10})
+            finally:
+                await service.close()
+
+            self.assertEqual(0, queue["queueSummary"]["queued"])
+            self.assertEqual(1, queue["queueSummary"]["runningTurnOperations"])
+            self.assertEqual("none", queue["nextRecommendedAction"])
+            self.assertFalse(queue["pollRecommended"])
 
     async def test_worker_managed_app_status_excludes_stale_active_records(self) -> None:
         with TemporaryDirectory() as tmp:
