@@ -77,7 +77,11 @@ class WorkflowServiceMixin:
                 status["idempotencyScope"] = "start"
                 return status
 
-        project_id = _required_string(args, "project_id")
+        requested_project_id = _required_string(args, "project_id")
+        project = self.catalog.get_project(requested_project_id)
+        if project is None:
+            raise project_not_found(requested_project_id)
+        project_id = project.project_id
         goal_objective = _bounded_optional_text(args.get("goal"), field_name="goal", max_chars=20000)
         goal_token_budget = _optional_bounded_int(args.get("goal_token_budget"), 1, 10000000, field_name="goal_token_budget")
         goal_completion_action = _optional_string(args.get("goal_completion_action")) or "clear"
@@ -152,6 +156,7 @@ class WorkflowServiceMixin:
                     {
                         "title": args.get("title"),
                         "startClientRequestId": client_request_id,
+                        "requestedProjectId": requested_project_id,
                         "goalConfigured": bool(goal_objective),
                         "runtimePolicy": start_operation.get("runtimePolicy"),
                     },

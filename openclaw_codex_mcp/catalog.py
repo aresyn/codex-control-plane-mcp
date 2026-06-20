@@ -38,6 +38,7 @@ class ProjectChatCatalog:
         self.hook_history = HookHistoryReader(config, storage)
         self.kb_history = KbHistoryReader(config)
         self.projects: dict[str, Project] = {}
+        self.project_aliases: dict[str, Project] = {}
         self.projects_by_path_key: dict[str, Project] = {}
         self.chats: dict[str, Chat] = {}
         self._state_rows_by_thread: dict[str, CodexThreadRow] = {}
@@ -236,17 +237,23 @@ class ProjectChatCatalog:
             project_path = canonical_existing_path(row["path"])
             if not project_path or not is_allowed_path(project_path, self.config.allowed_roots):
                 continue
-            projects.append(
-                Project(
-                    project_id=str(row["project_id"]),
-                    name=str(row["name"]),
-                    path=project_path,
-                    normalized_path_key=path_key(project_path),
-                    created_at=row["created_at"],
-                    last_activity_at=row["last_activity_at"],
-                    source=row["source"],
-                )
+            source = str(row["source"] or "")
+            project_id = str(row["project_id"])
+            if source != "registry":
+                project_id = project_id_for_path(project_path)
+            project = Project(
+                project_id=project_id,
+                name=str(row["name"]),
+                path=project_path,
+                normalized_path_key=path_key(project_path),
+                created_at=row["created_at"],
+                last_activity_at=row["last_activity_at"],
+                source=source,
             )
+            projects.append(project)
+            cached_project_id = str(row["project_id"])
+            if cached_project_id != project.project_id:
+                self.project_aliases[cached_project_id] = project
         return projects
 
     def load_cached_chats(self) -> None:
@@ -290,26 +297,36 @@ class ProjectChatCatalog:
 
     def get_project(self, project_id: str) -> Project | None:
         self._ensure_refreshed()
-        return self.projects.get(project_id)
+        return self._resolve_project_ref(project_id)
+
+    def resolve_project_id(self, project_ref: str | None) -> str | None:
+        project = self.get_project(project_ref or "") if project_ref else None
+        return project.project_id if project is not None else None
 
     def list_project_chats(self, project_id: str, include_archived: bool = False) -> list[Chat]:
         self._ensure_refreshed()
+        project = self._resolve_project_ref(project_id)
+        canonical_project_id = project.project_id if project is not None else project_id
         rows = [
             chat
             for chat in self.chats.values()
-            if chat.project_id == project_id and (include_archived or not chat.archived)
+            if chat.project_id == canonical_project_id and (include_archived or not chat.archived)
         ]
         return sorted(rows, key=lambda item: item.updated_at or "", reverse=True)
 
     def get_chat(self, chat_id: str, project_id: str | None = None) -> Chat | None:
         self._ensure_refreshed()
+        canonical_project_id = None
+        if project_id:
+            project = self._resolve_project_ref(project_id)
+            canonical_project_id = project.project_id if project is not None else project_id
         chat = self.chats.get(chat_id)
         if chat is None:
             for candidate in self.chats.values():
                 if candidate.thread_id == chat_id:
                     chat = candidate
                     break
-        if chat and project_id and chat.project_id != project_id:
+        if chat and canonical_project_id and chat.project_id != canonical_project_id:
             return None
         return chat
 
@@ -384,6 +401,69 @@ class ProjectChatCatalog:
         self.load_cached_chats()
         self._last_refresh_at = now_iso()
         return True
+
+    def _resolve_project_ref(self, project_ref: str | None, *, allow_refresh: bool = True) -> Project | None:
+        ref = str(project_ref or "").strip()
+        if not ref:
+            return None
+        direct = self.projects.get(ref) or self.project_aliases.get(ref)
+        if direct is not None:
+            return self._maybe_refresh_stale_project_alias(ref, direct, allow_refresh=allow_refresh)
+
+        ref_key = path_key(ref)
+        if ref_key:
+            by_path = self.projects_by_path_key.get(ref_key)
+            if by_path is not None:
+                return self._maybe_refresh_stale_project_alias(ref, by_path, allow_refresh=allow_refresh)
+            for project in self.projects.values():
+                if project.normalized_path_key == ref_key or path_key(project.path) == ref_key:
+                    return self._maybe_refresh_stale_project_alias(ref, project, allow_refresh=allow_refresh)
+
+        exact_name = [project for project in self.projects.values() if project.name == ref]
+        if len(exact_name) == 1:
+            return self._maybe_refresh_stale_project_alias(ref, exact_name[0], allow_refresh=allow_refresh)
+        if len(exact_name) > 1:
+            return None
+
+        folded = ref.casefold()
+        casefold_name = [project for project in self.projects.values() if project.name.casefold() == folded]
+        if len(casefold_name) == 1:
+            return self._maybe_refresh_stale_project_alias(ref, casefold_name[0], allow_refresh=allow_refresh)
+        if len(casefold_name) > 1:
+            return None
+
+        basename_matches = [
+            project
+            for project in self.projects.values()
+            if Path(project.path).name == ref or Path(project.path).name.casefold() == folded
+        ]
+        if len(basename_matches) == 1:
+            return self._maybe_refresh_stale_project_alias(ref, basename_matches[0], allow_refresh=allow_refresh)
+        return None
+
+    def _maybe_refresh_stale_project_alias(self, project_ref: str, project: Project, *, allow_refresh: bool) -> Project:
+        if not allow_refresh or not self._project_alias_candidate_is_stale(project):
+            return project
+        project_path_key = path_key(project.path)
+        try:
+            self.refresh()
+        except Exception as exc:  # noqa: BLE001 - project aliases must remain best-effort.
+            LOG.warning("project alias refresh failed project_ref=%s project_id=%s error=%s", project_ref, project.project_id, exc)
+            return project
+        refreshed = self._resolve_project_ref(project_ref, allow_refresh=False)
+        if refreshed is None and project_path_key:
+            refreshed = self.projects_by_path_key.get(project_path_key)
+        if refreshed is not None:
+            self.project_aliases[project.project_id] = refreshed
+        return refreshed or project
+
+    def _project_alias_candidate_is_stale(self, project: Project) -> bool:
+        if project.source == "registry":
+            return False
+        cleaned = canonical_existing_path(project.path)
+        if not cleaned or not Path(cleaned).exists() or not is_allowed_path(cleaned, self.config.allowed_roots):
+            return False
+        return project.project_id != project_id_for_path(cleaned)
 
     def _projects_from_registry(self) -> list[Project]:
         path = self.config.projects_registry_path

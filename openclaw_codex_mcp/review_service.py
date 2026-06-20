@@ -100,6 +100,9 @@ class ReviewServiceMixin:
         workflow_id = _optional_string(args.get("workflow_id"))
         timeout_seconds = _bounded_int(args.get("timeout_seconds", DEFAULT_TOOL_START_TIMEOUT_SECONDS), 1, 7200)
         project_id = _optional_string(args.get("project_id"))
+        project = self.catalog.get_project(project_id) if project_id else None
+        if project is not None:
+            project_id = project.project_id
         cwd = canonical_existing_path(args.get("cwd") or args.get("_resolved_project_path"))
         if not cwd or not is_allowed_path(cwd, self.config.allowed_roots):
             raise invalid_argument("Requested cwd is outside the allowlist.", cwd=cwd or args.get("cwd"))
@@ -348,6 +351,7 @@ class ReviewServiceMixin:
                 project = self.catalog.get_project(project_id)
                 if project is None:
                     raise project_not_found(project_id)
+                project_id = project.project_id
                 cwd = canonical_existing_path(args.get("cwd") or project.path)
             else:
                 cwd_arg = _required_string(args, "cwd")

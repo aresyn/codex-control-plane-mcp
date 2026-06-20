@@ -21,7 +21,7 @@ ROLE_COMPATIBILITY = "compatibility"
 TOOL_CONTRACT: dict[str, dict[str, Any]] = {
     "codex_list_projects": {
         "role": ROLE_READ_ONLY,
-        "description": "List known Codex projects from registry, hook history, transcripts, and cached Codex state. Use this before preflight or submit when you need a project_id. Next call codex_preflight_project_run for a concrete project.",
+        "description": "List known Codex projects from registry, hook history, transcripts, and cached Codex state. Use this before preflight or submit when you need a project reference; later tools accept projectId, project name, or project path and return canonical projectId. Next call codex_preflight_project_run for a concrete project.",
         "nextTools": ["codex_preflight_project_run", "codex_list_project_chats", "codex_submit_task"],
         "passiveRead": True,
     },
@@ -126,7 +126,7 @@ TOOL_CONTRACT: dict[str, dict[str, Any]] = {
     },
     "codex_submit_task": {
         "role": ROLE_PRIMARY_WRITE,
-        "description": "Queue a durable Codex write operation and return operationId immediately. Use this for long-running start_chat, send_message, execute_plan, steer_turn, and fork_thread work. Always pass client_request_id and poll codex_get_operation_status.",
+        "description": "Queue a durable Codex write operation and return operationId immediately. For project-scoped work, pass project_id from codex_list_projects.projectId; project name or project path are accepted aliases and MCP stores the canonical projectId. Always pass client_request_id and poll codex_get_operation_status.",
         "nextTools": ["codex_get_operation_status", "codex_list_pending_interactions", "codex_collect_diagnostics"],
         "mayStartTurn": True,
         "idempotency": "required",
@@ -404,6 +404,7 @@ GLOBAL_RULES: list[str] = [
     "Run risky repair actions with dry_run=true first.",
     "Stop automatic recovery when loopGuard.allowed is false.",
     "In client mode, write and lifecycle actions are delegated to the central worker.",
+    "Project arguments accept the canonical projectId, the listed project name, or the project path; MCP canonicalizes them before durable writes.",
 ]
 
 
@@ -427,7 +428,7 @@ FULL_EXAMPLES: dict[str, Any] = {
         "tool": "codex_submit_task",
         "arguments": {
             "operation_type": "start_chat",
-            "project_id": "<projectId>",
+            "project_id": "<projectId|projectName|projectPath>",
             "message": "MCP task text",
             "client_request_id": "<stable id>",
             "agent_id": "<agent id>",
@@ -436,7 +437,7 @@ FULL_EXAMPLES: dict[str, Any] = {
         "next": {"tool": "codex_get_operation_status", "arguments": {"operation_id": "<operationId>"}},
     },
     "planWorkflow": {
-        "start": {"tool": "codex_start_plan_workflow", "arguments": {"project_id": "<projectId>", "message": "Prepare a plan"}},
+        "start": {"tool": "codex_start_plan_workflow", "arguments": {"project_id": "<projectId|projectName|projectPath>", "message": "Prepare a plan"}},
         "poll": {"tool": "codex_get_workflow_status", "arguments": {"workflow_id": "<workflowId>"}},
         "approve": {"tool": "codex_approve_plan", "arguments": {"workflow_id": "<workflowId>", "client_request_id": "<stable id>"}},
     },

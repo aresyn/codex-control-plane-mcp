@@ -179,7 +179,7 @@ CLIENT_MODE_COMPATIBILITY_WRITE_TOOLS = {
 TOOLS: list[dict[str, Any]] = [
     {
         "name": "codex_list_projects",
-        "description": "List known Codex projects from the project registry, MCP hook history, transcript index, and read-only Codex state.",
+        "description": "List known Codex projects from the project registry, MCP hook history, transcript index, and read-only Codex state. Each result's projectId is the canonical value to pass as project_id to codex_submit_task, workflow, preflight, and chat tools.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -600,7 +600,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "codex_submit_task",
-        "description": "Durably queue a Codex write operation and return immediately with operationId. Use codex_get_operation_status to poll threadId, turnId, messages, pending interactions, and completion.",
+        "description": "Durably queue a Codex write operation and return immediately with operationId. For new work, pass project_id from codex_list_projects.projectId; project name or project path are accepted as aliases and MCP stores the canonical projectId. Use codex_get_operation_status to poll threadId, turnId, messages, pending interactions, and completion.",
         "inputSchema": {
             "type": "object",
             "required": ["operation_type"],
@@ -642,7 +642,11 @@ TOOLS: list[dict[str, Any]] = [
                     "default": False,
                     "description": "Opt-in only. Allows fuzzy duplicate matching to continue a completed historical thread.",
                 },
-                "project_id": {"type": ["string", "null"], "default": None},
+                "project_id": {
+                    "type": ["string", "null"],
+                    "default": None,
+                    "description": "Project reference for start_chat and other project-scoped operations. Prefer the canonical projectId returned by codex_list_projects; the listed project name or full project path are also accepted and canonicalized before durable writes.",
+                },
                 "chat_id": {"type": ["string", "null"], "default": None},
                 "thread_id": {
                     "type": ["string", "null"],

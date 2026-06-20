@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from openclaw_codex_mcp.catalog import ProjectChatCatalog
+from openclaw_codex_mcp.catalog import project_id_for_path
 from openclaw_codex_mcp.config import ServerConfig
 from openclaw_codex_mcp.storage import McpStorage
 
@@ -157,7 +158,7 @@ class CatalogTests(unittest.TestCase):
             finally:
                 storage.close()
 
-        self.assertEqual(["allowed-project"], [project.project_id for project in cached])
+        self.assertEqual([project_id_for_path(str(allowed_project))], [project.project_id for project in cached])
 
     def test_list_project_chats_uses_cached_index_before_full_refresh(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -180,9 +181,10 @@ class CatalogTests(unittest.TestCase):
             storage.connect()
             try:
                 updated_at = "2026-06-20T00:00:00+00:00"
+                project_id = project_id_for_path(str(project))
                 storage.upsert_project(
                     {
-                        "project_id": "project-1",
+                        "project_id": project_id,
                         "name": "TestProject",
                         "path": str(project),
                         "normalized_path_key": str(project),
@@ -196,7 +198,7 @@ class CatalogTests(unittest.TestCase):
                     {
                         "chat_id": "chat-1",
                         "thread_id": "thread-1",
-                        "project_id": "project-1",
+                        "project_id": project_id,
                         "project_path": str(project),
                         "title": "Cached chat",
                         "transcript_path": "",
@@ -216,11 +218,67 @@ class CatalogTests(unittest.TestCase):
                     raise AssertionError("full refresh should not run when cache is available")
 
                 catalog.refresh = fail_refresh  # type: ignore[method-assign]
-                chats = catalog.list_project_chats("project-1")
+                chats = catalog.list_project_chats(project_id)
+                chats_by_name = catalog.list_project_chats("TestProject")
+                chat_by_name = catalog.get_chat("chat-1", "TestProject")
+                chat_by_path = catalog.get_chat("chat-1", str(project))
+                project_by_name = catalog.get_project("TestProject")
+                project_by_path = catalog.get_project(str(project))
             finally:
                 storage.close()
 
         self.assertEqual(["chat-1"], [chat.chat_id for chat in chats])
+        self.assertEqual(["chat-1"], [chat.chat_id for chat in chats_by_name])
+        self.assertIsNotNone(chat_by_name)
+        self.assertIsNotNone(chat_by_path)
+        self.assertEqual(project_id, project_by_name.project_id if project_by_name else None)
+        self.assertEqual(project_id, project_by_path.project_id if project_by_path else None)
+
+    def test_project_name_alias_refreshes_stale_cached_project_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "1C_LO"
+            project.mkdir()
+            config = ServerConfig(
+                codex_home=root / ".codex",
+                sessions_dir=root / ".codex" / "sessions",
+                archived_sessions_dir=root / ".codex" / "archived_sessions",
+                codex_state_db=root / ".codex" / "state_5.sqlite",
+                codex_logs_db=root / ".codex" / "logs_2.sqlite",
+                projects_root=root,
+                projects_registry_path=root / "projects.json",
+                codex_binary_path=root / "codex.exe",
+                state_db_path=root / "mcp.sqlite",
+                allowed_roots=[root],
+            )
+            storage = McpStorage(config.state_db_path)
+            storage.connect()
+            try:
+                updated_at = "2026-06-20T00:00:00+00:00"
+                storage.upsert_project(
+                    {
+                        "project_id": "stale-project-id",
+                        "name": "1C_LO",
+                        "path": str(project),
+                        "normalized_path_key": str(project),
+                        "created_at": updated_at,
+                        "last_activity_at": updated_at,
+                        "source": "mixed",
+                        "updated_at": updated_at,
+                    }
+                )
+                catalog = ProjectChatCatalog(config, storage)
+                cached = catalog.load_cached_projects()
+                resolved = catalog.get_project("1C_LO")
+                resolved_by_stale_id = catalog.get_project("stale-project-id")
+            finally:
+                storage.close()
+
+        self.assertEqual([project_id_for_path(str(project))], [item.project_id for item in cached])
+        self.assertIsNotNone(resolved)
+        self.assertEqual(project_id_for_path(str(project)), resolved.project_id)
+        self.assertIsNotNone(resolved_by_stale_id)
+        self.assertEqual(project_id_for_path(str(project)), resolved_by_stale_id.project_id)
 
 
 if __name__ == "__main__":

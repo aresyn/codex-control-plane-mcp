@@ -328,7 +328,8 @@ class OperationServiceMixin:
         project_id: str | None = None,
     ) -> dict[str, Any]:
         explicit_cwd = _optional_string(cwd)
-        resolved_project_id = project_id
+        project = self.catalog.get_project(project_id) if project_id else None
+        resolved_project_id = project.project_id if project is not None else project_id
         resolved_project_path: str | None = None
         resolved_chat_id: str | None = None
         source_known = False
@@ -387,7 +388,9 @@ class OperationServiceMixin:
         operation = self.storage.get_latest_operation_for_thread(thread_id)
         hook_thread = self.storage.get_hook_thread(thread_id)
         source = "unknown"
-        resolved_project_id = project_id
+        project = self.catalog.get_project(project_id) if project_id else None
+        canonical_requested_project_id = project.project_id if project is not None else project_id
+        resolved_project_id = canonical_requested_project_id
         project_path: str | None = None
         chat_id = thread_id
         status: str | None = None
@@ -411,7 +414,7 @@ class OperationServiceMixin:
                 resolved_project_id = project_id_for_path(project_path)
             status = "completed"
 
-        if project_id and resolved_project_id and project_id != resolved_project_id:
+        if canonical_requested_project_id and resolved_project_id and canonical_requested_project_id != resolved_project_id:
             return None
         effective_path = canonical_existing_path(project_path)
         if not effective_path or not is_allowed_path(effective_path, self.config.allowed_roots):
@@ -1034,6 +1037,7 @@ class OperationServiceMixin:
         project = self.catalog.get_project(project_id)
         if project is None:
             raise project_not_found(project_id)
+        project_id = project.project_id
         cwd = canonical_existing_path(args.get("cwd") or project.path)
         if not is_allowed_path(cwd, self.config.allowed_roots):
             raise invalid_argument("Requested cwd is outside the allowlist.", cwd=cwd)
@@ -1508,6 +1512,8 @@ class OperationServiceMixin:
             project = self.catalog.get_project(str(project_id))
             if project is None:
                 raise project_not_found(str(project_id))
+            project_id = project.project_id
+            actual_args["project_id"] = project_id
             project_path = canonical_existing_path(args.get("cwd") or project.path)
             if not is_allowed_path(project_path, self.config.allowed_roots):
                 raise invalid_argument("Requested cwd is outside the allowlist.", cwd=project_path)
@@ -1546,6 +1552,8 @@ class OperationServiceMixin:
                 project = self.catalog.get_project(str(project_id)) if project_id else None
                 if project is None:
                     raise project_not_found(str(project_id))
+                project_id = project.project_id
+                actual_args["project_id"] = project_id
                 project_path = canonical_existing_path(project.path)
             if not project_path or not is_allowed_path(project_path, self.config.allowed_roots):
                 raise invalid_argument("Requested cwd is outside the allowlist.", cwd=project_path)

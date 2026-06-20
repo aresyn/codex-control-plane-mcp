@@ -502,13 +502,19 @@ class RuntimeServiceMixin:
         return result
 
     async def codex_preflight_project_run(self, args: dict[str, Any]) -> dict[str, Any]:
-        project_id = _optional_string(args.get("project_id"))
+        requested_project_id = _optional_string(args.get("project_id"))
+        project_id = requested_project_id
         cwd = _optional_string(args.get("cwd"))
         if project_id and not cwd:
             project = self.catalog.get_project(project_id)
             if project is None:
                 raise project_not_found(project_id)
+            project_id = project.project_id
             cwd = project.path
+        elif project_id:
+            project = self.catalog.get_project(project_id)
+            if project is not None:
+                project_id = project.project_id
         if not cwd:
             cwd = str(self.config.projects_root)
         if not project_id:
@@ -635,6 +641,7 @@ class RuntimeServiceMixin:
             "status": status,
             "cwd": str(cwd_path),
             "projectId": project_id,
+            "requestedProjectId": requested_project_id,
             "workflowKind": _optional_string(args.get("workflow_kind")) or "plan",
             "model": model,
             "sandbox": sandbox,

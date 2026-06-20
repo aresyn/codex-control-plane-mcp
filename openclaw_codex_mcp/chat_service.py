@@ -64,9 +64,11 @@ class ChatServiceMixin:
         return _with_budget(result, tool_name="codex_list_projects")
 
     def codex_list_project_chats(self, args: dict[str, Any]) -> dict[str, Any]:
-        project_id = _required_string(args, "project_id")
-        if self.catalog.get_project(project_id) is None:
-            raise project_not_found(project_id)
+        requested_project_id = _required_string(args, "project_id")
+        project = self.catalog.get_project(requested_project_id)
+        if project is None:
+            raise project_not_found(requested_project_id)
+        project_id = project.project_id
         limit = _bounded_int(args.get("limit", 100), 1, 500)
         cursor = args.get("cursor")
         offset = int(cursor) if cursor not in (None, "") else 0
@@ -80,6 +82,8 @@ class ChatServiceMixin:
         LOG.info("list_project_chats project_id=%s total=%d returned=%d", project_id, len(chats), len(page))
         result = {
             "project_id": project_id,
+            "projectId": project_id,
+            "requestedProjectId": requested_project_id,
             "chats": [
                 _chat_to_tool(chat, include_preview=include_preview, title_max_chars=title_max_chars, preview_max_chars=preview_max_chars)
                 for chat in page
@@ -99,8 +103,10 @@ class ChatServiceMixin:
         self.catalog.list_projects()
         chats = self.catalog.chats.values()
         if project_id:
-            if self.catalog.get_project(str(project_id)) is None:
+            project = self.catalog.get_project(str(project_id))
+            if project is None:
                 raise project_not_found(str(project_id))
+            project_id = project.project_id
             chats = [chat for chat in chats if chat.project_id == project_id]
         active: list[dict[str, Any]] = []
         for chat in chats:
@@ -150,9 +156,11 @@ class ChatServiceMixin:
             raise invalid_argument("query must be at most 1000 characters")
         project_id = args.get("project_id")
         if project_id:
-            project_id = str(project_id)
-            if self.catalog.get_project(project_id) is None:
-                raise project_not_found(project_id)
+            requested_project_id = str(project_id)
+            project = self.catalog.get_project(requested_project_id)
+            if project is None:
+                raise project_not_found(requested_project_id)
+            project_id = project.project_id
         include_archived = bool(args.get("include_archived", False))
         limit = _bounded_int(args.get("limit", 10), 1, 50)
         cursor = args.get("cursor")

@@ -185,10 +185,11 @@ class McpDefinitionTests(unittest.TestCase):
                     {"compact": True, "refresh": True, "roots": [str(project)], "limit": 10}
                 )
                 project_id = (projects["projects"][0]["projectId"] if projects["projects"] else None)
+                project_name = (projects["projects"][0]["name"] if projects["projects"] else None)
                 preflight = asyncio.run(
                     service.codex_preflight_project_run(
                         {
-                            "project_id": project_id,
+                            "project_id": project_name,
                             "cwd": str(project),
                             "sandbox": "danger-full-access",
                             "approval_policy": "never",
@@ -196,10 +197,11 @@ class McpDefinitionTests(unittest.TestCase):
                         }
                     )
                 )
+                chats = service.codex_list_project_chats({"project_id": project_name, "limit": 5})
                 submitted = service.codex_submit_task(
                     {
                         "operation_type": "start_chat",
-                        "project_id": project_id,
+                        "project_id": project_name,
                         "cwd": str(project),
                         "message": "MCP regression test. Do not modify files.",
                         "sandbox": "danger-full-access",
@@ -214,8 +216,13 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertTrue(project_id)
         self.assertNotEqual("error", preflight["status"])
         self.assertTrue(preflight["ok"])
+        self.assertEqual(project_id, preflight["projectId"])
+        self.assertEqual(project_name, preflight["requestedProjectId"])
+        self.assertEqual(project_id, chats["projectId"])
+        self.assertEqual(project_name, chats["requestedProjectId"])
         self.assertTrue(submitted["ok"])
         self.assertEqual("queued", submitted["status"])
+        self.assertEqual(project_id, submitted["projectId"])
 
     def test_runtime_capabilities_unauthenticated_skips_account_usage_and_limits(self) -> None:
         with TemporaryDirectory() as tmp:

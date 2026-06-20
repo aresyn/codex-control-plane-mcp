@@ -45,7 +45,9 @@ class ThreadResolver:
         requested = str(thread_id or "").strip()
         if not requested:
             return None
-        chat = self.catalog.get_chat(requested, project_id)
+        project = self.catalog.get_project(project_id) if project_id else None
+        canonical_project_id = project.project_id if project is not None else project_id
+        chat = self.catalog.get_chat(requested, canonical_project_id)
         if chat is not None:
             return ThreadResolution(chat=chat, source="catalog", requested_thread_id=requested, canonical_thread_id=chat.thread_id)
         if refresh_catalog:
@@ -53,7 +55,7 @@ class ThreadResolver:
                 self.catalog.refresh()
             except Exception:
                 pass
-            chat = self.catalog.get_chat(requested, project_id)
+            chat = self.catalog.get_chat(requested, canonical_project_id)
             if chat is not None:
                 return ThreadResolution(chat=chat, source="catalog_refresh", requested_thread_id=requested, canonical_thread_id=chat.thread_id)
 
@@ -64,7 +66,7 @@ class ThreadResolver:
                 chat=Chat(
                     chat_id=requested,
                     thread_id=requested,
-                    project_id=project_id or _optional_string(tracked_turn.get("project_id")) or (project_id_for_path(project_path) if project_path else None),
+                    project_id=canonical_project_id or _optional_string(tracked_turn.get("project_id")) or (project_id_for_path(project_path) if project_path else None),
                     project_path=project_path,
                     title=requested[:16],
                     created_at=_optional_string(tracked_turn.get("started_at")),
@@ -86,7 +88,7 @@ class ThreadResolver:
                 chat=Chat(
                     chat_id=requested,
                     thread_id=requested,
-                    project_id=project_id or (project_id_for_path(project_path) if project_path else None),
+                    project_id=canonical_project_id or (project_id_for_path(project_path) if project_path else None),
                     project_path=project_path,
                     title=_optional_string(hook_thread.get("title")),
                     created_at=_optional_string(hook_thread.get("created_at")),
@@ -106,7 +108,7 @@ class ThreadResolver:
                 chat=Chat(
                     chat_id=requested,
                     thread_id=requested,
-                    project_id=project_id,
+                    project_id=canonical_project_id,
                     project_path=None,
                     title=requested[:16],
                     transcript_path=str(thread_dir),

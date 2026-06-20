@@ -229,15 +229,17 @@ class ThreadLifecycleServiceMixin:
         }
 
     def _resolve_lifecycle_thread_context(self, *, thread_id: str, project_id: str | None = None) -> dict[str, Any]:
-        resolution = self.thread_resolver.resolve(thread_id, project_id, refresh_catalog=True)
-        known_thread = self._resolve_known_thread_context(thread_id, project_id)
+        project = self.catalog.get_project(project_id) if project_id else None
+        canonical_project_id = project.project_id if project is not None else project_id
+        resolution = self.thread_resolver.resolve(thread_id, canonical_project_id, refresh_catalog=True)
+        known_thread = self._resolve_known_thread_context(thread_id, canonical_project_id)
         if resolution is None and known_thread is None:
             raise thread_not_found(thread_id)
         chat = resolution.chat if resolution is not None else None
         resolved_project_id = (
             _optional_string(chat.project_id) if chat is not None else _optional_string((known_thread or {}).get("projectId"))
-        ) or project_id
-        if project_id and resolved_project_id and project_id != resolved_project_id:
+        ) or canonical_project_id
+        if canonical_project_id and resolved_project_id and canonical_project_id != resolved_project_id:
             raise thread_not_found(thread_id)
         project_path = (
             (_optional_string(chat.project_path) if chat is not None else None)
