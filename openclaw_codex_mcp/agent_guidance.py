@@ -782,6 +782,8 @@ def _instruction(
 ) -> dict[str, Any]:
     item = {
         "kind": kind,
+        "guideAction": kind,
+        "guideFlow": _guide_flow_for_instruction(kind, tool_name),
         "toolName": tool_name,
         "arguments": redact_payload({key: value for key, value in arguments.items() if value not in (None, "")}),
         "reason": redact_text(reason, max_chars=500),
@@ -794,6 +796,24 @@ def _instruction(
         "continueIf": continue_if or "the tool result is ok and loopGuard.allowed remains true",
     }
     return item
+
+
+def _guide_flow_for_instruction(kind: str, tool_name: str | None) -> str:
+    if tool_name in {"codex_get_operation_status", "codex_get_queue_status", "codex_get_concurrency_status"}:
+        return "long_running_poll"
+    if tool_name in {"codex_get_workflow_status", "codex_approve_plan"}:
+        return "plan_mode"
+    if tool_name in {"codex_collect_diagnostics", "codex_analyze_issue", "codex_repair_issue"}:
+        return "diagnostics_recovery"
+    if tool_name in {"codex_list_pending_interactions", "codex_answer_pending_interaction"}:
+        return "long_running_poll"
+    if tool_name == "codex_interrupt_turn" or kind == "interrupt_turn":
+        return "interrupt"
+    if kind == "no_action":
+        return "diagnostics_recovery"
+    if kind.startswith("retry_"):
+        return "new_task"
+    return "startup"
 
 
 _REPAIR_ACTIONS = {

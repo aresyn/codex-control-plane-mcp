@@ -15,6 +15,12 @@ from typing import Any
 from urllib.parse import urlparse
 
 from . import __version__
+from .agent_contract import (
+    GUIDE_VERSION,
+    apply_agent_contract_to_tools,
+    build_agent_contract,
+    compact_tools_list_contract,
+)
 from .agent_safe_redactor import AgentSafeRedactor
 from .agent_guidance import (
     attempt_scope_from_args,
@@ -141,6 +147,7 @@ STABLE_OPENCLAW_TOOLS = {
     "codex_get_worker_command_status",
     "codex_get_runtime_capabilities",
     "codex_health_summary",
+    "codex_get_agent_contract",
     "codex_collect_diagnostics",
     "codex_repair_issue",
 }
@@ -957,6 +964,19 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "codex_get_agent_contract",
+        "description": "Read the machine-readable agent guide for this MCP server. Use this when tools/list metadata was unavailable or when a client wants full flow examples. It is passive and never starts app-server or writes durable state.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "detail": {"type": "string", "enum": ["compact", "full"], "default": "compact"},
+                "client_type": {"type": ["string", "null"], "default": None, "maxLength": 100},
+                "include_examples": {"type": "boolean", "default": False},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "codex_collect_diagnostics",
         "description": "Collect a read-only MCP/Codex diagnostic snapshot: paths, app-server state, active work, pending interactions, workflows, logs/events pointers, and health checks.",
         "inputSchema": {
@@ -1066,15 +1086,17 @@ TOOLS: list[dict[str, Any]] = [
 
 
 for _tool in TOOLS:
-    with_output_schema(_tool)
-    _tool.setdefault(
-        "annotations",
-        {
-            "openclawContractGroup": "stable"
-            if _tool.get("name") in STABLE_OPENCLAW_TOOLS
-            else "compatibility"
-        },
+    annotations = dict(_tool.get("annotations") or {})
+    annotations.setdefault(
+        "openclawContractGroup",
+        "stable" if _tool.get("name") in STABLE_OPENCLAW_TOOLS else "compatibility",
     )
+    _tool["annotations"] = annotations
+
+apply_agent_contract_to_tools(TOOLS)
+
+for _tool in TOOLS:
+    with_output_schema(_tool)
 
 
 class ToolService:
@@ -1326,13 +1348,44 @@ class ToolService:
         redacted = self.agent_safe_redactor.redact(normalized, mode=mode)
         return redacted if isinstance(redacted, dict) else normalized
 
+    def codex_get_agent_contract(self, args: dict[str, Any]) -> dict[str, Any]:
+        detail = str(args.get("detail") or "compact")
+        if detail not in {"compact", "full"}:
+            raise invalid_argument("detail must be compact or full", detail=detail)
+        client_type = _bounded_optional_text(args.get("client_type"), field_name="client_type", max_chars=100)
+        include_examples = bool(args.get("include_examples", False))
+        contract = build_agent_contract(
+            contract_version=CONTRACT_VERSION,
+            tool_surface_hash=_tool_surface_hash(),
+            detail=detail,
+            client_type=client_type,
+            include_examples=include_examples,
+        )
+        return {
+            "ok": True,
+            "agentContract": contract,
+            "guideVersion": contract["version"],
+            "guideHash": contract["guideHash"],
+            "recommendedStartupTool": contract["recommendedStartupTool"],
+            "recommendedPrimaryWriteTool": contract["recommendedPrimaryWriteTool"],
+            "statusContract": {
+                "surface": "codex_get_agent_contract",
+                "passiveRead": True,
+                "mayStartTurn": False,
+            },
+        }
+
     async def call(self, name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
         args = arguments or {}
         started = time.monotonic()
         LOG.info("call start name=%s argument_keys=%s", name, sorted(args.keys()))
-        if self._can_schedule_inline():
+        if name != "codex_get_agent_contract" and self._can_schedule_inline():
             self._schedule_recoverable_operations()
         try:
+            if name == "codex_get_agent_contract":
+                result = self.codex_get_agent_contract(args)
+                LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
+                return self._finalize_public_result(name, result)
             if self._should_delegate_compatibility_write(name, args):
                 result = self._delegated_compatibility_write_payload(name, args)
                 LOG.info("call delegated compatibility write name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
@@ -2208,12 +2261,25 @@ def _canonical_repair_action(action_name: str) -> str:
     return aliases.get(action_name, action_name)
 
 
+def tools_list_payload() -> dict[str, Any]:
+    payload: dict[str, Any] = {"tools": TOOLS}
+    payload.update(compact_tools_list_contract(contract_version=CONTRACT_VERSION, tool_surface_hash=_tool_surface_hash()))
+    return payload
+
+
 def _contract_version_block(*, generated_at: str) -> dict[str, Any]:
+    tool_surface_hash = _tool_surface_hash()
+    guide = build_agent_contract(contract_version=CONTRACT_VERSION, tool_surface_hash=tool_surface_hash, detail="compact")
     return {
         "serverName": SERVER_NAME,
         "serverVersion": __version__,
         "contractVersion": CONTRACT_VERSION,
-        "toolSurfaceHash": _tool_surface_hash(),
+        "toolSurfaceHash": tool_surface_hash,
+        "guideVersion": GUIDE_VERSION,
+        "guideHash": guide["guideHash"],
+        "recommendedStartupFlow": guide["recommendedStartupFlow"],
+        "recommendedStartupTool": guide["recommendedStartupTool"],
+        "recommendedPrimaryWriteTool": guide["recommendedPrimaryWriteTool"],
         "stableToolCount": len(STABLE_OPENCLAW_TOOLS),
         "compatibilityToolCount": len(COMPATIBILITY_TOOLS),
         "stableTools": sorted(STABLE_OPENCLAW_TOOLS),
@@ -2232,6 +2298,7 @@ def _tool_surface_hash() -> str:
                 "inputSchema": tool.get("inputSchema"),
                 "outputSchema": tool.get("outputSchema"),
                 "contractGroup": (tool.get("annotations") or {}).get("openclawContractGroup"),
+                "codexMcp": (tool.get("annotations") or {}).get("codexMcp"),
             }
         )
     canonical = json.dumps(surface, ensure_ascii=False, sort_keys=True, separators=(",", ":"))

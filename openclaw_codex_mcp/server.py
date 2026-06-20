@@ -12,7 +12,7 @@ from . import __version__
 from .errors import CodexMcpError
 from .logging_utils import configure_logging, get_logger
 from .protocol import call_tool_result
-from .tools import TOOLS, ToolService
+from .tools import ToolService, tools_list_payload
 
 
 SERVER_INFO = {"name": "codex-control-plane-mcp", "version": __version__}
@@ -98,7 +98,7 @@ class StdioMcpServer:
                 "serverInfo": SERVER_INFO,
             }
         if method == "tools/list":
-            return {"tools": TOOLS}
+            return tools_list_payload()
         if method == "tools/call":
             name = params.get("name")
             if not isinstance(name, str) or not name.strip():

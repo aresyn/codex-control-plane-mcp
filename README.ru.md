@@ -628,8 +628,23 @@ Domain или tool error:
 ```
 
 Вызывайте `codex_health_summary` при старте и reconnect. В блоке `version` есть
-`serverName`, `serverVersion`, `contractVersion`, `toolSurfaceHash` и списки
+`serverName`, `serverVersion`, `contractVersion`, `toolSurfaceHash`,
+`guideHash`, `guideVersion`, рекомендуемые startup/write tools и списки
 stable/compatibility tools.
+
+Агент может понять порядок работы без этого README. `tools/list` возвращает:
+
+- `codexMcpGuide`: компактный машинно-читаемый guide с capabilities, flows,
+  global rules и runtime limits;
+- `toolGroups`: группы рекомендуемых tools;
+- `recommendedStartupTool="codex_health_summary"`;
+- `recommendedPrimaryWriteTool="codex_submit_task"`.
+
+У каждого tool есть `annotations.codexMcp`: роль, следующие tools, правило
+idempotency, признак passive read и `mayStartTurn`. Если клиентская библиотека
+скрывает top-level поля из `tools/list`, вызови
+`codex_get_agent_contract(detail="compact")` или
+`codex_get_agent_contract(detail="full", include_examples=true)`.
 
 ## Конфигурация
 

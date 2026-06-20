@@ -36,17 +36,20 @@ talks to `codex-app-server`.
 
 On startup, reconnect, and after MCP restart:
 
-1. Call `codex_health_summary`.
-2. Verify:
+1. Read `codexMcpGuide` from `tools/list`. If the MCP client library hides
+   top-level discovery fields, call `codex_get_agent_contract(detail="compact")`.
+2. Call `codex_health_summary`.
+3. Verify:
    - `ok == true`;
    - `version.serverName == "codex-control-plane-mcp"`;
    - `version.contractVersion == "1"`;
    - `version.toolSurfaceHash` exists;
+   - `version.guideHash` exists;
    - required stable tools are present in `version.stableTools`.
-3. If OpenClaw may start new work, call `codex_get_runtime_capabilities`.
-4. If `hookHistory.status` is not `ok`, continue with a warning. Hook history is
+4. If OpenClaw may start new work, call `codex_get_runtime_capabilities`.
+5. If `hookHistory.status` is not `ok`, continue with a warning. Hook history is
    a read fallback, not the write path.
-5. If `runtimeCapabilities.status == "partial"`, inspect `methodResults` and
+6. If `runtimeCapabilities.status == "partial"`, inspect `methodResults` and
    decide based on the failed method.
 
 Minimal startup call:

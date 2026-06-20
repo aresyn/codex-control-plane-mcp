@@ -8,7 +8,15 @@ verify:
 - `version.serverName == "codex-control-plane-mcp"`
 - `version.contractVersion == "1"`
 - `version.toolSurfaceHash` is present and stable for the installed build
+- `version.guideHash` is present and matches the agent guide returned by
+  discovery
 - required stable tools are present in `version.stableTools`
+
+Agents do not need a separate client guide to discover the basic workflow.
+`tools/list` returns `codexMcpGuide`, `toolGroups`,
+`recommendedStartupTool`, and `recommendedPrimaryWriteTool` next to the normal
+MCP `tools[]` array. If a client library drops those top-level fields, call
+`codex_get_agent_contract(detail="compact")` to read the same guide.
 
 ## MCP protocol
 
@@ -73,6 +81,7 @@ These tools are the supported surface for long-running Codex orchestration:
 - `codex_get_runtime_capabilities`
 - `codex_preflight_project_run`
 - `codex_health_summary`
+- `codex_get_agent_contract`
 - `codex_collect_diagnostics`
 - `codex_repair_issue`
 
@@ -987,6 +996,11 @@ the catalog catches up.
 - `serverVersion`
 - `contractVersion`
 - `toolSurfaceHash`
+- `guideVersion`
+- `guideHash`
+- `recommendedStartupFlow`
+- `recommendedStartupTool`
+- `recommendedPrimaryWriteTool`
 - `stableToolCount`
 - `compatibilityToolCount`
 - `stableTools`
@@ -994,8 +1008,28 @@ the catalog catches up.
 - `generatedAt`
 
 `toolSurfaceHash` is a SHA-256 hash over tool names, descriptions, input/output
-schemas, and contract groups. It is a fast compatibility probe, not a security
-signature.
+schemas, contract groups, and `codexMcp` tool annotations. `guideHash` is a
+SHA-256 hash over the machine-readable agent guide. Both are compatibility
+probes, not security signatures.
+
+## Agent self-description
+
+Every tool has `annotations.codexMcp`:
+
+- `role`: one of `primary_write`, `poll_status`, `workflow`, `diagnostics`,
+  `lifecycle`, `compatibility`, or `read_only`.
+- `preferred`: whether a new agent should prefer this tool over compatibility
+  alternatives.
+- `nextTools`: ordered follow-up calls.
+- `avoidWhen`: compact warnings.
+- `idempotency`: `required`, `recommended`, or `not_applicable`.
+- `passiveRead`: whether the tool is expected to be storage/cache only.
+- `mayStartTurn`: whether the tool can start or affect a Codex turn.
+
+The guide also exposes `capabilityMap`, `usageFlows`, `globalRules`, and
+`runtimeLimits`. Agent guidance instructions include `guideAction` and
+`guideFlow`, so clients can connect a problem response to the same usage flow
+they saw during discovery.
 
 ## Hook history block
 

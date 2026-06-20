@@ -1,6 +1,6 @@
 [project]
 name = "codex-control-plane-mcp"
-version = "0.1.4"
+version = "0.2.0"
 description = "Durable MCP control plane for long-running Codex Desktop tasks."
 readme = "README.md"
 requires-python = ">=3.11"

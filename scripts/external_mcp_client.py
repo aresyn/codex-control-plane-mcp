@@ -32,11 +32,36 @@ from external_mcp_common import (
 )
 
 
-SANDBOXES = [
-    Path(r"D:\CodexProjects\TestProject1"),
-    Path(r"D:\CodexProjects\TestProject2"),
-    Path(r"D:\CodexProjects\TestProject3"),
-]
+SANDBOX_NAMES = ("TestProject1", "TestProject2", "TestProject3")
+
+
+def _split_path_list(value: str) -> list[str]:
+    separator = ";" if ";" in value else os.pathsep
+    return [item.strip() for item in value.split(separator) if item.strip()]
+
+
+def _discover_sandboxes() -> list[Path]:
+    explicit = os.environ.get("CODEX_MCP_TEST_SANDBOXES")
+    if explicit:
+        return [Path(item) for item in _split_path_list(explicit)]
+
+    project_root = os.environ.get("CODEX_MCP_TEST_PROJECT_ROOT")
+    if project_root:
+        root = Path(project_root)
+        return [root / name for name in SANDBOX_NAMES]
+
+    configured_roots = os.environ.get("CODEX_ALLOWED_ROOTS") or local_mcp_entry_env().get("CODEX_ALLOWED_ROOTS", "")
+    for item in _split_path_list(configured_roots):
+        root = Path(item)
+        candidate = [root / name for name in SANDBOX_NAMES]
+        if all(path.exists() for path in candidate):
+            return candidate
+
+    fallback_root = REPO_ROOT / "work" / "mcp-test-sandboxes"
+    return [fallback_root / name for name in SANDBOX_NAMES]
+
+
+SANDBOXES = _discover_sandboxes()
 REPORT = REPO_ROOT / "corrective_action_plan.md"
 ARCHIVE_DIR = REPO_ROOT / "work" / "corrective_action_plan_archive"
 

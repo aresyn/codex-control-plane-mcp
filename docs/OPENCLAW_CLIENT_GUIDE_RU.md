@@ -35,18 +35,21 @@ transcript-файлы. Все write/control действия идут через
 
 При старте OpenClaw, при reconnect и после restart MCP:
 
-1. Вызови `codex_health_summary`.
-2. Проверь:
+1. Прочитай `codexMcpGuide` из `tools/list`. Если MCP client library скрывает
+   top-level поля discovery, вызови `codex_get_agent_contract(detail="compact")`.
+2. Вызови `codex_health_summary`.
+3. Проверь:
    - `ok == true`;
    - `version.serverName == "codex-control-plane-mcp"`;
    - `version.contractVersion == "1"`;
    - `version.toolSurfaceHash` присутствует;
+   - `version.guideHash` присутствует;
    - нужные stable tools есть в `version.stableTools`.
-3. Если OpenClaw планирует запускать новые задачи, вызови
+4. Если OpenClaw планирует запускать новые задачи, вызови
    `codex_get_runtime_capabilities`.
-4. Если `hookHistory.status` не `ok`, не блокируй работу, но добавь warning в
+5. Если `hookHistory.status` не `ok`, не блокируй работу, но добавь warning в
    свою диагностику.
-5. Если `runtimeCapabilities.status == "partial"`, смотри `methodResults` и
+6. Если `runtimeCapabilities.status == "partial"`, смотри `methodResults` и
    решай по конкретной причине.
 
 Минимальная проверка:

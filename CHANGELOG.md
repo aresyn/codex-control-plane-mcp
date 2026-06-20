@@ -7,6 +7,8 @@ versioning after the public `0.1.0` release.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-20
+
 ### Added
 
 - Add central MCP worker mode with `codex-control-plane-mcp-worker`.
@@ -14,6 +16,11 @@ versioning after the public `0.1.0` release.
 - Add worker, queue, concurrency, and worker command status tools.
 - Add scheduler metadata for `agent_id`, `resource_keys`, priority, and
   estimated cost class.
+- Add a self-describing agent contract with `codexMcpGuide`,
+  `codex_get_agent_contract`, tool annotations, startup flows, recovery rules,
+  and stable guide hashes.
+- Add external MCP client tooling for live testing without restarting the Codex
+  Desktop session.
 
 ### Changed
 
@@ -21,6 +28,14 @@ versioning after the public `0.1.0` release.
   operations.
 - Worker scheduling enforces global, per-project, per-agent, per-thread, and
   write resource limits before starting a turn.
+- Stabilize the worker-first control plane for long-running parallel Codex
+  tasks across different projects.
+- Route write/control work through durable operations or worker commands, while
+  status/read tools use bounded passive responses by default.
+- Normalize queue, lock, worker, health, workflow, diagnostics, and guidance
+  responses so agents can poll safely and avoid retry loops.
+- Redact agent-facing responses consistently to avoid leaking raw prompts,
+  local paths, account data, tokens, raw logs, or exact private usage details.
 
 ## [0.1.4] - 2026-06-19
 

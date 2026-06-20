@@ -627,7 +627,23 @@ Domain or tool error:
 
 Call `codex_health_summary` on startup and reconnect. The `version` block
 contains `serverName`, `serverVersion`, `contractVersion`, `toolSurfaceHash`,
-and stable/compatibility tool lists.
+`guideHash`, `guideVersion`, recommended startup/write tools, and
+stable/compatibility tool lists.
+
+Agents can discover the operating contract without reading this README.
+`tools/list` includes:
+
+- `codexMcpGuide`: compact machine-readable guide with capabilities, flows,
+  global rules, and runtime limits;
+- `toolGroups`: ordered groups of preferred tools;
+- `recommendedStartupTool="codex_health_summary"`;
+- `recommendedPrimaryWriteTool="codex_submit_task"`.
+
+Every tool also has `annotations.codexMcp` with its role, follow-up tools,
+idempotency rule, passive-read flag, and `mayStartTurn` flag. If a client
+library hides top-level `tools/list` fields, call
+`codex_get_agent_contract(detail="compact")` or
+`codex_get_agent_contract(detail="full", include_examples=true)`.
 
 ## Configuration
 

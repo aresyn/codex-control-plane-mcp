@@ -37,10 +37,10 @@ PYTHONIOENCODING=utf-8
 ```
 
 That keeps the external test client fingerprint aligned with the central worker.
-For the local sandbox live tests the local entry currently provides:
+For local sandbox live tests, point the helper at your own Codex projects root:
 
 ```text
-CODEX_ALLOWED_ROOTS=D:\CodexProjects;D:\Vibecoding1c
+CODEX_ALLOWED_ROOTS=<path-to-your-codex-projects-root>;<optional-second-root>
 ```
 
 If the local entry is absent, `daemon-start` falls back to the existing parent
@@ -48,8 +48,13 @@ directory of the three test projects. For another machine or a narrower test
 scope, pass roots explicitly:
 
 ```powershell
-python .\scripts\external_mcp_client.py daemon-start --allowed-root D:\CodexProjects
+python .\scripts\external_mcp_client.py daemon-start --allowed-root <path-to-your-codex-projects-root>
 ```
+
+The live-test scenarios look for three sandbox projects named `TestProject1`,
+`TestProject2`, and `TestProject3` under the configured project root. You can
+override that discovery with `CODEX_MCP_TEST_PROJECT_ROOT` or provide exact
+paths through `CODEX_MCP_TEST_SANDBOXES`.
 
 The daemon listens on `127.0.0.1:18891` and requires a random control token from
 `work/external_mcp_client/state.json`.
@@ -79,9 +84,9 @@ The baseline scenario checks:
 - runtime capabilities refresh;
 - sandbox project discovery;
 - sandbox preflight for:
-  - `D:\CodexProjects\TestProject1`
-  - `D:\CodexProjects\TestProject2`
-  - `D:\CodexProjects\TestProject3`
+  - `<sandbox-root>\TestProject1`
+  - `<sandbox-root>\TestProject2`
+  - `<sandbox-root>\TestProject3`
 
 Findings are written to `corrective_action_plan.md`. The old report can be
 archived automatically with `--archive-report`.

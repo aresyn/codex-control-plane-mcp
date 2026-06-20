@@ -161,6 +161,7 @@ class McpDefinitionTests(unittest.TestCase):
                 "codex_get_app_server_status",
                 "codex_get_runtime_capabilities",
                 "codex_health_summary",
+                "codex_get_agent_contract",
                 "codex_collect_diagnostics",
                 "codex_get_diagnostic_logs",
                 "codex_analyze_issue",
@@ -172,9 +173,43 @@ class McpDefinitionTests(unittest.TestCase):
             self.assertIn("outputSchema", tool)
             self.assertEqual(["ok"], tool["outputSchema"]["required"])
             self.assertIn((tool.get("annotations") or {}).get("openclawContractGroup"), {"stable", "compatibility"})
+            codex_mcp = (tool.get("annotations") or {}).get("codexMcp")
+            self.assertIsInstance(codex_mcp, dict)
+            self.assertIn(codex_mcp.get("role"), {"primary_write", "poll_status", "workflow", "diagnostics", "lifecycle", "compatibility", "read_only"})
+            self.assertIn(codex_mcp.get("idempotency"), {"required", "recommended", "not_applicable"})
+            self.assertIsInstance(codex_mcp.get("nextTools"), list)
+            self.assertIsInstance(codex_mcp.get("avoidWhen"), list)
+            self.assertIsInstance(codex_mcp.get("passiveRead"), bool)
+            self.assertIsInstance(codex_mcp.get("mayStartTurn"), bool)
         self.assertEqual(set(), {tool["name"] for tool in TOOLS} - STABLE_OPENCLAW_TOOLS - COMPATIBILITY_TOOLS)
         self.assertEqual(set(), STABLE_OPENCLAW_TOOLS & COMPATIBILITY_TOOLS)
         self.assertEqual(64, len(_tool_surface_hash()))
+        self.assertTrue(by_name := {tool["name"]: tool for tool in TOOLS})
+        self.assertFalse(by_name["codex_start_chat"]["annotations"]["codexMcp"]["preferred"])
+        self.assertTrue(by_name["codex_submit_task"]["annotations"]["codexMcp"]["preferred"])
+        self.assertTrue(by_name["codex_get_agent_contract"]["annotations"]["codexMcp"]["passiveRead"])
+        self.assertFalse(by_name["codex_get_agent_contract"]["annotations"]["codexMcp"]["mayStartTurn"])
+
+    def test_tools_list_exposes_machine_readable_agent_guide(self) -> None:
+        server = StdioMcpServer.__new__(StdioMcpServer)
+        server.service = FakeToolService({"ok": True})
+
+        listed = asyncio.run(server._handle_request("tools/list", {}))
+
+        self.assertIn("tools", listed)
+        self.assertEqual("codex_health_summary", listed["recommendedStartupTool"])
+        self.assertEqual("codex_submit_task", listed["recommendedPrimaryWriteTool"])
+        self.assertIn("toolGroups", listed)
+        self.assertIn("codexMcpGuide", listed)
+        guide = listed["codexMcpGuide"]
+        self.assertEqual("codex-mcp-agent-guide/v1", guide["version"])
+        self.assertEqual(CONTRACT_VERSION, guide["contractVersion"])
+        self.assertEqual(_tool_surface_hash(), guide["toolSurfaceHash"])
+        self.assertEqual("codex_health_summary", guide["recommendedStartupTool"])
+        self.assertEqual("codex_submit_task", guide["recommendedPrimaryWriteTool"])
+        self.assertIn("durableOperations", guide["capabilityMap"])
+        self.assertIn("startup", {flow["id"] for flow in guide["usageFlows"]})
+        self.assertEqual(64, len(guide["guideHash"]))
 
     def test_write_tools_return_fast_ack_schema(self) -> None:
         by_name = {tool["name"]: tool for tool in TOOLS}
@@ -330,6 +365,11 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertIn("operation_id", health_schema)
         self.assertEqual(30, health_schema["stale_after_minutes"]["default"])
 
+        agent_contract_schema = by_name["codex_get_agent_contract"]["inputSchema"]["properties"]
+        self.assertEqual(["compact", "full"], agent_contract_schema["detail"]["enum"])
+        self.assertEqual("compact", agent_contract_schema["detail"]["default"])
+        self.assertFalse(agent_contract_schema["include_examples"]["default"])
+
         logs_schema = by_name["codex_get_diagnostic_logs"]["inputSchema"]["properties"]
         self.assertIn("app_server_events", logs_schema["source"]["enum"])
         self.assertFalse(logs_schema["include_payload"]["default"])
@@ -446,6 +486,11 @@ class McpDefinitionTests(unittest.TestCase):
         names = {tool["name"] for tool in listed["tools"]}
         self.assertIn("codex_start_plan_workflow", names)
         self.assertIn("codex_get_workflow_status", names)
+        self.assertIn("codex_get_agent_contract", names)
+        self.assertEqual("codex_health_summary", listed["recommendedStartupTool"])
+        self.assertEqual("codex_submit_task", listed["recommendedPrimaryWriteTool"])
+        self.assertIn("codexMcpGuide", listed)
+        self.assertEqual(_tool_surface_hash(), listed["codexMcpGuide"]["toolSurfaceHash"])
 
     def test_stdio_subprocess_outputs_only_jsonrpc_frames(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -480,12 +525,19 @@ class McpDefinitionTests(unittest.TestCase):
 
                 initialized = request(1, "initialize", {"protocolVersion": "2025-01-10"})
                 listed = request(2, "tools/list", {})
-                tool_error = request(3, "tools/call", {"name": "missing_tool", "arguments": {}})
-                rpc_error = request(4, "missing/method", {})
+                contract = request(3, "tools/call", {"name": "codex_get_agent_contract", "arguments": {"detail": "compact"}})
+                tool_error = request(4, "tools/call", {"name": "missing_tool", "arguments": {}})
+                rpc_error = request(5, "missing/method", {})
 
                 self.assertEqual("2.0", initialized["jsonrpc"])
                 self.assertEqual("2025-01-10", initialized["result"]["protocolVersion"])
                 self.assertIn("tools", listed["result"])
+                self.assertIn("codexMcpGuide", listed["result"])
+                self.assertFalse(contract["result"]["isError"])
+                self.assertEqual(
+                    listed["result"]["codexMcpGuide"]["guideHash"],
+                    contract["result"]["structuredContent"]["agentContract"]["guideHash"],
+                )
                 self.assertTrue(tool_error["result"]["isError"])
                 self.assertFalse(tool_error["result"]["structuredContent"]["ok"])
                 self.assertEqual("INVALID_ARGUMENT", tool_error["result"]["structuredContent"]["error"]["code"])
