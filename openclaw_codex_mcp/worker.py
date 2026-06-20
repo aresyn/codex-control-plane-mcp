@@ -9,6 +9,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
+from .active_work import worker_active_turns_snapshot
 from .config import ServerConfig, path_key
 from .lock_planner import (
     operation_consumes_turn_slot as planner_operation_consumes_turn_slot,
@@ -114,16 +115,7 @@ class CentralWorker:
                 pass
 
     def _active_turn_count(self) -> int:
-        rows = self.service.storage.connection.execute(
-            f"""
-            SELECT COUNT(DISTINCT turns.turn_id) AS count
-              FROM codex_operations AS ops
-              JOIN tracked_turns AS turns ON turns.turn_id = ops.turn_id
-             WHERE turns.status IN ({','.join('?' for _ in TURN_ACTIVE_STATUSES)})
-            """,
-            tuple(TURN_ACTIVE_STATUSES),
-        ).fetchone()
-        return int(rows["count"] if rows is not None else 0)
+        return int(worker_active_turns_snapshot(self.service.storage).get("activeTurnCount") or 0)
 
     async def _process_worker_commands(self) -> None:
         for command in self.service.storage.list_worker_commands(status="queued", limit=10):
@@ -153,25 +145,26 @@ class CentralWorker:
                 )
             except asyncio.TimeoutError:
                 LOG.warning("worker command timed out command_id=%s type=%s", command_id, command_type)
+                now = _now_iso()
                 self.service.storage.update_worker_command(
                     command_id,
-                    status="running",
+                    status="timed_out",
                     result_json=json.dumps(
                         {
                             "ok": True,
                             "commandId": command_id,
                             "commandType": command_type,
-                            "status": "running",
+                            "status": "timed_out",
                             "commandTimedOut": True,
-                            "nextRecommendedAction": "poll_worker_command",
-                            "recommendedPollAfterSeconds": 5,
-                            "pollRecommended": True,
+                            "nextRecommendedAction": "inspect_worker_command",
+                            "recommendedPollAfterSeconds": 0,
+                            "pollRecommended": False,
                         },
                         ensure_ascii=False,
                     ),
                     worker_id=self.worker_id,
-                    updated_at=_now_iso(),
-                    completed_at=None,
+                    updated_at=now,
+                    completed_at=now,
                     last_error="Worker command timed out before completion.",
                 )
             except Exception as exc:

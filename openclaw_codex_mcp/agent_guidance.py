@@ -608,6 +608,27 @@ def _diagnostics_context(payload: dict[str, Any], surface: str) -> dict[str, Any
         actions = payload.get("recommendedRepairActions") if isinstance(payload.get("recommendedRepairActions"), list) else []
         first_action = _first_action_name(actions) or "collect_diagnostics"
         scope_type, scope_id = "diagnosis", str(payload.get("diagnosisId") or "latest")
+        if first_action == "no_action" or category == "no_obvious_issue":
+            return {
+                "problemState": "no_action",
+                "category": category,
+                "summary": redact_text(root.get("title") or "No automated recovery is recommended from the available diagnostics.", max_chars=300),
+                "scopeType": scope_type,
+                "scopeId": scope_id,
+                "action": "no_action",
+                "instructions": [
+                    _instruction(
+                        "no_action",
+                        None,
+                        {},
+                        reason="Diagnostics did not find a concrete recoverable MCP/Codex fault.",
+                        expected="The agent does not start repair loops and continues only if new evidence appears.",
+                        risk="low",
+                    )
+                ],
+                "evidenceRefs": [],
+                "recommendedPollAfterSeconds": 0,
+            }
         return _repair_context(
             "recoverable" if first_action in _REPAIR_ACTIONS else "blocked",
             category,
@@ -791,6 +812,7 @@ _REPAIR_ACTIONS = {
     "rebuild_search_index",
     "validate_paths_and_config",
     "interrupt_turn",
+    "no_action",
 }
 
 

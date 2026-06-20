@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from . import tools as _tools
+from .search import SearchIndexStatus
 
 globals().update(_tools.__dict__)
 
@@ -156,7 +157,7 @@ class ChatServiceMixin:
         limit = _bounded_int(args.get("limit", 10), 1, 50)
         cursor = args.get("cursor")
         offset = int(cursor) if cursor not in (None, "") else 0
-        include_snippets = bool(args.get("include_snippets", True))
+        include_snippets = bool(args.get("include_snippets", bool(project_id)))
         snippets_per_chat = _bounded_int(args.get("snippets_per_chat", 2), 0, 5)
         snippet_max_chars = _bounded_int(args.get("snippet_max_chars", 240), 80, 1000)
         refresh_index = bool(args.get("refresh_index", True))
@@ -166,10 +167,19 @@ class ChatServiceMixin:
         search_index = SearchIndex(self.config, self.storage, self.catalog)
         index_status = None
         if refresh_index:
-            index_status = search_index.refresh(
-                include_archived=include_archived,
-                time_budget_seconds=index_time_budget_seconds,
-            )
+            if not project_id and index_time_budget_seconds <= 3:
+                index_status = SearchIndexStatus(
+                    refreshed=False,
+                    indexed_files=0,
+                    skipped_unchanged_files=0,
+                    pending_files=0,
+                    time_budget_exhausted=True,
+                )
+            else:
+                index_status = search_index.refresh(
+                    include_archived=include_archived,
+                    time_budget_seconds=index_time_budget_seconds,
+                )
         else:
             self.catalog.list_projects()
         try:
@@ -233,7 +243,6 @@ class ChatServiceMixin:
         chat = self._resolve_chat_for_read(chat_id, str(project_id) if project_id else None)
         if chat is None:
             raise thread_not_found(chat_id)
-        self._refresh_thread_tracking_from_transcript(chat.thread_id, chat=chat)
         parsed, source_info = self._load_chat_summary(
             chat,
             archived=chat.archived,
@@ -274,7 +283,6 @@ class ChatServiceMixin:
         chat = self._resolve_chat_for_read(chat_id, str(project_id) if project_id else None)
         if chat is None:
             raise thread_not_found(chat_id)
-        self._refresh_thread_tracking_from_transcript(chat.thread_id, chat=chat)
         summary, source_info = self._load_chat_summary(
             chat,
             archived=chat.archived,
@@ -469,7 +477,7 @@ class ChatServiceMixin:
         }
 
     def _resolve_chat_for_read(self, chat_id: str, project_id: str | None) -> Chat | None:
-        resolution = self.thread_resolver.resolve(chat_id, project_id, refresh_catalog=True)
+        resolution = self.thread_resolver.resolve(chat_id, project_id, refresh_catalog=False)
         return resolution.chat if resolution is not None else None
 
     def _refresh_thread_tracking_from_transcript(self, thread_id: str, *, chat: Chat | None = None) -> dict[str, Any]:

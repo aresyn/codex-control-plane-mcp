@@ -29,7 +29,15 @@ def _workflow_action_with_queue_pressure(default_action: str, queue_state: dict[
     if queue_status == "queued":
         if reason in {"resource_lock_conflict", "write_project_slot_limit"}:
             return "wait_for_resource_lock"
-        if reason in {"global_slot_limit", "project_slot_limit", "agent_slot_limit", "thread_slot_limit"}:
+        if reason in {
+            "global_slot_limit",
+            "project_slot_limit",
+            "agent_slot_limit",
+            "thread_slot_limit",
+            "waiting_for_worker",
+            "app_server_backpressure",
+            "worker_unavailable",
+        }:
             return "wait_for_worker_slot"
     return default_action
 

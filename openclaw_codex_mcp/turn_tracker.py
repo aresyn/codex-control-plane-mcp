@@ -912,9 +912,11 @@ def _progress_event(
     metadata: dict[str, Any] = {}
 
     if method == "item/agentMessage/delta":
-        category = "agent_message_delta"
-        text, truncated = _clean_progress_text(params.get("delta"), max_chars)
-        metadata = {"itemId": item_id}
+        category = "assistant_delta_summary"
+        delta = str(params.get("delta") or "")
+        text = "Assistant message delta received."
+        truncated = False
+        metadata = {"itemId": item_id, "deltaChars": len(delta)}
     elif method == "item/plan/delta":
         category = "plan_delta"
         text, truncated = _clean_progress_text(params.get("delta"), max_chars)

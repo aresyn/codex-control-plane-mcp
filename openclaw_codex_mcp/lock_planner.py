@@ -37,7 +37,7 @@ def thread_active_lock(
         "thread_id": thread_id,
         "project_id": project_id,
         "lock_mode": "exclusive",
-        "worker_id": worker_id or "unknown",
+        "worker_id": worker_id or "planned",
         "created_at": created_at,
         "expires_at": expires_at,
     }

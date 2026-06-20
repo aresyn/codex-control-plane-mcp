@@ -567,14 +567,26 @@ class RuntimeServiceMixin:
         runtime = capabilities.get("runtimeCapabilities") or {}
         account = runtime.get("accountStatus") if isinstance(runtime.get("accountStatus"), dict) else {}
         auth_file_present = (self.config.codex_home / "auth.json").exists()
-        worker_managed_passive = self.config.execution_mode in {"client", "observe"} and runtime.get("status") in {"passive", "not_collected"}
+        worker_managed_runtime = self.config.execution_mode in {"client", "observe"}
+        worker_managed_passive = worker_managed_runtime and runtime.get("status") in {
+            "passive",
+            "not_collected",
+            "unknown",
+            "stale",
+            "cached",
+            "ok",
+        }
         if account.get("authenticated"):
             account_status = "ok"
             account_message = "Codex account is authenticated."
         elif worker_managed_passive and auth_file_present:
             account_status = "skipped"
             account_message = "Codex account inventory is worker-managed; auth.json is present, so authentication is unknown from this client process."
-            account = {"authenticated": None, "status": "unknown", "skippedReason": "worker_managed_passive_inventory"}
+            account = {"authenticated": None, "status": "unknown_worker_managed", "skippedReason": "worker_managed_passive_inventory"}
+        elif worker_managed_runtime and auth_file_present:
+            account_status = "skipped"
+            account_message = "Codex account inventory is worker-managed; auth.json is present, so this client does not block on stale account state."
+            account = {"authenticated": None, "status": "skipped_worker_managed", "skippedReason": "worker_managed_account_inventory"}
         else:
             account_status = "error"
             account_message = "Codex account is not authenticated."

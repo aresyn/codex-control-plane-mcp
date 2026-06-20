@@ -48,7 +48,15 @@ def _workflow_action_with_queue_pressure(default_action: str, queue_state: dict[
     if queue_status == "queued":
         if reason in {"resource_lock_conflict", "write_project_slot_limit"}:
             return "wait_for_resource_lock"
-        if reason in {"global_slot_limit", "project_slot_limit", "agent_slot_limit", "thread_slot_limit"}:
+        if reason in {
+            "global_slot_limit",
+            "project_slot_limit",
+            "agent_slot_limit",
+            "thread_slot_limit",
+            "waiting_for_worker",
+            "app_server_backpressure",
+            "worker_unavailable",
+        }:
             return "wait_for_worker_slot"
     return default_action
 
@@ -855,6 +863,7 @@ class WorkflowServiceMixin:
             workflow,
             execution_turn=execution_turn,
             message_max_chars=message_max_chars,
+            read_only=read_only,
         )
         workflow = self.storage.get_workflow(workflow_id) or workflow
         phase, status, last_error = _derive_workflow_phase(
@@ -877,8 +886,16 @@ class WorkflowServiceMixin:
             last_error = None
         now = _now_iso()
         completed_at = workflow.get("completed_at")
+        timestamp_source = "workflow_row" if completed_at else None
         if status in {"completed", "failed", "orphaned_after_app_server_exit"} and not completed_at:
-            completed_at = now
+            fallback_candidates = [
+                (execution_operation or {}).get("completedAt") if isinstance(execution_operation, dict) else None,
+                (plan_operation or {}).get("completedAt") if isinstance(plan_operation, dict) else None,
+                (execution_turn or {}).get("completedAt") if isinstance(execution_turn, dict) else None,
+                (plan_turn or {}).get("completedAt") if isinstance(plan_turn, dict) else None,
+            ]
+            completed_at = next((_optional_string(item) for item in fallback_candidates if _optional_string(item)), None)
+            timestamp_source = "operation_or_turn_fallback" if completed_at else "missing"
         if not read_only and (phase != workflow.get("phase") or status != workflow.get("status") or last_error != workflow.get("last_error")):
             self.storage.update_workflow(
                 workflow_id,
@@ -922,6 +939,11 @@ class WorkflowServiceMixin:
             runtime_policy = plan_operation.get("runtimePolicy")
         runtime_policy_fields = _runtime_policy_public_fields(runtime_policy)
         safe_completed_at, timestamp_corrected = _safe_codex_timestamp(completed_at)
+        latest_report_hash = (
+            workflow.get("latest_report_hash")
+            or ((execution_operation or {}).get("latestReportHash") if isinstance(execution_operation, dict) else None)
+            or ((final_report or {}).get("reportHash") if isinstance(final_report, dict) else None)
+        )
         workflow_operation_queue_state = _workflow_operation_queue_state(
             execution_operation if execution_operation is not None else plan_operation
         )
@@ -955,12 +977,14 @@ class WorkflowServiceMixin:
             "createdAt": workflow.get("created_at"),
             "updatedAt": workflow.get("updated_at"),
             "completedAt": safe_completed_at,
+            "timestampSource": timestamp_source,
+            "workflowTimestampSource": timestamp_source,
             "timestampCorrected": timestamp_corrected,
             "clientRequestId": workflow.get("client_request_id"),
             "executionClientRequestId": workflow.get("execution_client_request_id"),
             "latestPlanItemId": workflow.get("latest_plan_item_id") or plan_updates.get("latest_plan_item_id"),
             "latestPlanHash": workflow.get("latest_plan_hash") or plan_updates.get("latest_plan_hash"),
-            "latestReportHash": workflow.get("latest_report_hash"),
+            "latestReportHash": latest_report_hash,
             "workflowRetryState": _workflow_retry_state(workflow, metadata),
             "planOperation": plan_operation,
             "executionOperation": execution_operation,
@@ -1192,6 +1216,7 @@ class WorkflowServiceMixin:
         *,
         execution_turn: dict[str, Any] | None,
         message_max_chars: int,
+        read_only: bool = False,
     ) -> dict[str, Any] | None:
         workflow_id = str(workflow["workflow_id"])
         stored: dict[str, Any] | None = None
@@ -1216,7 +1241,7 @@ class WorkflowServiceMixin:
                 source=execution_turn.get("source") or "storage",
                 schema_hash=schema_hash,
             )
-            if report_hash != workflow.get("latest_report_hash") or stored is None:
+            if not read_only and (report_hash != workflow.get("latest_report_hash") or stored is None):
                 self.storage.update_workflow(
                     workflow_id,
                     latest_report_hash=report_hash,

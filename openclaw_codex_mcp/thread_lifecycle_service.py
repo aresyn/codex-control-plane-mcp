@@ -338,10 +338,13 @@ class ThreadLifecycleServiceMixin:
         action_type = str(action.get("action_type") or "")
         status = str(action.get("status") or "unknown")
         thread_id = str(action.get("thread_id") or "")
-        terminal = status in {"completed", "failed", "unknown_after_app_server_exit"}
+        terminal = status in {"completed", "partial_success", "failed", "timed_out", "ambiguous_after_timeout", "unknown_after_app_server_exit"}
         if status == "running":
             next_action = "poll_thread_compaction"
             poll_after = 5
+        elif status == "partial_success":
+            next_action = "inspect_hook_diagnostics"
+            poll_after = 0
         elif status == "completed" and action_type == "compact":
             next_action = "read_thread_status"
             poll_after = 0
@@ -509,18 +512,34 @@ class ThreadLifecycleServiceMixin:
         thread_id = str(action.get("thread_id") or "")
         created_at = str(action.get("created_at") or "")
         for event in self.storage.list_app_server_events(thread_id=thread_id, since=created_at, limit=500):
+            payload = _lifecycle_event_payload(event)
             if event.get("method") != "thread/compacted":
-                continue
+                if not _is_compaction_completion_event(event, payload):
+                    continue
+                post_compact_failed = _post_compact_failed_for_thread(self.storage, thread_id=thread_id, since=created_at)
+                now = _now_iso()
+                target_turn_id = _optional_string(event.get("turn_id")) or _optional_string(payload.get("turnId"))
+                self.storage.update_thread_lifecycle_action(
+                    str(action["action_id"]),
+                    status="partial_success" if post_compact_failed else "completed",
+                    updated_at=now,
+                    completed_at=now,
+                    observed_event_id=event.get("id"),
+                    target_turn_id=target_turn_id,
+                    last_error="PostCompact hook failed after compaction turn completed." if post_compact_failed else None,
+                )
+                return self.storage.get_thread_lifecycle_action(str(action["action_id"])) or action
             now = _now_iso()
             target_turn_id = _optional_string(event.get("turn_id"))
+            post_compact_failed = _post_compact_failed_for_thread(self.storage, thread_id=thread_id, since=created_at)
             self.storage.update_thread_lifecycle_action(
                 str(action["action_id"]),
-                status="completed",
+                status="partial_success" if post_compact_failed else "completed",
                 updated_at=now,
                 completed_at=now,
                 observed_event_id=event.get("id"),
                 target_turn_id=target_turn_id,
-                last_error=None,
+                last_error="PostCompact hook failed after thread/compacted was observed." if post_compact_failed else None,
             )
             return self.storage.get_thread_lifecycle_action(str(action["action_id"])) or action
         generation = int(action.get("app_server_generation") or 0)
@@ -547,6 +566,46 @@ class ThreadLifecycleServiceMixin:
             raise invalid_argument("Thread lifecycle action was not found.", action_id=action_id)
         action = self._reconcile_thread_compaction_action(action)
         return self._thread_lifecycle_action_to_tool(action, include_events=include_events)
+
+
+def _lifecycle_event_payload(event: dict[str, Any]) -> dict[str, Any]:
+    try:
+        payload = json.loads(str(event.get("payload_json") or "{}"))
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _lifecycle_payload_params(payload: dict[str, Any]) -> dict[str, Any]:
+    params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+    if params:
+        return params
+    result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+    return result
+
+
+def _is_compaction_completion_event(event: dict[str, Any], payload: dict[str, Any]) -> bool:
+    method = str(event.get("method") or payload.get("method") or "")
+    params = _lifecycle_payload_params(payload)
+    if method in {"turn/completed", "turn/cancelled", "turn/canceled", "turn/aborted"}:
+        text = json.dumps(redact_payload(params), ensure_ascii=False).casefold()
+        return "compact" in text or "compaction" in text or "contextcompaction" in text
+    if method == "item/completed":
+        item = params.get("item") if isinstance(params.get("item"), dict) else {}
+        text = json.dumps(redact_payload({"params": params, "item": item}), ensure_ascii=False).casefold()
+        return "compact" in text or "compaction" in text or "contextcompaction" in text
+    return False
+
+
+def _post_compact_failed_for_thread(storage: Any, *, thread_id: str, since: str) -> bool:
+    for event in storage.list_app_server_events(thread_id=thread_id, since=since, limit=500):
+        payload = _lifecycle_event_payload(event)
+        text = json.dumps(redact_payload(payload), ensure_ascii=False).casefold()
+        if "postcompact" not in text and "post compact" not in text:
+            continue
+        if any(marker in text for marker in ("failed", "error", "parsererror", "exit code", "non-zero")):
+            return True
+    return False
 
 
 def _compact_lifecycle_app_server_result(value: Any) -> Any:

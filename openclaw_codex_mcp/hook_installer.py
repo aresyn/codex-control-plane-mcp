@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -240,11 +241,12 @@ def _backup_file(path: Path) -> Path | None:
 
 
 def _hook_handler(config_path: Path) -> dict[str, Any]:
-    command = f"{_quote(sys.executable)} -m {HOOK_MARKER} --config {_quote(config_path)}"
+    command = shlex.join([sys.executable, "-m", HOOK_MARKER, "--config", str(config_path)])
+    command_windows = f"& {_quote(sys.executable)} -m {HOOK_MARKER} --config {_quote(config_path)}"
     return {
         "type": "command",
         "command": command,
-        "commandWindows": command,
+        "commandWindows": command_windows,
         "timeout": 30,
         "statusMessage": "Recording Codex Control Plane MCP history",
     }

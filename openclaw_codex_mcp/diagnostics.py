@@ -461,7 +461,7 @@ def analyze_context(problem_text: str | None, diagnostics: dict[str, Any], logs:
                 "info",
                 "No obvious MCP/Codex problem was detected from the available diagnostics.",
                 evidence=[],
-                recommended_actions=[action("validate_paths_and_config", expected_effect="Confirm current configuration and paths remain valid.")],
+                recommended_actions=[action("no_action", expected_effect="No automated repair is recommended from the available evidence.")],
                 confidence="medium",
             )
         )

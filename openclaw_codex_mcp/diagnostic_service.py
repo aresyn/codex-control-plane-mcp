@@ -216,7 +216,7 @@ class DiagnosticServiceMixin:
             "recommendedPollAfterSeconds": 15 if active_turns or pending or check_stale_operations else 0,
             "pollRecommended": bool(active_turns or pending or check_stale_operations),
         }
-        return redact_payload(self._attach_agent_guidance(result, surface="health_summary"))
+        return self._finalize_public_result("codex_health_summary", self._attach_agent_guidance(result, surface="health_summary"))
 
     def _stall_supervisor_snapshot(self, active_turns: list[dict[str, Any]], pending: list[dict[str, Any]]) -> dict[str, Any]:
         timeout_seconds = int(getattr(self.config, "turn_stall_timeout_seconds", 900) or 900)
@@ -266,6 +266,8 @@ class DiagnosticServiceMixin:
         workflow_id = _optional_string(args.get("workflow_id"))
         thread_id = _optional_string(args.get("thread_id"))
         turn_id = _optional_string(args.get("turn_id"))
+        action_id = _optional_string(args.get("action_id"))
+        command_id = _optional_string(args.get("command_id"))
         operation = self.storage.get_operation(operation_id) if operation_id else None
         if operation is not None:
             workflow_id = workflow_id or _optional_string(operation.get("workflow_id"))
@@ -307,6 +309,8 @@ class DiagnosticServiceMixin:
             "workflowId": workflow_id,
             "threadId": thread_id,
             "turnId": turn_id,
+            "actionId": action_id,
+            "commandId": command_id,
             "operation": operation,
             "workflow": workflow,
             "operations": operations,
@@ -324,12 +328,14 @@ class DiagnosticServiceMixin:
         workflow_id = context["workflowId"]
         thread_id = context["threadId"]
         turn_id = context["turnId"]
+        action_id = context["actionId"]
+        command_id = context["commandId"]
         workflow = context["workflow"]
         if bool(args.get("refresh_catalog", False)):
             self.catalog.refresh()
         app_status = self.codex_get_app_server_status({"include_recent_events": True})
         pending = self._pending_interactions_for_diagnostics(context, limit=50)
-        scoped_request = bool(operation_id or workflow_id or thread_id or turn_id)
+        scoped_request = bool(operation_id or workflow_id or thread_id or turn_id or action_id or command_id)
         workflows = [workflow] if workflow is not None else ([] if scoped_request else self.storage.list_workflows(limit=20))
         active_work = {
             "pendingRequests": app_status.get("pendingRequests", 0),
@@ -378,6 +384,7 @@ class DiagnosticServiceMixin:
                     last_messages=5,
                     message_max_chars=8000,
                     include_events=False,
+                    read_only=True,
                 )
                 workflow_observation = workflow_status.get("workflowObservation")
             except Exception as exc:
@@ -400,6 +407,8 @@ class DiagnosticServiceMixin:
                 "workflowId": workflow_id,
                 "threadId": thread_id,
                 "turnId": turn_id,
+                "actionId": action_id,
+                "commandId": command_id,
                 "sinceMinutes": since_minutes,
             },
             "paths": {
@@ -461,7 +470,10 @@ class DiagnosticServiceMixin:
                     "include_payload": False,
                 }
             )
-        return redact_payload(self._attach_agent_guidance(result, surface="collect_diagnostics"))
+        return self._finalize_public_result(
+            "codex_collect_diagnostics",
+            self._attach_agent_guidance(result, surface="collect_diagnostics"),
+        )
 
     def codex_get_diagnostic_logs(self, args: dict[str, Any]) -> dict[str, Any]:
         source = str(args.get("source") or "all")
@@ -515,13 +527,22 @@ class DiagnosticServiceMixin:
         started = time.monotonic()
         problem_text = _optional_string(args.get("problem_text"))
         since_minutes = _bounded_int(args.get("since_minutes", 120), 1, 10080)
-        scoped_request = bool(args.get("operation_id") or args.get("workflow_id") or args.get("thread_id") or args.get("turn_id"))
+        scoped_request = bool(
+            args.get("operation_id")
+            or args.get("workflow_id")
+            or args.get("thread_id")
+            or args.get("turn_id")
+            or args.get("action_id")
+            or args.get("command_id")
+        )
         context = self.codex_collect_diagnostics(
             {
                 "operation_id": args.get("operation_id"),
                 "workflow_id": args.get("workflow_id"),
                 "thread_id": args.get("thread_id"),
                 "turn_id": args.get("turn_id"),
+                "action_id": args.get("action_id"),
+                "command_id": args.get("command_id"),
                 "since_minutes": since_minutes,
                 "include_logs": False,
                 "event_limit": _bounded_int(args.get("event_limit", 50), 1, 100),
@@ -557,7 +578,8 @@ class DiagnosticServiceMixin:
         if analysis_timed_out:
             analysis["analysisTimedOut"] = True
         evidence_truncated = _compact_analysis_evidence(analysis)
-        diagnosis_id = "diag_" + uuid.uuid4().hex
+        record_analysis = bool(args.get("record", False))
+        diagnosis_id = "diag_" + uuid.uuid4().hex if record_analysis else None
         created_at = _now_iso()
         if not bool(args.get("include_evidence", True)):
             for item in analysis.get("findings") or []:
@@ -566,26 +588,28 @@ class DiagnosticServiceMixin:
             if analysis.get("likelyRootCause"):
                 analysis["likelyRootCause"]["evidenceAvailable"] = bool(analysis["likelyRootCause"].get("evidence"))
                 analysis["likelyRootCause"]["evidence"] = []
-        self.storage.record_diagnostic_run(
-            diagnosis_id=diagnosis_id,
-            problem_text=redact_text(problem_text),
-            context=context,
-            summary=analysis,
-            created_at=created_at,
-        )
-        for item in analysis.get("findings") or []:
-            self.storage.record_diagnostic_finding(
+        if record_analysis and diagnosis_id is not None:
+            self.storage.record_diagnostic_run(
                 diagnosis_id=diagnosis_id,
-                severity=str(item.get("severity") or "info"),
-                category=str(item.get("category") or "unknown"),
-                title=str(item.get("title") or ""),
-                evidence=item.get("evidence") if isinstance(item.get("evidence"), list) else [],
-                recommended_actions=item.get("recommendedActions") if isinstance(item.get("recommendedActions"), list) else [],
+                problem_text=redact_text(problem_text),
+                context=context,
+                summary=analysis,
                 created_at=created_at,
             )
+            for item in analysis.get("findings") or []:
+                self.storage.record_diagnostic_finding(
+                    diagnosis_id=diagnosis_id,
+                    severity=str(item.get("severity") or "info"),
+                    category=str(item.get("category") or "unknown"),
+                    title=str(item.get("title") or ""),
+                    evidence=item.get("evidence") if isinstance(item.get("evidence"), list) else [],
+                    recommended_actions=item.get("recommendedActions") if isinstance(item.get("recommendedActions"), list) else [],
+                    created_at=created_at,
+                )
         result = {
             "ok": True,
             "diagnosisId": diagnosis_id,
+            "diagnosisRecorded": bool(record_analysis and diagnosis_id),
             "createdAt": created_at,
             "analysisElapsedMs": elapsed_ms,
             "analysisTimedOut": analysis_timed_out,
@@ -593,7 +617,7 @@ class DiagnosticServiceMixin:
             "evidenceTruncated": evidence_truncated,
             **analysis,
         }
-        return self._attach_agent_guidance(result, surface="analyze_issue")
+        return self._finalize_public_result("codex_analyze_issue", self._attach_agent_guidance(result, surface="analyze_issue"))
 
     async def codex_repair_issue(self, args: dict[str, Any]) -> dict[str, Any]:
         requested_action = _required_string(args, "action")

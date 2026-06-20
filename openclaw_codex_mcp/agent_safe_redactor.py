@@ -51,8 +51,9 @@ class AgentSafeRedactor:
     """Privacy boundary for agent-facing MCP responses.
 
     The redactor is intentionally conservative for public/status surfaces:
-    it preserves paths under configured allowed roots, but collapses Codex
-    home, state DB, logs, app binaries, profile paths, and token-like text.
+    it collapses absolute filesystem paths, account identifiers, tokens and
+    exact usage into compact references. Raw local paths are available only on
+    the explicit raw-audit surface and still pass through secret redaction.
     """
 
     def __init__(self, *, allowed_roots: list[Path], private_roots: list[Path]) -> None:
@@ -104,8 +105,6 @@ class AgentSafeRedactor:
     def _redact_path_text(self, text: str) -> str:
         if not text or not _looks_like_path(text):
             return self._redact_text(text) if _WINDOWS_PATH_RE.search(text) else text
-        if self._is_public_allowed_path(text) and not self._is_private_path(text):
-            return text
         return _path_ref(text)
 
     def _is_public_allowed_path(self, text: str) -> bool:

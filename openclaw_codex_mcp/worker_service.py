@@ -148,9 +148,13 @@ class WorkerServiceMixin:
             max_result_chars=max_result_chars,
         )
         payload["ok"] = True
-        payload["pollRecommended"] = payload.get("status") not in {"completed", "failed", "cancelled", "canceled"}
+        payload["pollRecommended"] = payload.get("status") not in {"completed", "failed", "timed_out", "cancelled", "canceled"}
         payload["recommendedPollAfterSeconds"] = 2 if payload["pollRecommended"] else 0
-        payload["nextRecommendedAction"] = "poll_worker_command" if payload["pollRecommended"] else "none"
+        payload["nextRecommendedAction"] = (
+            "poll_worker_command"
+            if payload["pollRecommended"]
+            else ("inspect_worker_command" if payload.get("status") == "timed_out" else "none")
+        )
         elapsed_ms = int((time.monotonic() - started) * 1000)
         payload["elapsedMs"] = elapsed_ms
         if elapsed_ms > 2000:
@@ -196,6 +200,11 @@ def _worker_command_row_to_tool(
     max_result_chars: int = 12000,
 ) -> dict[str, Any]:
     request = _json_dict(row.get("request_json"))
+    status = str(row.get("status") or "")
+    result_json_text = str(row.get("result_json") or "")
+    timeout_result = '"commandTimedOut"' in result_json_text or "timed out" in str(row.get("last_error") or "").casefold()
+    if status == "running" and timeout_result:
+        status = "timed_out"
     result_payload = _bounded_worker_command_result(
         row.get("result_json"),
         include_result=include_result,
@@ -204,7 +213,8 @@ def _worker_command_row_to_tool(
     return {
         "commandId": row.get("command_id"),
         "commandType": row.get("command_type"),
-        "status": row.get("status"),
+        "status": status,
+        "commandTimedOut": status == "timed_out" or timeout_result,
         "request": _compact_worker_payload(request),
         "result": result_payload["result"],
         "resultAvailable": result_payload["resultAvailable"],
@@ -262,13 +272,16 @@ def _queue_entry_consumes_turn_slot(entry: dict[str, Any]) -> bool:
 
 
 def _resource_lock_row_to_tool(row: dict[str, Any]) -> dict[str, Any]:
+    worker_id = row.get("worker_id")
+    planned = worker_id in {"planned", "unknown", None, ""}
     return {
         "lockKey": row.get("lock_key"),
         "operationId": row.get("operation_id"),
         "threadId": row.get("thread_id"),
         "projectId": row.get("project_id"),
         "lockMode": row.get("lock_mode"),
-        "workerId": row.get("worker_id"),
+        "workerId": None if planned else worker_id,
+        "planned": bool(planned),
         "expiresAt": row.get("expires_at"),
         "createdAt": row.get("created_at"),
     }
