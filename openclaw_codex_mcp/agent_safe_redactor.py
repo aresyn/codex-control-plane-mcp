@@ -10,6 +10,7 @@ from .config import is_path_under
 
 
 _WINDOWS_PATH_RE = re.compile(r"(?i)(?:[a-z]:[\\/][^\s\"'<>|\)\]]+|\\\\[^\s\"'<>|\)\]]+)")
+_POSIX_PATH_RE = re.compile(r"(?<![:/\w])/(?:[^\s\"'<>|\)\]]+/)*[^\s\"'<>|\)\]]+")
 _EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
 _TOKEN_RE = re.compile(
     r"(?i)(?:\b(?:sk|sess|tok|key)[-_][A-Za-z0-9._-]{12,}\b|\bbearer\s+[A-Za-z0-9._~+/=-]{12,})"
@@ -100,7 +101,8 @@ class AgentSafeRedactor:
 
     def _redact_text(self, text: str) -> str:
         text = _TOKEN_RE.sub("[redacted-token]", _EMAIL_RE.sub("[redacted-email]", text))
-        return _WINDOWS_PATH_RE.sub(lambda match: self._redact_path_text(match.group(0)), text)
+        text = _WINDOWS_PATH_RE.sub(lambda match: self._redact_path_text(match.group(0)), text)
+        return _POSIX_PATH_RE.sub(lambda match: self._redact_path_text(match.group(0)), text)
 
     def _redact_path_text(self, text: str) -> str:
         if not text or not _looks_like_path(text):
@@ -130,8 +132,9 @@ def _looks_like_path(text: str) -> bool:
 
 
 def _path_ref(text: str) -> str:
-    normalized = text.replace("/", "\\")
-    name = Path(normalized).name or "path"
+    normalized = text.strip().rstrip(".,;:")
+    parts = [part for part in re.split(r"[\\/]+", normalized) if part]
+    name = parts[-1] if parts else Path(normalized).name or "path"
     digest = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()[:10]
     return f"[redacted-path:{name}:{digest}]"
 

@@ -238,6 +238,8 @@ def analyze_context(problem_text: str | None, diagnostics: dict[str, Any], logs:
         if status not in {"warning", "error"}:
             continue
         category = str(item.get("details", {}).get("category") or item.get("name") or "diagnostic_check")
+        if category == "logs" or item.get("name") == "mcp_log":
+            continue
         findings.append(
             finding(
                 category,
