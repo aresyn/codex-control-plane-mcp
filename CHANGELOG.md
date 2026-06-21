@@ -7,6 +7,18 @@ versioning after the public `0.1.0` release.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-06-21
+
+### Fixed
+
+- Return canonical path-derived project ids from cached non-registry projects so
+  `codex_list_projects`, preflight, chat tools, workflows, and durable task
+  submission resolve the same project reference consistently.
+- Keep stale cached project ids as aliases for compatibility while guiding
+  agents to use the canonical `projectId` returned by `codex_list_projects`.
+- Make Windows catalog regression tests deterministic when temporary paths are
+  canonicalized differently before and after cleanup.
+
 ## [0.2.0] - 2026-06-20
 
 ### Added
