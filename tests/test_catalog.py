@@ -8,6 +8,7 @@ from pathlib import Path
 
 from openclaw_codex_mcp.catalog import ProjectChatCatalog
 from openclaw_codex_mcp.catalog import project_id_for_path
+from openclaw_codex_mcp.config import canonical_existing_path
 from openclaw_codex_mcp.config import ServerConfig
 from openclaw_codex_mcp.storage import McpStorage
 
@@ -129,6 +130,7 @@ class CatalogTests(unittest.TestCase):
             storage.connect()
             try:
                 updated_at = "2026-06-20T00:00:00+00:00"
+                expected_project_id = project_id_for_path(canonical_existing_path(allowed_project))
                 storage.upsert_project(
                     {
                         "project_id": "allowed-project",
@@ -158,7 +160,7 @@ class CatalogTests(unittest.TestCase):
             finally:
                 storage.close()
 
-        self.assertEqual([project_id_for_path(str(allowed_project))], [project.project_id for project in cached])
+        self.assertEqual([expected_project_id], [project.project_id for project in cached])
 
     def test_list_project_chats_uses_cached_index_before_full_refresh(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -255,6 +257,7 @@ class CatalogTests(unittest.TestCase):
             storage.connect()
             try:
                 updated_at = "2026-06-20T00:00:00+00:00"
+                expected_project_id = project_id_for_path(canonical_existing_path(project))
                 storage.upsert_project(
                     {
                         "project_id": "stale-project-id",
@@ -274,11 +277,11 @@ class CatalogTests(unittest.TestCase):
             finally:
                 storage.close()
 
-        self.assertEqual([project_id_for_path(str(project))], [item.project_id for item in cached])
+        self.assertEqual([expected_project_id], [item.project_id for item in cached])
         self.assertIsNotNone(resolved)
-        self.assertEqual(project_id_for_path(str(project)), resolved.project_id)
+        self.assertEqual(expected_project_id, resolved.project_id)
         self.assertIsNotNone(resolved_by_stale_id)
-        self.assertEqual(project_id_for_path(str(project)), resolved_by_stale_id.project_id)
+        self.assertEqual(expected_project_id, resolved_by_stale_id.project_id)
 
 
 if __name__ == "__main__":
