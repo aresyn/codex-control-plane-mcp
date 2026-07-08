@@ -165,6 +165,10 @@ Minimal stdio entry:
 }
 ```
 
+More copy-paste examples for Claude Desktop, Cursor, VS Code-style MCP clients,
+local checkouts, installed packages, and central worker mode are available in
+[`examples/mcp-client-configs.md`](examples/mcp-client-configs.md).
+
 Run the MCP stdio server:
 
 ```powershell
