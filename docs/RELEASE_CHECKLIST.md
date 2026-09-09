@@ -153,7 +153,8 @@ Install in a clean virtual environment and verify scripts:
 ```powershell
 py -m venv .venv-release
 .\.venv-release\Scripts\Activate.ps1
-python -m pip install .\dist\codex_control_plane_mcp-0.1.2-py3-none-any.whl
+$wheel = Get-ChildItem -LiteralPath .\dist -Filter "codex_control_plane_mcp-*-py3-none-any.whl" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+python -m pip install $($wheel.FullName)
 python -c "import codex_control_plane_mcp, openclaw_codex_mcp; print(codex_control_plane_mcp.__version__, openclaw_codex_mcp.__version__)"
 codex-control-plane-mcp-hooks status --codex-home .\tmp-codex-home
 codex-control-plane-mcp-admin print-config
