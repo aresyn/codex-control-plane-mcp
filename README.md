@@ -676,6 +676,11 @@ Common variables:
 - `CODEX_MCP_TURN_STALL_TIMEOUT_SECONDS`: inactivity threshold for stalled-turn reporting. Defaults to `900`.
 - `CODEX_MCP_STALLED_TURN_ACTION`: stalled-turn policy. Defaults to `diagnose_only`.
 - `CODEX_MCP_APPROVAL_RESPONSE_TIMEOUT_SECONDS`: pending interaction timeout.
+- `CODEX_MCP_INSTRUCTIONS_FILE`: optional UTF-8 text file returned to MCP clients as
+  `instructions` in the `initialize` response. Defaults to
+  `~/.codex-control-plane/instructions.md`; when the file is missing or empty, no
+  `instructions` field is sent. Use it for operator rules that every orchestrating
+  agent should follow, such as default sandbox expectations.
 - `DEEPSEEK_ENV_PATH`: optional `.env` file for DeepSeek summary settings.
 - `DEEPSEEK_SUMMARY_ENABLED`: enables or disables remote summary calls.
 

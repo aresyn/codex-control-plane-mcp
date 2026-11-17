@@ -7,6 +7,13 @@ versioning after the public `0.1.0` release.
 
 ## [Unreleased]
 
+### Added
+
+- Return operator-provided MCP client instructions from the `initialize`
+  response. The text is read from `CODEX_MCP_INSTRUCTIONS_FILE`, falling back to
+  `~/.codex-control-plane/instructions.md`; nothing is sent when the file is
+  missing or empty.
+
 ## [0.2.1] - 2026-06-21
 
 ### Fixed
