@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import time
 import traceback
@@ -17,6 +18,21 @@ from .tools import ToolService, tools_list_payload
 
 SERVER_INFO = {"name": "codex-control-plane-mcp", "version": __version__}
 LOG = get_logger("server")
+
+
+def _load_client_instructions() -> str:
+    """Return operator-provided MCP client instructions, or "" when none are configured.
+
+    Reads the file named by ``CODEX_MCP_INSTRUCTIONS_FILE``; without it, falls back to
+    ``~/.codex-control-plane/instructions.md``. A missing or unreadable file is not an error.
+    """
+    path = os.environ.get("CODEX_MCP_INSTRUCTIONS_FILE") or str(
+        Path.home() / ".codex-control-plane" / "instructions.md"
+    )
+    try:
+        return Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
 
 
 class StdioMcpServer:
@@ -92,11 +108,15 @@ class StdioMcpServer:
 
     async def _handle_request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         if method == "initialize":
-            return {
+            result = {
                 "protocolVersion": params.get("protocolVersion") or "2024-11-05",
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": SERVER_INFO,
             }
+            instructions = _load_client_instructions()
+            if instructions:
+                result["instructions"] = instructions
+            return result
         if method == "tools/list":
             return tools_list_payload()
         if method == "tools/call":

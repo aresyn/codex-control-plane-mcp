@@ -673,6 +673,11 @@ idempotency, признак passive read и `mayStartTurn`. Если клиен�
 - `CODEX_MCP_TURN_STALL_TIMEOUT_SECONDS`: порог неактивности для stalled-turn отчетов. По умолчанию `900`.
 - `CODEX_MCP_STALLED_TURN_ACTION`: политика stalled-turn. По умолчанию `diagnose_only`.
 - `CODEX_MCP_APPROVAL_RESPONSE_TIMEOUT_SECONDS`: timeout pending interactions.
+- `CODEX_MCP_INSTRUCTIONS_FILE`: опциональный UTF-8 текстовый файл, который
+  возвращается MCP-клиентам как `instructions` в ответе `initialize`. По умолчанию
+  `~/.codex-control-plane/instructions.md`; если файла нет или он пустой, поле
+  `instructions` не отправляется. Подходит для правил оператора, которым должен
+  следовать каждый оркестрирующий агент.
 - `DEEPSEEK_ENV_PATH`: опциональный `.env` для DeepSeek summary settings.
 - `DEEPSEEK_SUMMARY_ENABLED`: включает или отключает remote summary calls.
 

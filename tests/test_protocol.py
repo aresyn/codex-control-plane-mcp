@@ -492,6 +492,49 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertIn("codexMcpGuide", listed)
         self.assertEqual(_tool_surface_hash(), listed["codexMcpGuide"]["toolSurfaceHash"])
 
+    def test_initialize_includes_client_instructions_from_env_file(self) -> None:
+        from unittest import mock
+
+        server = StdioMcpServer.__new__(StdioMcpServer)
+        server.service = FakeToolService({"ok": True})
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "instructions.md"
+            path.write_text("  Always poll codex_get_operation_status.\n\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"CODEX_MCP_INSTRUCTIONS_FILE": str(path)}):
+                initialized = asyncio.run(server._handle_request("initialize", {}))
+
+        self.assertEqual("Always poll codex_get_operation_status.", initialized["instructions"])
+        self.assertEqual("codex-control-plane-mcp", initialized["serverInfo"]["name"])
+
+    def test_initialize_omits_instructions_when_file_missing_or_empty(self) -> None:
+        from unittest import mock
+
+        server = StdioMcpServer.__new__(StdioMcpServer)
+        server.service = FakeToolService({"ok": True})
+        with TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "missing.md"
+            empty = Path(tmp) / "empty.md"
+            empty.write_text("   \n", encoding="utf-8")
+            for path in (missing, empty):
+                with mock.patch.dict(os.environ, {"CODEX_MCP_INSTRUCTIONS_FILE": str(path)}):
+                    initialized = asyncio.run(server._handle_request("initialize", {}))
+                self.assertNotIn("instructions", initialized)
+
+    def test_initialize_reads_default_instructions_path_under_home(self) -> None:
+        from unittest import mock
+
+        server = StdioMcpServer.__new__(StdioMcpServer)
+        server.service = FakeToolService({"ok": True})
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / ".codex-control-plane").mkdir()
+            (home / ".codex-control-plane" / "instructions.md").write_text("Default rules.", encoding="utf-8")
+            env = {key: value for key, value in os.environ.items() if key != "CODEX_MCP_INSTRUCTIONS_FILE"}
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(Path, "home", return_value=home):
+                initialized = asyncio.run(server._handle_request("initialize", {}))
+
+        self.assertEqual("Default rules.", initialized["instructions"])
+
     def test_stdio_subprocess_outputs_only_jsonrpc_frames(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
